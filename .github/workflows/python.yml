@@ -35,6 +35,35 @@ jobs:
       - name: Test
         run: uv run pytest python/tests
 
+  base-install:
+    # The base package must work with no extras: PydanticAI and the memory and
+    # harness clients are opt-in, and nothing in the base may import them.
+    name: base install without extras
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.20"
+          python-version: "3.14"
+      - name: Install ol-llm alone
+        run: |
+          uv venv "$RUNNER_TEMP/base"
+          uv pip install --python "$RUNNER_TEMP/base" ./python
+      - name: Import without extras
+        run: |
+          "$RUNNER_TEMP/base/bin/python" - <<'PY'
+          import importlib.util
+          import ol_llm
+          import opik
+          absent = ["pydantic_ai", "pydantic_ai_harness", "hindsight_client"]
+          present = [name for name in absent if importlib.util.find_spec(name)]
+          assert not present, f"installed without being asked for: {present}"
+          print(f"ol-llm {ol_llm.__version__} imports with no extras")
+          PY
+
   slim-smoke:
     # The overrides a uv consumer copies to drop opik's heavy dependencies. A
     # failure here means an opik release (or ol-llm itself) now needs a package
