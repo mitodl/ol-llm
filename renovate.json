@@ -1,0 +1,11 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["local>mitodl/.github:renovate-config"],
+  "packageRules": [
+    {
+      "description": "opik is pinned exactly because consumers slim it with uv override-dependencies. A bump always gets human review, and the slimmed-install smoke test in python.yml has to pass first.",
+      "matchDepNames": ["opik"],
+      "automerge": false
+    }
+  ]
+}
