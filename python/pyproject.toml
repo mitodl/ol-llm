@@ -1,0 +1,48 @@
+[project]
+name = "ol-llm"
+version = "0.0.1"
+description = "Shared library for LLM calls at MIT Open Learning, with Opik tracing, prompt management, and evaluation built in"
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+authors = [{ name = "MIT Open Learning", email = "odl-devops@mit.edu" }]
+requires-python = ">=3.11"
+keywords = ["llm", "opik", "pydantic-ai", "observability"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+# opik is pinned exactly: consumers slim it with uv override-dependencies, and a
+# release that starts importing a dropped package eagerly would break them at
+# import time. The smoke project in python/smoke/ catches that on every bump.
+dependencies = [
+    "httpx>=0.28",
+    "opentelemetry-exporter-otlp-proto-http>=1.38",
+    "opentelemetry-sdk>=1.38",
+    "opik==2.2.87",
+    "pydantic-ai-slim>=2.52,<3",
+]
+
+[project.optional-dependencies]
+anthropic = ["pydantic-ai-slim[anthropic]>=2.52,<3"]
+bedrock = ["pydantic-ai-slim[bedrock]>=2.52,<3"]
+google = ["pydantic-ai-slim[google]>=2.52,<3"]
+mistral = ["pydantic-ai-slim[mistral]>=2.52,<3"]
+openai = ["pydantic-ai-slim[openai]>=2.52,<3"]
+
+[project.urls]
+Homepage = "https://github.com/mitodl/ol-llm"
+Repository = "https://github.com/mitodl/ol-llm"
+Issues = "https://github.com/mitodl/ol-llm/issues"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ol_llm"]

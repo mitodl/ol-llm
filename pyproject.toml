@@ -1,0 +1,50 @@
+[project]
+name = "ol-llm-workspace"
+version = "0"
+description = "Workspace root for ol-llm. Not published; the distribution lives in python/."
+requires-python = ">=3.11"
+
+[dependency-groups]
+prek = ["prek==0.5.4"]
+dev = [
+    { include-group = "prek" },
+    "mypy>=1.18",
+    "ol-llm[anthropic,bedrock,google,mistral,openai]",
+    "pytest>=8.4",
+    "ruff>=0.15",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["python"]
+# The slimmed-install smoke project has its own lockfile on purpose: its
+# override-dependencies are what a consumer would write, and they must not leak
+# into the workspace that the main test matrix resolves.
+exclude = ["python/smoke"]
+
+[tool.uv.sources]
+ol-llm = { workspace = true }
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "COM812", # conflicts with the formatter
+    "CPY",    # no per-file copyright headers; the license is in LICENSE
+    "D203",   # incompatible with D211
+    "D213",   # incompatible with D212
+    "ISC001", # conflicts with the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["D", "INP001", "S101", "PLR2004"]
+"python/smoke/smoke_test.py" = ["T201", "INP001"]
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
