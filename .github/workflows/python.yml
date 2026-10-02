@@ -1,0 +1,82 @@
+name: python
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the oldest Python among the edx-platform releases in use;
+        # learn-ai and ol-data-platform run 3.14.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.20"
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Install
+        run: uv sync --frozen
+      - name: Type check
+        run: uv run mypy python/src
+      - name: Test
+        run: uv run pytest python/tests
+
+  slim-smoke:
+    # The overrides a uv consumer copies to drop opik's heavy dependencies. A
+    # failure here means an opik release (or ol-llm itself) now needs a package
+    # those overrides remove, and consumers would break at import time.
+    name: slimmed install smoke test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python/smoke
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.20"
+          python-version: "3.14"
+      - name: Install
+        run: uv sync --frozen
+      - name: Smoke test
+        run: uv run python smoke_test.py
+
+  edx-platform-resolution:
+    # The course-translation plugins install ol-llm into edxapp, whose
+    # dependencies are pinned by edx-platform. Only master is checked: ulmo and
+    # verawood cap openai<=0.28.1, which the openai extra cannot satisfy.
+    name: resolves with edx-platform master
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.20"
+      - name: Fetch edx-platform master requirements
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/edx-base.txt" \
+            https://raw.githubusercontent.com/openedx/edx-platform/master/requirements/edx/base.txt
+      - name: Resolve ol-llm[openai] under edx-platform pins
+        run: |
+          echo "./python[openai]" | uv pip compile - \
+            -c "$RUNNER_TEMP/edx-base.txt" \
+            --python-version 3.12 \
+            -o "$RUNNER_TEMP/resolved.txt"
