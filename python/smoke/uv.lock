@@ -633,34 +633,40 @@ dependencies = [
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
     { name = "opik" },
+]
+
+[package.optional-dependencies]
+pydantic-ai = [
     { name = "pydantic-ai-slim" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "hindsight-client", marker = "extra == 'memory'", specifier = ">=0.10,<0.11" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.38" },
     { name = "opentelemetry-sdk", specifier = ">=1.38" },
     { name = "opik", specifier = "==2.2.87" },
-    { name = "pydantic-ai-slim", specifier = ">=2.52,<3" },
+    { name = "pydantic-ai-harness", marker = "extra == 'harness'", specifier = ">=0.52,<0.53" },
+    { name = "pydantic-ai-slim", marker = "extra == 'pydantic-ai'", specifier = ">=2.52,<3" },
     { name = "pydantic-ai-slim", extras = ["anthropic"], marker = "extra == 'anthropic'", specifier = ">=2.52,<3" },
     { name = "pydantic-ai-slim", extras = ["bedrock"], marker = "extra == 'bedrock'", specifier = ">=2.52,<3" },
     { name = "pydantic-ai-slim", extras = ["google"], marker = "extra == 'google'", specifier = ">=2.52,<3" },
     { name = "pydantic-ai-slim", extras = ["mistral"], marker = "extra == 'mistral'", specifier = ">=2.52,<3" },
     { name = "pydantic-ai-slim", extras = ["openai"], marker = "extra == 'openai'", specifier = ">=2.52,<3" },
 ]
-provides-extras = ["anthropic", "bedrock", "google", "mistral", "openai"]
+provides-extras = ["pydantic-ai", "anthropic", "bedrock", "google", "mistral", "openai", "harness", "memory"]
 
 [[package]]
 name = "ol-llm-smoke"
 version = "0"
 source = { virtual = "." }
 dependencies = [
-    { name = "ol-llm" },
+    { name = "ol-llm", extra = ["pydantic-ai"] },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "ol-llm", editable = "../" }]
+requires-dist = [{ name = "ol-llm", extras = ["pydantic-ai"], editable = "../" }]
 
 [[package]]
 name = "openai"

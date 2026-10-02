@@ -9,7 +9,7 @@ prek = ["prek==0.5.4"]
 dev = [
     { include-group = "prek" },
     "mypy>=1.18",
-    "ol-llm[anthropic,bedrock,google,mistral,openai]",
+    "ol-llm[anthropic,bedrock,google,harness,memory,mistral,openai,pydantic-ai]",
     "pytest>=8.4",
     "ruff>=0.15",
 ]

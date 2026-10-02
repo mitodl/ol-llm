@@ -10,6 +10,20 @@ which otherwise replaces the host application's Sentry client with its own.
 
 The design is in [mitodl/ol-infrastructure `docs/plans/shared-llm-library-spec.md`](https://github.com/mitodl/ol-infrastructure/blob/main/docs/plans/shared-llm-library-spec.md).
 
+## Extras
+
+The base install is the Opik SDK and OpenTelemetry, which every call site needs. Everything
+else is opt-in:
+
+| Extra | Installs | For |
+| --- | --- | --- |
+| `pydantic-ai` | `pydantic-ai-slim` | The default construction path for agents and single calls |
+| `openai`, `anthropic`, `bedrock`, `google`, `mistral` | the matching `pydantic-ai-slim` extra | A provider SDK; each also installs PydanticAI |
+| `harness` | `pydantic-ai-harness` | In-session memory, compaction, and conversation search. Each harness release pins PydanticAI exactly |
+| `memory` | `hindsight-client` | The shared memory service's client. Provisional: the backend is still being evaluated |
+
+For example, `ol-llm[bedrock,harness]`.
+
 ## Installing without the Opik SDK's heavy dependencies
 
 The `opik` package hard-requires litellm, openai, pytest, and several other packages the

@@ -6,7 +6,8 @@
 name = "ol-llm-smoke"
 version = "0"
 requires-python = ">=3.11"
-dependencies = ["ol-llm"]
+# The pydantic-ai extra, because the smoke test runs an instrumented agent.
+dependencies = ["ol-llm[pydantic-ai]"]
 
 [tool.uv]
 package = false

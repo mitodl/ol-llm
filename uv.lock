@@ -142,6 +142,18 @@ wheels = [
 ]
 
 [[package]]
+name = "aiohttp-retry"
+version = "2.9.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9d/61/ebda4d8e3d8cfa1fd3db0fb428db2dd7461d5742cea35178277ad180b033/aiohttp_retry-2.9.1.tar.gz", hash = "sha256:8eb75e904ed4ee5c2ec242fefe85bf04240f685391c4879d8f541d6028ff01f1", size = 13608, upload-time = "2024-11-06T10:44:54.574Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1a/99/84ba7273339d0f3dfa57901b846489d2e5c2cd731470167757f1935fffbd/aiohttp_retry-2.9.1-py3-none-any.whl", hash = "sha256:66d2759d1921838256a05a3f80ad7e724936f083e35be5abb5e16eed6be6dc54", size = 9981, upload-time = "2024-11-06T10:44:52.917Z" },
+]
+
+[[package]]
 name = "aiosignal"
 version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1034,6 +1046,24 @@ wheels = [
 ]
 
 [[package]]
+name = "hindsight-client"
+version = "0.10.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "aiohttp" },
+    { name = "aiohttp-retry" },
+    { name = "pydantic" },
+    { name = "python-dateutil" },
+    { name = "typing-extensions" },
+    { name = "urllib3" },
+    { name = "yarl" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/e4/e9/d2880efde91a89980a3ecaf70c0a59742cfcddf8282855b8f6d6636328dd/hindsight_client-0.10.2.tar.gz", hash = "sha256:0d1cb80a4cc0aff9b4b74219c39af302eb65af47c8aa4f113114a22bcd416b4f", size = 200987, upload-time = "2026-09-29T09:41:52.904Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f4/08/fef2d8ce6bad91a6ea3dd9c9f02812457fdc2e9f9e08fdb3f03fbd6aad97/hindsight_client-0.10.2-py3-none-any.whl", hash = "sha256:6843e625d813333a42ca4bff38e8cab39b58ec6ed5a33d7eb596f71e16c7ef64", size = 447714, upload-time = "2026-09-29T09:41:51.337Z" },
+]
+
+[[package]]
 name = "httpcore"
 version = "1.0.9"
 source = { registry = "https://pypi.org/simple" }
@@ -1282,6 +1312,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d3/59/322338183ecda247fb5d1763a6cbe46eff7222eaeebafd9fa65d4bf5cb11/jmespath-1.1.0.tar.gz", hash = "sha256:472c87d80f36026ae83c6ddd0f1d05d4e510134ed462851fd5f754c8c3cbb88d", size = 27377, upload-time = "2026-01-22T16:35:26.279Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/14/2f/967ba146e6d58cf6a652da73885f52fc68001525b4197effc174321d70b4/jmespath-1.1.0-py3-none-any.whl", hash = "sha256:a5663118de4908c91729bea0acadca56526eb2698e83de10cd116ae0f4e97c64", size = 20419, upload-time = "2026-01-22T16:35:24.919Z" },
+]
+
+[[package]]
+name = "json-repair"
+version = "0.63.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/72/29/653c36e0de80f7048f01298a9098f1c66bb9da162e92ad6a6e2c3202cc52/json_repair-0.63.5.tar.gz", hash = "sha256:75a6a1a4ea954935dd3fb69b6e49ac0e3e3d69b4290127a0c8d37af93b709f3a", size = 52945, upload-time = "2026-09-22T18:36:08.745Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6b/a4/222e2581667c326183a87df229e772140fbf3e5dc03ec73e2a0e74804114/json_repair-0.63.5-py3-none-any.whl", hash = "sha256:0e39b3066f7829b4bd7fc614e463cfd4ff7a4c46f82f5b65431fc11e29a74c81", size = 51334, upload-time = "2026-09-22T18:36:07.05Z" },
 ]
 
 [[package]]
@@ -1831,7 +1870,6 @@ dependencies = [
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
     { name = "opik" },
-    { name = "pydantic-ai-slim" },
 ]
 
 [package.optional-dependencies]
@@ -1844,27 +1882,38 @@ bedrock = [
 google = [
     { name = "pydantic-ai-slim", extra = ["google"] },
 ]
+harness = [
+    { name = "pydantic-ai-harness" },
+]
+memory = [
+    { name = "hindsight-client" },
+]
 mistral = [
     { name = "pydantic-ai-slim", extra = ["mistral"] },
 ]
 openai = [
     { name = "pydantic-ai-slim", extra = ["openai"] },
 ]
+pydantic-ai = [
+    { name = "pydantic-ai-slim" },
+]
 
 [package.metadata]
 requires-dist = [
+    { name = "hindsight-client", marker = "extra == 'memory'", specifier = ">=0.10,<0.11" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.38" },
     { name = "opentelemetry-sdk", specifier = ">=1.38" },
     { name = "opik", specifier = "==2.2.87" },
-    { name = "pydantic-ai-slim", specifier = ">=2.52,<3" },
+    { name = "pydantic-ai-harness", marker = "extra == 'harness'", specifier = ">=0.52,<0.53" },
+    { name = "pydantic-ai-slim", marker = "extra == 'pydantic-ai'", specifier = ">=2.52,<3" },
     { name = "pydantic-ai-slim", extras = ["anthropic"], marker = "extra == 'anthropic'", specifier = ">=2.52,<3" },
     { name = "pydantic-ai-slim", extras = ["bedrock"], marker = "extra == 'bedrock'", specifier = ">=2.52,<3" },
     { name = "pydantic-ai-slim", extras = ["google"], marker = "extra == 'google'", specifier = ">=2.52,<3" },
     { name = "pydantic-ai-slim", extras = ["mistral"], marker = "extra == 'mistral'", specifier = ">=2.52,<3" },
     { name = "pydantic-ai-slim", extras = ["openai"], marker = "extra == 'openai'", specifier = ">=2.52,<3" },
 ]
-provides-extras = ["anthropic", "bedrock", "google", "mistral", "openai"]
+provides-extras = ["pydantic-ai", "anthropic", "bedrock", "google", "mistral", "openai", "harness", "memory"]
 
 [[package]]
 name = "ol-llm-workspace"
@@ -1874,7 +1923,7 @@ source = { virtual = "." }
 [package.dev-dependencies]
 dev = [
     { name = "mypy" },
-    { name = "ol-llm", extra = ["anthropic", "bedrock", "google", "mistral", "openai"] },
+    { name = "ol-llm", extra = ["anthropic", "bedrock", "google", "harness", "memory", "mistral", "openai", "pydantic-ai"] },
     { name = "prek" },
     { name = "pytest" },
     { name = "ruff" },
@@ -1888,7 +1937,7 @@ prek = [
 [package.metadata.requires-dev]
 dev = [
     { name = "mypy", specifier = ">=1.18" },
-    { name = "ol-llm", extras = ["anthropic", "bedrock", "google", "mistral", "openai"], editable = "python" },
+    { name = "ol-llm", extras = ["anthropic", "bedrock", "google", "harness", "memory", "mistral", "openai", "pydantic-ai"], editable = "python" },
     { name = "prek", specifier = "==0.5.4" },
     { name = "pytest", specifier = ">=8.4" },
     { name = "ruff", specifier = ">=0.15" },
@@ -2346,6 +2395,21 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/53/ef/fc4f868f4e2cee79f863883abffceff107875f569b848507319842d2a681/pydantic-2.13.5.tar.gz", hash = "sha256:51a9c5f7b2f8e636f04c6cada605d9b6a3bf1348fdf945a3d8869b19bba0ee08", size = 845750, upload-time = "2026-08-28T14:04:00.916Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/eb/47/c95ffc2009878c7aac0c5e08528022dcb885933252a88b5f170058014464/pydantic-2.13.5-py3-none-any.whl", hash = "sha256:346a034f080da3755d8e9cb5e00e8b07de1d39e4f6e2c87d8ab7cafa0b269a73", size = 472589, upload-time = "2026-08-28T14:03:59.136Z" },
+]
+
+[[package]]
+name = "pydantic-ai-harness"
+version = "0.52.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "genai-prices" },
+    { name = "httpx" },
+    { name = "json-repair" },
+    { name = "pydantic-ai-slim" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/08/9f/5473f999f0c8c1f69a941417911da54cfd9b47df262da3ca70abde330076/pydantic_ai_harness-0.52.0.tar.gz", hash = "sha256:321a8bdae70a34257ba22922e58b1e7d55aeef81b6165b0d79563c7746432e3f", size = 942581, upload-time = "2026-09-30T01:18:00.483Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/16/f5/d16a33a2d3b784f811227ef610bda46b84f2d58aa2f0368ee4d76f963198/pydantic_ai_harness-0.52.0-py3-none-any.whl", hash = "sha256:3f1400c355c0e083cb9d64a2d1f54d6f6b1b348f5d29f20cb7c09e5c91b06be9", size = 1174891, upload-time = "2026-09-30T01:17:48.993Z" },
 ]
 
 [[package]]
