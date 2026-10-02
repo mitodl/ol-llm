@@ -28,5 +28,5 @@ uv run prek run --all-files                     # the same hooks CI runs
 - `opik` is pinned exactly. Bumping it means the smoke test must still pass with the overrides
   in `python/smoke/pyproject.toml`, which are the overrides consumers copy from the README.
 - Do not add litellm as a dependency.
-- A release is a version bump in `python/pyproject.toml` and `python/src/ol_llm/__init__.py`;
+- A release is a version bump in `python/pyproject.toml`, the only place the version lives;
   the publish workflow does the rest on merge.

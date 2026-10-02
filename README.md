@@ -23,7 +23,7 @@ uv run pytest python/tests
 
 ## Releasing
 
-Bump `version` in `python/pyproject.toml` and `__version__` in
-`python/src/ol_llm/__init__.py` in a pull request. When it merges, the publish workflow builds,
+Bump `version` in `python/pyproject.toml` in a pull request; `ol_llm.__version__` reads it
+from the installed metadata. When it merges, the publish workflow builds,
 publishes to PyPI with Trusted Publishing, and tags the commit `ol-llm-v<version>`. A merge
 that does not change the version publishes nothing.

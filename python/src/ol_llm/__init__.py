@@ -7,7 +7,9 @@ does that first, so every consumer gets it by importing ol_llm before opik.
 """
 
 import os
+from importlib.metadata import version
 
 os.environ.setdefault("OPIK_SENTRY_ENABLE", "false")
 
-__version__ = "0.0.1"
+# The version lives only in python/pyproject.toml, which is what a release bumps.
+__version__ = version("ol-llm")
