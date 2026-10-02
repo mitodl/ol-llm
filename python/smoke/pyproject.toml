@@ -1,0 +1,27 @@
+# A consumer-shaped project: ol-llm installed with the overrides a uv consumer
+# copies to drop the opik SDK's heavy dependencies. CI runs smoke_test.py in this
+# environment on every change, so an opik release that starts importing a dropped
+# package eagerly fails here before any app picks it up.
+[project]
+name = "ol-llm-smoke"
+version = "0"
+requires-python = ">=3.11"
+dependencies = ["ol-llm"]
+
+[tool.uv]
+package = false
+override-dependencies = [
+    "boto3-stubs; sys_platform == 'never'",
+    "click; sys_platform == 'never'",
+    "litellm; sys_platform == 'never'",
+    "openai; sys_platform == 'never'",
+    "pytest; sys_platform == 'never'",
+    "rapidfuzz; sys_platform == 'never'",
+    "tree-sitter; sys_platform == 'never'",
+    "tree-sitter-javascript; sys_platform == 'never'",
+    "tree-sitter-typescript; sys_platform == 'never'",
+    "watchfiles; sys_platform == 'never'",
+]
+
+[tool.uv.sources]
+ol-llm = { path = "..", editable = true }
