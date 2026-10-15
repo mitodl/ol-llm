@@ -71,7 +71,17 @@ def test_other_profiles_variables_are_ignored() -> None:
 
 
 def test_use_case_name_is_upper_cased_for_the_environment() -> None:
-    assert use_case(name="feedback.summary v2").env_name == "FEEDBACK_SUMMARY_V2"
+    assert use_case(name="feedback-summary-v2").env_name == "FEEDBACK_SUMMARY_V2"
+
+
+# Names become environment variables and the X-OL-LLM-Use-Case header, so two
+# spellings may not share variables and nothing may break the header.
+@pytest.mark.parametrize(
+    "name", ["", "Batch", "course_translation", "feedback.summary", "-x", "a\r\nb"]
+)
+def test_malformed_names_are_refused(name: str) -> None:
+    with pytest.raises(ValueError, match="lowercase letters"):
+        use_case(name=name)
 
 
 def test_unparseable_environment_value_names_the_variable() -> None:

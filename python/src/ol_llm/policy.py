@@ -16,7 +16,7 @@ Profile = Literal["request", "batch"]
 
 _ENV_PREFIX = "OL_LLM"
 _RESERVED_NAMES = frozenset({"request", "batch"})
-_NON_ENV_CHARS = re.compile(r"[^A-Z0-9]")
+_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -46,8 +46,9 @@ class UseCase:
     """One LLM call site, declared once as a module-level constant.
 
     :param app: the application, e.g. ``learn-ai``. Becomes the Opik project.
-    :param name: the use case, e.g. ``course-translation``. Names the environment
-        overrides, so it may not be ``request`` or ``batch``.
+    :param name: the use case, e.g. ``course-translation``: lowercase letters, digits,
+        and hyphens. Names the environment overrides, so it may not be ``request`` or
+        ``batch``, and goes in a request header.
     :param profile: ``request`` for a user waiting on the answer, ``batch`` for
         pipelines and background jobs.
     :param model: the model id in PydanticAI form, ``provider:model``.
@@ -82,14 +83,17 @@ class UseCase:
     def __post_init__(self) -> None:
         """Validate the declaration so a bad one fails at import, not on first call.
 
-        :raises ValueError: on an empty or reserved name, an unknown profile, a
+        :raises ValueError: on a malformed or reserved name, an unknown profile, a
             policy override without a reason, or an out-of-range value.
         """
         if not self.app:
             msg = "UseCase.app must not be empty"
             raise ValueError(msg)
-        if not self.name:
-            msg = "UseCase.name must not be empty"
+        if not _NAME.fullmatch(self.name):
+            msg = (
+                "UseCase.name must be lowercase letters, digits, and hyphens, "
+                f"e.g. 'course-translation', not {self.name!r}"
+            )
             raise ValueError(msg)
         if self.name in _RESERVED_NAMES:
             msg = f"UseCase.name may not be {self.name!r}, which is a profile name"
@@ -108,9 +112,7 @@ class UseCase:
             msg = "UseCase.output_retries must not be negative"
             raise ValueError(msg)
         object.__setattr__(self, "fallback_models", tuple(self.fallback_models))
-        object.__setattr__(
-            self, "_env_name", _NON_ENV_CHARS.sub("_", self.name.upper())
-        )
+        object.__setattr__(self, "_env_name", self.name.upper().replace("-", "_"))
         _check_policy_values(
             f"use case {self.name!r}",
             timeout_seconds=self.timeout_seconds,
