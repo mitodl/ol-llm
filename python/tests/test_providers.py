@@ -39,7 +39,7 @@ def provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "GOOGLE_API_KEY": "test-key",
         "MISTRAL_API_KEY": "test-key",
         "TOGETHER_API_KEY": "test-key",
-        "AWS_REGION": "us-east-1",
+        "AWS_DEFAULT_REGION": "us-east-1",
         "AWS_ACCESS_KEY_ID": "test",
         "AWS_SECRET_ACCESS_KEY": "test",
     }.items():
