@@ -187,10 +187,12 @@ class _RetryBudget:
         if self.profile == "request":
             # A total budget: a Retry-After longer than what is left ends the call
             # so the caller can tell the user instead of holding a request open.
+            # Once the budget is spent, retrying with no wait would hammer a
+            # provider that is already failing.
             remaining = self.policy.max_backoff_seconds - self.waited
-            if retry_after is not None and retry_after > remaining:
+            if remaining <= 0 or (retry_after is not None and retry_after > remaining):
                 return None
-            delay = min(delay, max(remaining, 0))
+            delay = min(delay, remaining)
         else:
             delay = min(delay, self.policy.max_backoff_seconds)
         self.retries += 1

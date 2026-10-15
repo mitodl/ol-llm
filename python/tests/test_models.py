@@ -258,7 +258,7 @@ def test_request_profile_backoff_is_a_total(sleeps: list[float]) -> None:
         build_agent(use_case).run_sync("hi")
 
     assert sum(sleeps) == pytest.approx(2)
-    assert len(script.calls) == 11
+    assert len(script.calls) == len(sleeps) + 1 < 11
 
 
 def test_request_profile_gives_up_on_a_long_retry_after(sleeps: list[float]) -> None:
@@ -299,6 +299,7 @@ def test_batch_profile_backs_off_exponentially(sleeps: list[float]) -> None:
         build_agent(FEEDBACK).run_sync("hi")
 
     assert len(script.calls) == 6
+    assert len(sleeps) == 5
     for attempt, delay in enumerate(sleeps):
         assert 0.25 * 2**attempt <= delay <= 0.5 * 2**attempt
 
