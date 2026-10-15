@@ -17,8 +17,7 @@ from typing import Any, NoReturn, TypeVar, cast, overload
 
 import httpx
 import httpx2
-from pydantic_ai import Agent
-from pydantic_ai._run_context import RunContext
+from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities import RaiseContentFilterError
 from pydantic_ai.exceptions import (
     ContentFilterError,

@@ -47,6 +47,8 @@ if TYPE_CHECKING:
 __version__ = version("ol-llm")
 
 _PYDANTIC_AI_EXPORTS = frozenset({"build_agent", "build_model", "usage_limits"})
+# What the pydantic-ai extra installs that ol_llm.models imports directly.
+_PYDANTIC_AI_MODULES = frozenset({"pydantic_ai", "httpx2"})
 
 __all__ = [
     "Attribution",
@@ -82,7 +84,11 @@ def __getattr__(name: str) -> Any:  # noqa: ANN401
         raise AttributeError(msg)
     try:
         module = import_module("ol_llm.models")
-    except ImportError as exc:
+    except ModuleNotFoundError as exc:
+        # Only a missing extra gets the hint; any other import failure is a bug
+        # and should surface as itself.
+        if (exc.name or "").partition(".")[0] not in _PYDANTIC_AI_MODULES:
+            raise
         msg = f"ol_llm.{name} needs the ol-llm[pydantic-ai] extra: {exc}"
         raise ImportError(msg) from exc
     return getattr(module, name)
