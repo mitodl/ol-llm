@@ -61,6 +61,17 @@ jobs:
           absent = ["pydantic_ai", "pydantic_ai_harness", "hindsight_client"]
           present = [name for name in absent if importlib.util.find_spec(name)]
           assert not present, f"installed without being asked for: {present}"
+          # Call sites not built on PydanticAI use the policy from the base.
+          use_case = ol_llm.UseCase(
+              app="ci", name="base", profile="batch", model="openai:gpt-4o-mini"
+          )
+          assert ol_llm.resolve_policy(use_case, {}).timeout_seconds == 300
+          try:
+              ol_llm.build_model
+          except ImportError as exc:
+              assert "ol-llm[pydantic-ai]" in str(exc), exc
+          else:
+              raise AssertionError("build_model imported without PydanticAI")
           print(f"ol-llm {ol_llm.__version__} imports with no extras")
           PY
 

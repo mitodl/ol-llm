@@ -5,8 +5,8 @@ overrides drop. Exits non-zero on any failure.
 
 What it proves, in an environment shaped like a consumer's runtime image:
 - ol_llm and opik import with litellm, openai, pytest, and tree-sitter absent;
-- an @opik.track root with an instrumented PydanticAI agent inside it produces OTel
-  spans that OpikSpanProcessor attaches to the tracked trace;
+- an @opik.track root with an instrumented agent from ol_llm.build_agent inside it
+  produces OTel spans that OpikSpanProcessor attaches to the tracked trace;
 - importing ol_llm first leaves no Sentry client running.
 
 No Opik server is needed. The SDK is pointed at a closed port, so its background
@@ -23,19 +23,22 @@ os.environ["OPIK_WORKSPACE"] = "default"
 import ol_llm
 import opik
 import sentry_sdk
+from ol_llm.models import build_agent, override_models
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
 from opik.integrations.otel import OpikSpanProcessor
-from pydantic_ai import Agent
 from pydantic_ai.capabilities import Instrumentation
 from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_ai.models.test import TestModel
 
 DROPPED = ("litellm", "openai", "pytest", "tree_sitter", "click")
 OPIK_TRACE_ID = "opik.trace_id"
+SMOKE = ol_llm.UseCase(
+    app="ol-llm-smoke", name="smoke", profile="request", model="openai:smoke"
+)
 
 
 def main() -> int:
@@ -45,12 +48,18 @@ def main() -> int:
     provider.add_span_processor(OpikSpanProcessor())
     provider.add_span_processor(SimpleSpanProcessor(exporter))
 
-    agent = Agent(
-        TestModel(),
-        capabilities=[
-            Instrumentation(settings=InstrumentationSettings(tracer_provider=provider))
-        ],
-    )
+    ol_llm.configure(ol_llm.Settings(environment="ci"))
+    # The test model stands in for the provider; the policy wrapper, the agent's
+    # capabilities, and the import graph are the library's own.
+    with override_models(TestModel()):
+        agent = build_agent(
+            SMOKE,
+            capabilities=[
+                Instrumentation(
+                    settings=InstrumentationSettings(tracer_provider=provider)
+                )
+            ],
+        )
 
     @opik.track(name="smoke", project_name="ol-llm-smoke")
     def run() -> str:
