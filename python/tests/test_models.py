@@ -1,4 +1,5 @@
 import asyncio
+import pickle
 from collections.abc import AsyncIterator, Callable
 
 import httpx
@@ -503,6 +504,18 @@ def test_tracing_disabled_restores_the_previous_state() -> None:
     with tracing_disabled():
         assert opik.is_tracing_active() is False
     assert opik.is_tracing_active() is before
+
+
+def test_errors_survive_pickling() -> None:
+    original = LLMRejected("m", use_case="u", model=PRIMARY, status_code=400)
+    restored = pickle.loads(pickle.dumps(original))  # noqa: S301
+
+    assert type(restored) is LLMRejected
+    assert (restored.use_case, restored.status_code, restored.args) == (
+        "u",
+        400,
+        ("m",),
+    )
 
 
 def test_error_copy_keeps_fields() -> None:

@@ -5,7 +5,8 @@ the class to their own user-facing text; the provider's message stays on the
 exception and the trace and is never shown to users.
 """
 
-from typing import ClassVar, Self
+import copy
+from typing import Any, ClassVar, Self
 
 
 class LLMError(Exception):
@@ -24,16 +25,30 @@ class LLMError(Exception):
         self.use_case = use_case
         self.model = model
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Pickle by attributes, because the keyword-only fields defeat the default.
+
+        Celery and process pools pickle exceptions to hand them back to the caller;
+        without this the caller gets a wrapper its ``except LLMRateLimited`` misses.
+        """
+        return (_rebuild, (type(self), self.args, self.__dict__))
+
     def copy(self) -> Self:
         """Return a copy that can take a different ``__cause__``.
 
         Fallback re-raises the primary model's error with the whole exception group
         as its cause; copying keeps the original's own cause intact inside the group.
         """
-        clone = type(self).__new__(type(self))
-        clone.__dict__.update(self.__dict__)
-        clone.args = self.args
-        return clone
+        return copy.copy(self)
+
+
+def _rebuild(
+    cls: type[LLMError], args: tuple[object, ...], state: dict[str, object]
+) -> LLMError:
+    error = cls.__new__(cls)
+    error.args = args
+    error.__dict__.update(state)
+    return error
 
 
 class LLMRateLimited(LLMError):
