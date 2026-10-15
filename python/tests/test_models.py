@@ -1,6 +1,7 @@
 import asyncio
 import pickle
 from collections.abc import AsyncIterator, Callable
+from typing import Any
 
 import httpx
 import httpx2
@@ -26,7 +27,7 @@ from ol_llm.models import (
 )
 from ol_llm.testing import policy_model, tracing_disabled
 from pydantic import BaseModel
-from pydantic_ai import Agent
+from pydantic_ai import Agent, DeferredToolRequests
 from pydantic_ai.capabilities import RaiseContentFilterError
 from pydantic_ai.exceptions import (
     ContentFilterError,
@@ -39,7 +40,7 @@ from pydantic_ai.exceptions import (
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
-from pydantic_ai.output import NativeOutput
+from pydantic_ai.output import NativeOutput, OutputSpec
 
 PRIMARY = "openai:gpt-4o-mini"
 FALLBACK = "anthropic:claude-haiku-4-5"
@@ -464,14 +465,25 @@ def test_invalid_output_after_retries_is_classified() -> None:
     )
 
 
-def test_native_output_needs_model_support(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "output_type",
+    [
+        NativeOutput(Summary),
+        [NativeOutput(Summary)],
+        [NativeOutput(Summary), None],
+        [[NativeOutput(Summary)], DeferredToolRequests],
+    ],
+)
+def test_native_output_needs_model_support(
+    monkeypatch: pytest.MonkeyPatch, output_type: OutputSpec[Any]
+) -> None:
     monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
     use_case = UseCase(
         app="a", name="extract", profile="batch", model="mistral:mistral-large-latest"
     )
 
     with pytest.raises(ValueError, match="does not support NativeOutput"):
-        build_agent(use_case, output_type=NativeOutput(Summary))
+        build_agent(use_case, output_type=output_type)
 
 
 def test_usage_limits_follow_the_use_case() -> None:

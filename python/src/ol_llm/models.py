@@ -561,8 +561,17 @@ def _chain(model: Model) -> Sequence[Model]:
     return model.models if isinstance(model, FallbackModel) else (model,)
 
 
+def _uses_native_output(output_type: object) -> bool:
+    # PydanticAI flattens nested sequences, so [NativeOutput(X), None] is native too.
+    if isinstance(output_type, NativeOutput):
+        return True
+    if isinstance(output_type, Sequence) and not isinstance(output_type, str):
+        return any(_uses_native_output(member) for member in output_type)
+    return False
+
+
 def _check_output_mode(output_type: object, model: Model) -> None:
-    if not isinstance(output_type, NativeOutput):
+    if not _uses_native_output(output_type):
         return
     for member in _chain(model):
         if not member.profile.get("supports_json_schema_output", False):
