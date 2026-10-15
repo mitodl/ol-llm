@@ -5,15 +5,17 @@ The attempt counts depend on SDK defaults that can change in any release (spec
 what arrives.
 """
 
+import asyncio
 import json
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
+from botocore.exceptions import EventStreamError
 from ol_llm import LLMRejected, LLMUnavailable, UseCase
 from ol_llm.attribution import USE_CASE_HEADER
 from ol_llm.models import PolicyModel, build_agent, build_model
@@ -231,3 +233,82 @@ def test_gateway_requests_carry_the_use_case(
 
     headers = {k.lower(): v for k, v in mock_provider.requests[0].items()}
     assert headers[USE_CASE_HEADER.lower()] == "summary"
+
+
+# Bedrock hands back its stream before reading an event, so these fake the event
+# stream itself: a throttle on the first read must be retried like one on opening.
+THROTTLED = EventStreamError(
+    {"Error": {"Code": "throttlingException", "Message": "slow down"}},
+    "ConverseStream",
+)
+ANSWER = [
+    {"messageStart": {"role": "assistant"}},
+    {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "ok"}}},
+    {"contentBlockStop": {"contentBlockIndex": 0}},
+    {"messageStop": {"stopReason": "end_turn"}},
+    {
+        "metadata": {
+            "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+            "metrics": {"latencyMs": 1},
+        }
+    },
+]
+
+
+@dataclass
+class FakeEventStream:
+    events: list[object]
+    closed: bool = False
+
+    def __iter__(self) -> Iterator[object]:
+        for event in self.events:
+            if isinstance(event, Exception):
+                raise event
+            yield event
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def stream_bedrock(
+    monkeypatch: pytest.MonkeyPatch, *responses: list[object]
+) -> tuple[Any, list[FakeEventStream]]:
+    agent = build_agent(use_case("bedrock:us.anthropic.claude-sonnet-5"))
+    opened: list[FakeEventStream] = []
+
+    def converse_stream(**_params: object) -> dict[str, object]:
+        stream = FakeEventStream(responses[min(len(opened), len(responses) - 1)])
+        opened.append(stream)
+        return {"stream": stream, "ResponseMetadata": {"RequestId": "r"}}
+
+    client = agent.model.wrapped.provider.client  # type: ignore[union-attr]
+    monkeypatch.setattr(client, "converse_stream", converse_stream)
+    return agent, opened
+
+
+async def consume(agent: Any) -> str:  # noqa: ANN401
+    async with agent.run_stream("hi") as stream:
+        output: str = await stream.get_output()
+        return output
+
+
+@pytest.mark.usefixtures("provider_env")
+def test_bedrock_stream_retries_a_failed_first_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent, opened = stream_bedrock(monkeypatch, [THROTTLED], ANSWER)
+
+    assert asyncio.run(consume(agent)) == "ok"
+    assert len(opened) == 2
+    assert opened[0].closed
+
+
+@pytest.mark.usefixtures("provider_env")
+def test_bedrock_stream_gives_up_after_its_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent, opened = stream_bedrock(monkeypatch, [THROTTLED])
+
+    with pytest.raises(LLMUnavailable):
+        asyncio.run(consume(agent))
+    assert len(opened) == 3

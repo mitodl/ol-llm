@@ -9,12 +9,21 @@ the extra for each provider a use case names.
 import asyncio
 import os
 import random
-from collections.abc import AsyncGenerator, Callable, Generator, Mapping, Sequence
+import sys
+from collections.abc import (
+    AsyncGenerator,
+    Callable,
+    Generator,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, NoReturn, TypeVar, cast, overload
 
+import anyio
 import httpx
 import httpx2
 from pydantic_ai import Agent, RunContext
@@ -199,6 +208,52 @@ class _RetryBudget:
         return delay
 
 
+_NO_EVENT = object()
+
+
+@dataclass
+class _PrimedEvents:
+    """A Bedrock event stream whose first event has already been read."""
+
+    first: object
+    rest: Iterator[object]
+    source: Any
+
+    def __iter__(self) -> Iterator[object]:
+        if self.first is not _NO_EVENT:
+            yield self.first
+        yield from self.rest
+
+    def close(self) -> None:
+        self.source.close()
+
+
+async def _read_first_bedrock_event(stream: StreamedResponse) -> None:
+    """Read a Bedrock stream's first event while the stream can still be retried.
+
+    Every other PydanticAI provider reads the first chunk before handing back its
+    stream. BedrockModel does not, so a throttle or outage on the first read would
+    skip both retries and fallback. The event is put back for the consumer. This
+    reaches into BedrockStreamedResponse's private fields; remove it once
+    PydanticAI reads the first event itself:
+    https://github.com/pydantic/pydantic-ai/issues/10364
+    """
+    bedrock = sys.modules.get("pydantic_ai.models.bedrock")
+    if bedrock is None or not isinstance(stream, bedrock.BedrockStreamedResponse):
+        return
+    primed = cast("Any", stream)
+    source = primed._event_stream  # noqa: SLF001
+    events = iter(source)
+    try:
+        with bedrock._map_api_errors(stream.model_name):  # noqa: SLF001
+            first = await anyio.to_thread.run_sync(next, events, _NO_EVENT)
+    except Exception:
+        # Leaving the provider's context does not close Bedrock's event stream.
+        await stream.cancel()
+        raise
+    primed._event_stream = _PrimedEvents(first, events, source)  # noqa: SLF001
+
+
 @dataclass(init=False)
 class PolicyModel(WrapperModel):
     """A provider model under the call policy: one retry layer and a timeout.
@@ -238,6 +293,18 @@ class PolicyModel(WrapperModel):
     def _classify(self, exc: BaseException) -> LLMError | None:
         return classify_failure(exc, use_case=self.use_case, model=self.catalog_id)
 
+    def _retry_delay(self, exc: Exception, budget: _RetryBudget) -> float:
+        """Return the wait before the next attempt, or raise what the caller sees.
+
+        Callers catch ``Exception`` and hand it here; anything not classified is
+        re-raised unchanged.
+        """
+        if (error := self._classify(exc)) is None:
+            raise exc
+        if (delay := budget.next_delay(error)) is None:
+            raise error from exc
+        return delay
+
     async def request(
         self,
         messages: list[ModelMessage],
@@ -252,11 +319,8 @@ class PolicyModel(WrapperModel):
                 return await self.wrapped.request(
                     messages, settings, model_request_parameters
                 )
-            except Exception as exc:
-                if (error := self._classify(exc)) is None:
-                    raise
-                if (delay := budget.next_delay(error)) is None:
-                    raise error from exc
+            except Exception as exc:  # noqa: BLE001
+                delay = self._retry_delay(exc, budget)
             await _sleep(delay)
 
     @asynccontextmanager
@@ -276,12 +340,14 @@ class PolicyModel(WrapperModel):
             )
             try:
                 stream = await stream_cm.__aenter__()
-            except Exception as exc:
-                if (error := self._classify(exc)) is None:
-                    raise
-                if (delay := budget.next_delay(error)) is None:
-                    raise error from exc
-                await _sleep(delay)
+            except Exception as exc:  # noqa: BLE001
+                await _sleep(self._retry_delay(exc, budget))
+                continue
+            try:
+                await _read_first_bedrock_event(stream)
+            except Exception as exc:  # noqa: BLE001
+                await stream_cm.__aexit__(type(exc), exc, exc.__traceback__)
+                await _sleep(self._retry_delay(exc, budget))
                 continue
             break
         try:
