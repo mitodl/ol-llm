@@ -18,6 +18,7 @@ from ol_llm import LLMRejected, LLMUnavailable, UseCase
 from ol_llm.attribution import USE_CASE_HEADER
 from ol_llm.models import PolicyModel, build_agent, build_model
 from ol_llm.settings import GatewayRoute, Settings, configure
+from pydantic_ai.providers import mistral
 
 HANG_SECONDS = 1.5
 TEST_TIMEOUT_SECONDS = "0.3"
@@ -164,6 +165,17 @@ def point_at(
     if family == "bedrock":
         monkeypatch.setenv("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", mock.url)
         return
+    if family == "google":
+        monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", mock.url)
+        return
+    if family == "mistral":
+        # MistralProvider takes a base URL only as an argument.
+        class LocalMistral(mistral.MistralProvider):
+            def __init__(self) -> None:
+                super().__init__(base_url=mock.url)
+
+        monkeypatch.setattr(mistral, "MistralProvider", LocalMistral)
+        return
     base_url = f"{mock.url}/v1" if family == "openai" else mock.url
     route = GatewayRoute(base_url=base_url, api_key="app-key")
     configure(Settings(environment="ci", gateway_routes={family: route}))
@@ -173,6 +185,8 @@ MOCKED_MODELS = [
     "openai:gpt-4o-mini",
     "anthropic:claude-haiku-4-5",
     "bedrock:us.anthropic.claude-sonnet-5",
+    "google:gemini-3-pro-preview",
+    "mistral:mistral-large-latest",
 ]
 
 

@@ -447,7 +447,7 @@ def _google_provider(provider: str) -> Provider[Any]:
         )
     except ImportError as exc:
         _raise_missing_extra("google", exc)
-    # One attempt by default: there are no SDK retries to turn off.
+    # The SDK retries only when given a retry config, and none is passed.
     if provider == "google-cloud":
         return GoogleCloudProvider()
     return GoogleProvider()
@@ -458,7 +458,7 @@ def _mistral_provider() -> Provider[Any]:
         from pydantic_ai.providers.mistral import MistralProvider  # noqa: PLC0415
     except ImportError as exc:
         _raise_missing_extra("mistral", exc)
-    # One attempt by default: there are no SDK retries to turn off.
+    # The SDK retries only when given a retry config, and none is passed.
     return MistralProvider()
 
 
