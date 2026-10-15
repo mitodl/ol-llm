@@ -1,6 +1,6 @@
 import asyncio
 import pickle
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterable, AsyncIterator, Callable
 from typing import Any
 
 import httpx
@@ -65,26 +65,30 @@ def http_error(status: int, headers: dict[str, str] | None = None) -> ModelHTTPE
 
 
 class Scripted:
-    """A FunctionModel body that raises the scripted failures, then answers."""
+    """A FunctionModel body that plays its steps in order, then answers.
 
-    def __init__(self, *failures: Exception, answer: str = "ok") -> None:
-        self.failures = list(failures)
+    Each step is a failure to raise or a reply to give.
+    """
+
+    def __init__(self, *steps: Exception | str, answer: str = "ok") -> None:
+        self.steps = list(steps)
         self.answer = answer
         self.calls: list[AgentInfo] = []
 
-    def __call__(self, _messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    def _next(self, info: AgentInfo) -> str:
         self.calls.append(info)
-        if self.failures:
-            raise self.failures.pop(0)
-        return ModelResponse(parts=[TextPart(self.answer)])
+        step = self.steps.pop(0) if self.steps else self.answer
+        if isinstance(step, Exception):
+            raise step
+        return step
+
+    def __call__(self, _messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(self._next(info))])
 
     async def stream(
         self, _messages: list[ModelMessage], info: AgentInfo
     ) -> AsyncIterator[str]:
-        self.calls.append(info)
-        if self.failures:
-            raise self.failures.pop(0)
-        yield self.answer
+        yield self._next(info)
 
 
 def always(exc: Callable[[], Exception], count: int = 20) -> list[Exception]:
@@ -463,6 +467,66 @@ def test_invalid_output_after_retries_is_classified() -> None:
         classify_run_failure(caught.value, use_case="summary", model=PRIMARY),
         LLMInvalidOutput,
     )
+
+
+SECOND_FALLBACK = "mistral:mistral-large-latest"
+VALID = '{"text": "from fallback"}'
+
+
+def run_for_summary(use_case: UseCase, *, stream: bool) -> Summary:
+    agent = build_agent(use_case, output_type=NativeOutput(Summary))
+    if not stream:
+        return agent.run_sync("hi").output
+
+    # run_stream does not retry invalid output; a run with an event handler streams
+    # every request and does.
+    async def drain(_ctx: object, events: AsyncIterable[object]) -> None:
+        async for _ in events:
+            pass
+
+    return agent.run_sync("hi", event_stream_handler=drain).output
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_invalid_output_is_retried_on_the_model_that_gave_it(stream: bool) -> None:  # noqa: FBT001
+    # The primary has recovered by the retry; it must still not answer it.
+    primary = Scripted(
+        *always(lambda: http_error(503), 3), answer='{"text": "from primary"}'
+    )
+    fallback = Scripted("not json", answer=VALID)
+    with override_models(fallback_models(primary, fallback)):
+        output = run_for_summary(SUMMARY_WITH_FALLBACK, stream=stream)
+
+    assert output == Summary(text="from fallback")
+    assert len(primary.calls) == 3
+    assert len(fallback.calls) == 2
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_retry_falls_back_only_past_the_model_that_gave_it(stream: bool) -> None:  # noqa: FBT001
+    primary = Scripted(
+        *always(lambda: http_error(503), 3), answer='{"text": "from primary"}'
+    )
+    fallback = Scripted("not json", *always(lambda: http_error(503), 3))
+    second = Scripted(answer=VALID)
+    use_case = UseCase(
+        app="mit-learn",
+        name="summary",
+        profile="request",
+        model=PRIMARY,
+        fallback_models=(FALLBACK, SECOND_FALLBACK),
+    )
+    models = {
+        **fallback_models(primary, fallback),
+        SECOND_FALLBACK: FunctionModel(second, stream_function=second.stream),
+    }
+    with override_models(models):
+        output = run_for_summary(use_case, stream=stream)
+
+    assert output == Summary(text="from fallback")
+    assert len(primary.calls) == 3
+    assert len(fallback.calls) == 4
+    assert len(second.calls) == 1
 
 
 @pytest.mark.parametrize(

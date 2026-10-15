@@ -59,15 +59,17 @@ budget is a total, and a `Retry-After` longer than what remains ends the call at
 the cap and tries again. A stream is retried while it opens; a failure after the first chunk
 reaches the caller as `LLMUnavailable`.
 
-Invalid output is retried on the same model, `output_retries` times (default 1), not by
-falling back.
+Invalid output is retried on the model that produced it, `output_retries` times (default 1).
+The retry falls back only if that model is rate limited or unavailable, and then only to the
+models after it in the chain.
 
 ## Fallback
 
 A use case that lists `fallback_models` tries them in order once the model before has spent
 its own retries on a rate limit or an outage. A rejected request does not fall back. When every
-model fails, the caller gets the primary model's error, with the whole group of failures as
-its cause. A model whose gateway route already falls back takes no library fallback.
+model fails, the caller gets the primary model's error (on a retry of invalid output, the
+error of the model that produced it), with the whole group of failures as its cause. A model
+whose gateway route already falls back takes no library fallback.
 
 ## Degraded results
 

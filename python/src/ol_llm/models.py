@@ -36,7 +36,12 @@ from pydantic_ai.exceptions import (
     UnexpectedModelBehavior,
     UsageLimitExceeded,
 )
-from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    RetryPromptPart,
+)
 from pydantic_ai.models import (
     Model,
     ModelRequestParameters,
@@ -208,6 +213,25 @@ class _RetryBudget:
         return delay
 
 
+_METADATA_KEY = "ol_llm"
+
+
+def _stamp_answered_by(
+    response: ModelResponse | StreamedResponse, catalog_id: str
+) -> None:
+    """Record which chain member answered, where the run's history keeps it."""
+    if response.metadata is None:
+        response.metadata = {}
+    response.metadata.setdefault(_METADATA_KEY, {})["model"] = catalog_id
+
+
+def _answered_by(response: ModelResponse) -> str | None:
+    answered_by: str | None = (
+        (response.metadata or {}).get(_METADATA_KEY, {}).get("model")
+    )
+    return answered_by
+
+
 _NO_EVENT = object()
 
 
@@ -316,11 +340,14 @@ class PolicyModel(WrapperModel):
         budget = _RetryBudget(self.policy, self.profile_name)
         while True:
             try:
-                return await self.wrapped.request(
+                response = await self.wrapped.request(
                     messages, settings, model_request_parameters
                 )
             except Exception as exc:  # noqa: BLE001
                 delay = self._retry_delay(exc, budget)
+            else:
+                _stamp_answered_by(response, self.catalog_id)
+                return response
             await _sleep(delay)
 
     @asynccontextmanager
@@ -350,6 +377,7 @@ class PolicyModel(WrapperModel):
                 await _sleep(self._retry_delay(exc, budget))
                 continue
             break
+        _stamp_answered_by(stream, self.catalog_id)
         try:
             yield stream
         except Exception as exc:
@@ -372,8 +400,35 @@ class PolicyFallbackModel(FallbackModel):
 
     Each model in the chain spends its own retries before the next is tried, and
     only rate limits and outages fall back (spec §6.4). When every model fails the
-    caller gets the primary model's error, with the whole group as ``__cause__``.
+    caller gets the error of the first model tried, with the whole group as
+    ``__cause__``.
+
+    A request that asks the model to retry its last response (invalid output, or a
+    tool's ``ModelRetry``) starts at the model that gave that response, so the retry
+    neither waits out an outage the run already fell back from nor gets answered
+    by a model that never saw the mistake.
     """
+
+    def _starting_at(self, messages: list[ModelMessage]) -> FallbackModel:
+        """Return the chain a request runs on, read from the run's own history."""
+        last = messages[-1] if messages else None
+        if not isinstance(last, ModelRequest) or not any(
+            isinstance(part, RetryPromptPart) for part in last.parts
+        ):
+            return self
+        answered_by = next(
+            (
+                _answered_by(message)
+                for message in reversed(messages)
+                if isinstance(message, ModelResponse)
+            ),
+            None,
+        )
+        ids = [cast("PolicyModel", model).catalog_id for model in self.models]
+        if answered_by not in ids[1:]:
+            return self
+        start = ids.index(answered_by)
+        return FallbackModel(*self.models[start:], fallback_on=FALLBACK_ON)
 
     async def request(
         self,
@@ -383,8 +438,11 @@ class PolicyFallbackModel(FallbackModel):
     ) -> ModelResponse:
         """Try each model in turn."""
         try:
-            return await super().request(
-                messages, model_settings, model_request_parameters
+            return await FallbackModel.request(
+                self._starting_at(messages),
+                messages,
+                model_settings,
+                model_request_parameters,
             )
         except FallbackExceptionGroup as group:
             if (primary := _primary_error(group)) is None:
@@ -400,8 +458,12 @@ class PolicyFallbackModel(FallbackModel):
         run_context: RunContext[Any] | None = None,
     ) -> AsyncGenerator[StreamedResponse]:
         """Open a stream on each model in turn; fall back only while opening."""
-        stream_cm = super().request_stream(
-            messages, model_settings, model_request_parameters, run_context
+        stream_cm = FallbackModel.request_stream(
+            self._starting_at(messages),
+            messages,
+            model_settings,
+            model_request_parameters,
+            run_context,
         )
         try:
             stream = await stream_cm.__aenter__()
