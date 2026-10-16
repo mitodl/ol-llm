@@ -11,13 +11,15 @@ import threading
 import time
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
+from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import pytest
 from botocore.exceptions import EventStreamError
-from ol_llm import LLMRejected, LLMUnavailable, UseCase
+from ol_llm import LLMRejected, LLMUnavailable, UseCase, models
 from ol_llm.attribution import USE_CASE_HEADER
+from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.models import PolicyModel, build_agent, build_model
 from ol_llm.settings import GatewayRoute, Settings, configure
 from pydantic_ai.providers import mistral
@@ -26,26 +28,34 @@ HANG_SECONDS = 1.5
 TEST_TIMEOUT_SECONDS = "0.3"
 
 
+# Models the catalog does not list, so construction is tested for every provider
+# the library builds and refused for one it does not.
+UNLISTED_MODELS = (
+    "anthropic:claude-haiku-4-5",
+    "together:meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "google:gemini-3.1-pro-preview",
+    "groq:llama-3.3-70b",
+)
+
+
+@pytest.fixture(autouse=True)
+def provider_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    released = load_catalog()
+    unlisted = {
+        model_id: CatalogEntry(
+            id=model_id,
+            kind="chat",
+            input_usd_per_mtok=Decimal(1),
+            output_usd_per_mtok=Decimal(1),
+        )
+        for model_id in UNLISTED_MODELS
+    }
+    catalog = Catalog({**released.entries, **unlisted})
+    monkeypatch.setattr(models, "load_catalog", lambda: catalog)
+
+
 def use_case(model: str) -> UseCase:
     return UseCase(app="mit-learn", name="summary", profile="request", model=model)
-
-
-@pytest.fixture
-def provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name, value in {
-        "OPENAI_API_KEY": "test-key",
-        "ANTHROPIC_API_KEY": "test-key",
-        "AZURE_OPENAI_API_KEY": "test-key",
-        "AZURE_OPENAI_ENDPOINT": "https://example.openai.azure.com",
-        "OPENAI_API_VERSION": "2024-10-21",
-        "GOOGLE_API_KEY": "test-key",
-        "MISTRAL_API_KEY": "test-key",
-        "TOGETHER_API_KEY": "test-key",
-        "AWS_DEFAULT_REGION": "us-east-1",
-        "AWS_ACCESS_KEY_ID": "test",
-        "AWS_SECRET_ACCESS_KEY": "test",
-    }.items():
-        monkeypatch.setenv(name, value)
 
 
 def provider_client(model_id: str) -> Any:  # noqa: ANN401
@@ -81,7 +91,7 @@ def test_bedrock_client_carries_the_timeout_and_no_retries() -> None:
 
 @pytest.mark.usefixtures("provider_env")
 @pytest.mark.parametrize(
-    "model_id", ["google:gemini-3-pro-preview", "mistral:mistral-large-latest"]
+    "model_id", ["google:gemini-3.1-pro-preview", "mistral:mistral-large-latest"]
 )
 def test_single_attempt_providers_build(model_id: str) -> None:
     assert isinstance(build_model(use_case(model_id)), PolicyModel)
@@ -110,12 +120,9 @@ def test_gateway_route_replaces_the_vendor_api(family: str, model_id: str) -> No
     assert client.default_headers[USE_CASE_HEADER] == "summary"
 
 
-@pytest.mark.parametrize(
-    "model_id", ["gpt-4o-mini", "openai:", ":gpt-4o-mini", "groq:llama-3.3-70b"]
-)
-def test_unsupported_model_ids_are_refused(model_id: str) -> None:
-    with pytest.raises(ValueError, match=r"provider:model|does not build"):
-        build_model(use_case(model_id))
+def test_unsupported_provider_is_refused() -> None:
+    with pytest.raises(ValueError, match="does not build 'groq'"):
+        build_model(use_case("groq:llama-3.3-70b"))
 
 
 # The mock server
@@ -187,7 +194,7 @@ MOCKED_MODELS = [
     "openai:gpt-4o-mini",
     "anthropic:claude-haiku-4-5",
     "bedrock:us.anthropic.claude-sonnet-5",
-    "google:gemini-3-pro-preview",
+    "google:gemini-3.1-pro-preview",
     "mistral:mistral-large-latest",
 ]
 

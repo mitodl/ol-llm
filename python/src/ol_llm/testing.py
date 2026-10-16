@@ -21,6 +21,7 @@ from contextlib import contextmanager
 import opik
 from pydantic_ai.models import Model
 
+from ol_llm.catalog import load_catalog
 from ol_llm.models import PolicyModel, override_models
 from ol_llm.policy import UseCase, resolve_policy
 
@@ -34,11 +35,14 @@ def policy_model(use_case: UseCase, model: Model) -> PolicyModel:
     :param model: the model standing in for the provider.
     :returns: the wrapped model.
     :rtype: PolicyModel
+    :raises ValueError: if the use case's model is not a chat model in the
+        catalog, or is retired.
     """
     return PolicyModel(
         model,
         use_case=use_case,
         model_id=use_case.model,
+        catalog_entry=load_catalog().require(use_case.model, kind="chat"),
         policy=resolve_policy(use_case),
     )
 

@@ -47,6 +47,11 @@ ignore = [
 "**/tests/**" = ["D", "INP001", "S101", "PLR2004"]
 "python/smoke/smoke_test.py" = ["T201", "INP001"]
 
+[tool.pytest.ini_options]
+markers = [
+    "network: fetches from the internet; deselect offline with -m 'not network'",
+]
+
 [tool.mypy]
 strict = true
 python_version = "3.11"
