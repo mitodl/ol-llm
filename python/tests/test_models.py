@@ -43,7 +43,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.output import NativeOutput, OutputSpec
 
 PRIMARY = "openai:gpt-4o-mini"
-FALLBACK = "anthropic:claude-haiku-4-5"
+FALLBACK = "bedrock:global.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 SUMMARY = UseCase(app="mit-learn", name="summary", profile="request", model=PRIMARY)
 SUMMARY_WITH_FALLBACK = UseCase(

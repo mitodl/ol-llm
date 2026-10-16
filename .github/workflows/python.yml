@@ -66,6 +66,8 @@ jobs:
               app="ci", name="base", profile="batch", model="openai:gpt-4o-mini"
           )
           assert ol_llm.resolve_policy(use_case, {}).timeout_seconds == 300
+          # The catalog ships in the wheel, and apps check against it without extras.
+          assert ol_llm.check_model_ids(["openai:gpt-4o-mini"]).ok
           try:
               ol_llm.build_model
           except ImportError as exc:

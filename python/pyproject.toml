@@ -50,6 +50,9 @@ harness = ["pydantic-ai-harness>=0.52,<0.53"]
 # extra may change backend before the memory interface ships.
 memory = ["hindsight-client>=0.10,<0.11"]
 
+[project.scripts]
+ol-llm-catalog = "ol_llm.catalog:main"
+
 [project.urls]
 Homepage = "https://github.com/mitodl/ol-llm"
 Repository = "https://github.com/mitodl/ol-llm"

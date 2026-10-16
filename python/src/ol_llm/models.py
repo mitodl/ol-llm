@@ -7,6 +7,7 @@ the extra for each provider a use case names.
 """
 
 import asyncio
+import logging
 import os
 import random
 import sys
@@ -56,6 +57,7 @@ from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.usage import UsageLimits
 
 from ol_llm.attribution import USE_CASE_HEADER, Attribution
+from ol_llm.catalog import CatalogEntry, load_catalog
 from ol_llm.errors import (
     LLMBudgetExceeded,
     LLMContentFiltered,
@@ -67,6 +69,8 @@ from ol_llm.errors import (
 )
 from ol_llm.policy import CallPolicy, Profile, UseCase, resolve_policy
 from ol_llm.settings import GatewayRoute, Settings, get_settings
+
+log = logging.getLogger(__name__)
 
 OutputT = TypeVar("OutputT")
 _NO_DEPS: type[None] = type(None)
@@ -291,22 +295,32 @@ class PolicyModel(WrapperModel):
 
     use_case: str
     catalog_id: str
+    catalog_entry: CatalogEntry
     profile_name: Profile
     policy: CallPolicy
 
     def __init__(
-        self, wrapped: Model, *, use_case: UseCase, model_id: str, policy: CallPolicy
+        self,
+        wrapped: Model,
+        *,
+        use_case: UseCase,
+        model_id: str,
+        catalog_entry: CatalogEntry,
+        policy: CallPolicy,
     ) -> None:
         """Wrap a provider model.
 
         :param wrapped: the provider model, with its SDK's own retries off.
         :param use_case: the call site.
         :param model_id: the id the model was built from, for errors.
+        :param catalog_entry: the model's catalog entry; tracing reads its status
+            and Opik name from here.
         :param policy: the resolved policy.
         """
         super().__init__(wrapped)
         self.use_case = use_case.name
         self.catalog_id = model_id
+        self.catalog_entry = catalog_entry
         self.profile_name = use_case.profile
         self.policy = policy
 
@@ -650,6 +664,29 @@ def _provider_model(
     return infer_model(model_id, provider_factory=factory)
 
 
+def _catalog_entries(use_case: UseCase) -> list[CatalogEntry]:
+    """Look up every model the use case names; only catalog chat models build."""
+    catalog = load_catalog()
+    entries = [
+        catalog.require(model_id, kind="chat") for model_id in use_case.model_ids
+    ]
+    if use_case.fallback_models and entries[0].route_falls_back:
+        msg = (
+            f"Use case {use_case.name!r} declares fallback_models, but the route to "
+            f"{use_case.model!r} already falls back on its own (spec §6.4)"
+        )
+        raise ValueError(msg)
+    for model_id, entry in zip(use_case.model_ids, entries, strict=True):
+        if entry.status == "deprecated":
+            log.warning(
+                "Use case %s names %s, which is deprecated and retires on %s",
+                use_case.name,
+                model_id,
+                entry.retires_on,
+            )
+    return entries
+
+
 def build_model(use_case: UseCase, *, settings: Settings | None = None) -> Model:
     """Build the model for a use case: the primary and any fallbacks, under policy.
 
@@ -660,10 +697,12 @@ def build_model(use_case: UseCase, *, settings: Settings | None = None) -> Model
     :returns: a ``PolicyModel``, or a ``PolicyFallbackModel`` over one per model id
         when the use case declares fallbacks.
     :rtype: Model
-    :raises ValueError: on a model id that is not ``provider:model``, a provider
-        the library does not build, or an environment policy value that does not
-        parse.
+    :raises ValueError: on a model id that is not a chat model in the catalog or
+        is retired, fallbacks behind a route that falls back on its own, a
+        provider the library does not build, or an environment policy value that
+        does not parse.
     """
+    entries = _catalog_entries(use_case)
     policy = resolve_policy(use_case)
     override = _model_override.get()
     factory = (
@@ -676,9 +715,10 @@ def build_model(use_case: UseCase, *, settings: Settings | None = None) -> Model
             _provider_model(model_id, override, factory),
             use_case=use_case,
             model_id=model_id,
+            catalog_entry=entry,
             policy=policy,
         )
-        for model_id in use_case.model_ids
+        for model_id, entry in zip(use_case.model_ids, entries, strict=True)
     ]
     if len(models) == 1:
         return models[0]

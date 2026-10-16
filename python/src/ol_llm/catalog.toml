@@ -1,0 +1,177 @@
+# The model catalog: every model an Open Learning application may call.
+#
+# build_model accepts only ids listed here, and apps check their own model lists
+# against it in CI. Policy: mitodl/ol-infrastructure
+# docs/plans/llm-usage-policies-spec.md §2.2. Adding or changing an entry is a pull
+# request approved by the catalog owner (Platform Engineering).
+#
+# Fields, with defaults in brackets:
+#   id                  PydanticAI form, provider:model. Bedrock ids are inference
+#                       profile ids; Azure ids name the deployment, which is
+#                       deployed under the model's own name.
+#   kind                chat or embedding.
+#   status              [allowed] allowed, deprecated (needs retires_on), or
+#                       retired. A deprecated id still builds; a retired id raises.
+#   retires_on          the date the provider retires the model, or the date we
+#                       stop allowing it.
+#   floating            [false] true when the id can change behavior without
+#                       changing: an alias the provider repoints (gpt-4o,
+#                       mistral-large-latest, an Azure deployment left on
+#                       auto-upgrade) or a preview.
+#   route               [direct] direct, or gateway when the app reaches it through
+#                       an LLM gateway route.
+#   route_falls_back    [false] the gateway route falls back to another model on
+#                       its own, so a use case on it may not declare
+#                       fallback_models.
+#   opik_provider,      the provider and model name Opik's price table holds the
+#   opik_model          model under. Both absent when Opik has no price for it,
+#                       and its traces then carry no cost.
+#   input_usd_per_mtok, list price in US dollars per million tokens, at the lowest
+#   output_usd_per_mtok tier where the price is tiered by prompt length. The
+#                       Prometheus spend rules use these.
+#
+# Sources for the initial entries are in llm-usage-policies-spec.md §2.1.
+# Prices were read from Opik 2.2.87's price table where it has the model.
+
+# OpenAI direct.
+
+[[model]]
+id = "openai:gpt-4o-mini"
+kind = "chat"
+floating = true
+opik_provider = "openai"
+opik_model = "gpt-4o-mini"
+input_usd_per_mtok = "0.15"
+output_usd_per_mtok = "0.60"
+
+[[model]]
+id = "openai:gpt-4o"
+kind = "chat"
+floating = true
+opik_provider = "openai"
+opik_model = "gpt-4o"
+input_usd_per_mtok = "2.50"
+output_usd_per_mtok = "10.00"
+
+[[model]]
+id = "openai:gpt-5-nano-2025-08-07"
+kind = "chat"
+opik_provider = "openai"
+opik_model = "gpt-5-nano-2025-08-07"
+input_usd_per_mtok = "0.05"
+output_usd_per_mtok = "0.40"
+
+[[model]]
+id = "openai:gpt-5.2"
+kind = "chat"
+floating = true
+opik_provider = "openai"
+opik_model = "gpt-5.2"
+input_usd_per_mtok = "1.75"
+output_usd_per_mtok = "14.00"
+
+[[model]]
+id = "openai:text-embedding-3-large"
+kind = "embedding"
+opik_provider = "openai"
+opik_model = "text-embedding-3-large"
+input_usd_per_mtok = "0.13"
+output_usd_per_mtok = "0"
+
+# Azure OpenAI, GlobalStandard deployments named after the model. Left unset,
+# Azure upgrades a deployment's model version on its own, so the chat models float.
+
+[[model]]
+id = "azure:gpt-4o"
+kind = "chat"
+floating = true
+opik_provider = "azure"
+opik_model = "gpt-4o"
+input_usd_per_mtok = "2.50"
+output_usd_per_mtok = "10.00"
+
+[[model]]
+id = "azure:gpt-5-mini"
+kind = "chat"
+floating = true
+opik_provider = "azure"
+opik_model = "gpt-5-mini"
+input_usd_per_mtok = "0.25"
+output_usd_per_mtok = "2.00"
+
+[[model]]
+id = "azure:gpt-5.2"
+kind = "chat"
+floating = true
+opik_provider = "azure"
+opik_model = "gpt-5.2"
+input_usd_per_mtok = "1.75"
+output_usd_per_mtok = "14.00"
+
+[[model]]
+id = "azure:text-embedding-3-large"
+kind = "embedding"
+opik_provider = "azure"
+opik_model = "text-embedding-3-large"
+input_usd_per_mtok = "0.13"
+output_usd_per_mtok = "0"
+
+# mit-learn's CI embeddings.
+[[model]]
+id = "azure:text-embedding-3-small"
+kind = "embedding"
+opik_provider = "azure"
+opik_model = "text-embedding-3-small"
+input_usd_per_mtok = "0.02"
+output_usd_per_mtok = "0"
+
+# Bedrock.
+
+[[model]]
+id = "bedrock:global.anthropic.claude-haiku-4-5-20251001-v1:0"
+kind = "chat"
+opik_provider = "bedrock"
+opik_model = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+input_usd_per_mtok = "1.00"
+output_usd_per_mtok = "5.00"
+
+# A US cross-region profile, priced 10% above the global one.
+[[model]]
+id = "bedrock:us.anthropic.claude-sonnet-5"
+kind = "chat"
+opik_provider = "bedrock"
+opik_model = "us.anthropic.claude-sonnet-5"
+input_usd_per_mtok = "2.20"
+output_usd_per_mtok = "11.00"
+
+[[model]]
+id = "bedrock:amazon.titan-embed-text-v2:0"
+kind = "embedding"
+opik_provider = "bedrock"
+opik_model = "amazon.titan-embed-text-v2:0"
+input_usd_per_mtok = "0.02"
+output_usd_per_mtok = "0"
+
+# Gemini API.
+
+# Google lists 2026-03-09 as the earliest shutdown date, with
+# gemini-3.1-pro-preview as the replacement. Opik 2.2.87 has no price for it.
+[[model]]
+id = "google:gemini-3-pro-preview"
+kind = "chat"
+status = "deprecated"
+retires_on = 2026-03-09
+floating = true
+input_usd_per_mtok = "2.00"
+output_usd_per_mtok = "12.00"
+
+# Mistral.
+
+[[model]]
+id = "mistral:mistral-large-latest"
+kind = "chat"
+floating = true
+opik_provider = "mistral"
+opik_model = "mistral-large-latest"
+input_usd_per_mtok = "0.50"
+output_usd_per_mtok = "1.50"
