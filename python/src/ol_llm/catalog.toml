@@ -154,12 +154,13 @@ output_usd_per_mtok = "0"
 
 # Gemini API.
 
-# Google lists 2026-03-09 as the earliest shutdown date, with
-# gemini-3.1-pro-preview as the replacement. Opik 2.2.87 has no price for it.
+# Retired: Google lists 2026-03-09 as the earliest shutdown date, with
+# gemini-3.1-pro-preview as the replacement. Kept for its price, since the
+# translations config still names it. Opik 2.2.87 has no price for it.
 [[model]]
 id = "google:gemini-3-pro-preview"
 kind = "chat"
-status = "deprecated"
+status = "retired"
 retires_on = 2026-03-09
 floating = true
 input_usd_per_mtok = "2.00"

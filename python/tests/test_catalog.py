@@ -28,7 +28,10 @@ from pydantic_ai.usage import RequestUsage
 pytestmark = pytest.mark.usefixtures("provider_env")
 
 CATALOG = load_catalog()
-CHAT_ENTRIES = [e for e in CATALOG.entries.values() if e.kind == "chat"]
+# The chat models build_model will build.
+CHAT_ENTRIES = [
+    e for e in CATALOG.entries.values() if e.kind == "chat" and e.status != "retired"
+]
 
 TEST_CATALOG = """
 [[model]]

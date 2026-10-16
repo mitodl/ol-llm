@@ -33,6 +33,7 @@ TEST_TIMEOUT_SECONDS = "0.3"
 UNLISTED_MODELS = (
     "anthropic:claude-haiku-4-5",
     "together:meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "google:gemini-3.1-pro-preview",
     "groq:llama-3.3-70b",
 )
 
@@ -90,7 +91,7 @@ def test_bedrock_client_carries_the_timeout_and_no_retries() -> None:
 
 @pytest.mark.usefixtures("provider_env")
 @pytest.mark.parametrize(
-    "model_id", ["google:gemini-3-pro-preview", "mistral:mistral-large-latest"]
+    "model_id", ["google:gemini-3.1-pro-preview", "mistral:mistral-large-latest"]
 )
 def test_single_attempt_providers_build(model_id: str) -> None:
     assert isinstance(build_model(use_case(model_id)), PolicyModel)
@@ -193,7 +194,7 @@ MOCKED_MODELS = [
     "openai:gpt-4o-mini",
     "anthropic:claude-haiku-4-5",
     "bedrock:us.anthropic.claude-sonnet-5",
-    "google:gemini-3-pro-preview",
+    "google:gemini-3.1-pro-preview",
     "mistral:mistral-large-latest",
 ]
 
