@@ -15,13 +15,21 @@ import json
 import sys
 import tomllib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from functools import cache
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Literal, get_args
+from typing import Any, Literal, Self
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 ModelKind = Literal["chat", "embedding"]
 ModelStatus = Literal["allowed", "deprecated", "retired"]
@@ -38,17 +46,20 @@ _PROVIDER_ALIASES: Mapping[str, str] = {
     "openai-responses": "openai",
     "azure-responses": "azure",
 }
-_PRICE_FIELDS = ("input_usd_per_mtok", "output_usd_per_mtok")
 
 
-@dataclass(frozen=True, kw_only=True)
-class CatalogEntry:
+class CatalogEntry(BaseModel):
     """One model in the catalog. The fields are described in ``catalog.toml``.
 
-    :raises ValueError: on a malformed id, an unknown kind, status, or route, a
-        deprecated entry with no ``retires_on``, ``route_falls_back`` on a direct
-        route, only one of the two Opik names, or a negative price.
+    Strict, so a quoted boolean or date is refused rather than read as truthy.
+
+    :raises ValueError: on a malformed id, an unknown field, kind, status, or
+        route, a price that is not a quoted decimal, a deprecated entry with no
+        ``retires_on``, ``route_falls_back`` on a direct route, only one of the two
+        Opik names, or a negative price.
     """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     id: str
     kind: ModelKind
@@ -61,37 +72,52 @@ class CatalogEntry:
     route_falls_back: bool = False
     opik_provider: str | None = None
     opik_model: str | None = None
-    provider: str = field(init=False, repr=False, compare=False)
-    model_name: str = field(init=False, repr=False, compare=False)
 
-    def __post_init__(self) -> None:
-        """Validate the entry so a bad catalog fails when it loads."""
-        provider, sep, name = self.id.partition(":")
+    @field_validator("input_usd_per_mtok", "output_usd_per_mtok", mode="before")
+    @classmethod
+    def _exact_price(cls, value: object) -> Decimal:
+        # A TOML float would be read as binary floating point.
+        if isinstance(value, Decimal):
+            return value
+        if not isinstance(value, str):
+            msg = 'must be a quoted decimal, e.g. "0.15"'
+            raise ValueError(msg)  # noqa: TRY004 - pydantic reports ValueError
+        return Decimal(value)
+
+    @field_validator("id")
+    @classmethod
+    def _provider_model_form(cls, value: str) -> str:
+        provider, sep, name = value.partition(":")
         if not (provider and sep and name):
-            msg = f"Catalog id {self.id!r} is not in provider:model form"
+            msg = f"{value!r} is not in provider:model form"
             raise ValueError(msg)
-        object.__setattr__(self, "provider", provider)
-        object.__setattr__(self, "model_name", name)
-        for value, choices in (
-            (self.kind, ModelKind),
-            (self.status, ModelStatus),
-            (self.route, Route),
-        ):
-            if value not in get_args(choices):
-                msg = f"{self.id}: {value!r} is not one of {get_args(choices)}"
-                raise ValueError(msg)
+        return value
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
         if self.status == "deprecated" and self.retires_on is None:
-            msg = f"{self.id}: a deprecated entry needs retires_on"
+            msg = "a deprecated entry needs retires_on"
             raise ValueError(msg)
         if self.route_falls_back and self.route != "gateway":
-            msg = f"{self.id}: only a gateway route can fall back on its own"
+            msg = "only a gateway route can fall back on its own"
             raise ValueError(msg)
         if (self.opik_provider is None) != (self.opik_model is None):
-            msg = f"{self.id}: set opik_provider and opik_model together, or neither"
+            msg = "set opik_provider and opik_model together, or neither"
             raise ValueError(msg)
         if self.input_usd_per_mtok < 0 or self.output_usd_per_mtok < 0:
-            msg = f"{self.id}: prices must not be negative"
+            msg = "prices must not be negative"
             raise ValueError(msg)
+        return self
+
+    @property
+    def provider(self) -> str:
+        """The provider half of the id, e.g. ``bedrock``."""
+        return self.id.partition(":")[0]
+
+    @property
+    def model_name(self) -> str:
+        """The model half of the id, e.g. ``us.anthropic.claude-sonnet-5``."""
+        return self.id.partition(":")[2]
 
 
 @dataclass(frozen=True)
@@ -160,23 +186,10 @@ class Catalog:
 
 
 def _parse_entry(raw: Mapping[str, Any]) -> CatalogEntry:
-    values = dict(raw)
-    label = values.get("id", "<no id>")
-    for name in _PRICE_FIELDS:
-        price = values.get(name)
-        if not isinstance(price, str):
-            # A TOML float would be read as binary floating point.
-            msg = f'{label}: {name} must be a quoted decimal, e.g. "0.15"'
-            raise ValueError(msg)  # noqa: TRY004 - a malformed file, not a misused API
-        values[name] = Decimal(price)
-    known = {f.name for f in fields(CatalogEntry) if f.init}
-    if unknown := set(values) - known:
-        msg = f"{label}: unknown catalog fields {sorted(unknown)}"
-        raise ValueError(msg)
     try:
-        return CatalogEntry(**values)
-    except TypeError as exc:
-        msg = f"{label}: {exc}"
+        return CatalogEntry.model_validate(raw)
+    except ValidationError as exc:
+        msg = f"Catalog entry {raw.get('id', '<no id>')!r}: {exc}"
         raise ValueError(msg) from exc
 
 
@@ -243,8 +256,10 @@ def price_rules(catalog: Catalog | None = None) -> dict[str, Any]:
 
     Each entry gets ``ol_llm_model_input_usd_per_token`` and
     ``ol_llm_model_output_usd_per_token`` series labeled with the ``provider`` and
-    ``model`` halves of its id, the labels the library's token counters carry, so
-    spend is ``tokens * on (provider, model) group_left price``.
+    ``model`` halves of its id, so spend is ``tokens * on (provider, model)
+    group_left price``. Token counters joined against these must carry the same
+    split of the catalog id: ``openai``, not ``openai-chat``, and the requested
+    model name, not the dated one a response reports.
 
     :param catalog: the catalog to export; the released one when omitted.
     :returns: a rule file with one group, ready for ``json.dumps``. JSON is YAML,

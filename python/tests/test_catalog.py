@@ -165,7 +165,7 @@ def test_policy_model_checks_the_catalog() -> None:
         (lambda t: t.replace('"0.15"', "0.15"), "quoted decimal"),
         (
             lambda t: t.replace('kind = "chat"', 'kind = "chat"\ncolor = "red"', 1),
-            "unknown",
+            "Extra inputs",
         ),
         (lambda t: t.replace('kind = "chat"', 'kind = "vision"', 1), "'vision'"),
         (lambda t: t.replace("retires_on = 2027-01-01\n", ""), "needs retires_on"),
@@ -178,6 +178,14 @@ def test_policy_model_checks_the_catalog() -> None:
             "together",
         ),
         (lambda t: t.replace('kind = "chat"\n', "", 1), "kind"),
+        (
+            lambda t: t.replace("route_falls_back = true", 'route_falls_back = "true"'),
+            "bool",
+        ),
+        (
+            lambda t: t.replace("retires_on = 2027-01-01", 'retires_on = "2027-01-01"'),
+            "date",
+        ),
     ],
 )
 def test_malformed_catalog_is_refused(
@@ -319,15 +327,17 @@ def opik_prices() -> dict[tuple[str, str], dict[str, Any]]:
 
 
 @pytest.mark.network
-@pytest.mark.parametrize(
-    "entry",
-    [e for e in CATALOG.entries.values() if e.opik_model is not None],
-    ids=lambda e: e.id,
-)
+@pytest.mark.parametrize("entry", CATALOG.entries.values(), ids=lambda e: e.id)
 def test_opik_prices_every_model_at_the_catalog_price(
     entry: CatalogEntry, opik_prices: dict[tuple[str, str], dict[str, Any]]
 ) -> None:
-    row = opik_prices.get((str(entry.opik_model), str(entry.opik_provider)))
+    if entry.opik_model is None:
+        # Leaving the Opik name out is only for a model Opik cannot price, so
+        # this fails once Opik adds it and the entry should name it.
+        priced = [key for key in opik_prices if key[0] == entry.model_name]
+        assert not priced, f"Opik prices {entry.id} as {priced}; name it"
+        return
+    row = opik_prices.get((entry.opik_model, str(entry.opik_provider)))
 
     assert row is not None, f"Opik has no price for {entry.opik_model}"
     opik_input = row.get("input_cost_per_token", Decimal(0)) * TOKENS_PER_MTOK

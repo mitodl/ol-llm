@@ -633,6 +633,7 @@ dependencies = [
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
     { name = "opik" },
+    { name = "pydantic" },
 ]
 
 [package.optional-dependencies]
@@ -647,6 +648,7 @@ requires-dist = [
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.38" },
     { name = "opentelemetry-sdk", specifier = ">=1.38" },
     { name = "opik", specifier = "==2.2.87" },
+    { name = "pydantic", specifier = ">=2,<3" },
     { name = "pydantic-ai-harness", marker = "extra == 'harness'", specifier = ">=0.52,<0.53" },
     { name = "pydantic-ai-slim", marker = "extra == 'pydantic-ai'", specifier = ">=2.52,<3" },
     { name = "pydantic-ai-slim", extras = ["anthropic"], marker = "extra == 'anthropic'", specifier = ">=2.52,<3" },

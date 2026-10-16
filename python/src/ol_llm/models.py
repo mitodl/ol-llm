@@ -313,8 +313,8 @@ class PolicyModel(WrapperModel):
         :param wrapped: the provider model, with its SDK's own retries off.
         :param use_case: the call site.
         :param model_id: the id the model was built from, for errors.
-        :param catalog_entry: the model's catalog entry; tracing reads its status
-            and Opik name from here.
+        :param catalog_entry: the model's catalog entry, for tracing to tag a
+            deprecated model and name it as Opik prices it.
         :param policy: the resolved policy.
         """
         super().__init__(wrapped)
@@ -653,10 +653,6 @@ def _provider_model(
     override: Model | Mapping[str, Model] | None,
     factory: Callable[[str], Provider[Any]] | None,
 ) -> Model:
-    provider, sep, name = model_id.partition(":")
-    if not (provider and sep and name):
-        msg = f"Model id {model_id!r} is not in provider:model form"
-        raise ValueError(msg)
     if override is not None:
         return override if isinstance(override, Model) else override[model_id]
     if factory is None:  # pragma: no cover - set whenever override is None
