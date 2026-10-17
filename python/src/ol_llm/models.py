@@ -125,6 +125,10 @@ _model_override: ContextVar[Model | Mapping[str, Model] | None] = ContextVar(
     "ol_llm_model_override", default=None
 )
 
+# Where recording_answers collects model ids. A list, not a value: the run's
+# tasks get a copy of the context, and an append is what reaches the caller.
+_answers: ContextVar[list[str] | None] = ContextVar("ol_llm_answers", default=None)
+
 # Patched in tests so retries do not wait.
 _sleep: Callable[[float], Any] = asyncio.sleep
 
@@ -229,6 +233,26 @@ def _stamp_answered_by(
     if response.metadata is None:
         response.metadata = {}
     response.metadata.setdefault(_METADATA_KEY, {})["model"] = catalog_id
+    if (answers := _answers.get()) is not None:
+        answers.append(catalog_id)
+
+
+@contextmanager
+def recording_answers() -> Generator[list[str]]:
+    """Collect the model id of every response given inside the block, in order.
+
+    A run that fails on a response (invalid output, a content filter) has no
+    history to read, so this is how its error names the model that gave it.
+
+    :returns: the list the ids are appended to.
+    :rtype: list[str]
+    """
+    answers: list[str] = []
+    token = _answers.set(answers)
+    try:
+        yield answers
+    finally:
+        _answers.reset(token)
 
 
 def _answered_by(response: ModelResponse) -> str | None:
