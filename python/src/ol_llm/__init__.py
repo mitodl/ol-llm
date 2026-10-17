@@ -5,8 +5,9 @@ that replaces whatever Sentry client the host application already configured.
 Setting OPIK_SENTRY_ENABLE before anything imports opik stops it. This module
 does that first, so every consumer gets it by importing ol_llm before opik.
 
-The model factory and agent builder need the ``pydantic-ai`` extra. They are
-imported on first use, so the base package imports without it.
+The model factory, the agent builder, and the run entry points need the
+``pydantic-ai`` extra. They are imported on first use, so the base package imports
+without it.
 """
 
 import os
@@ -47,6 +48,7 @@ from ol_llm.tracing import (
 
 if TYPE_CHECKING:
     from ol_llm.models import build_agent, build_model, usage_limits
+    from ol_llm.runs import LLMResult, PostProcessed, run, run_sync
 
 # The version lives only in python/pyproject.toml, which is what a release bumps.
 __version__ = version("ol-llm")
@@ -55,6 +57,10 @@ _PYDANTIC_AI_EXPORTS = {
     "build_agent": "ol_llm.models",
     "build_model": "ol_llm.models",
     "usage_limits": "ol_llm.models",
+    "LLMResult": "ol_llm.runs",
+    "PostProcessed": "ol_llm.runs",
+    "run": "ol_llm.runs",
+    "run_sync": "ol_llm.runs",
 }
 # What the pydantic-ai extra installs that ol_llm.models imports directly.
 _PYDANTIC_AI_MODULES = frozenset({"pydantic_ai", "httpx2"})
@@ -71,7 +77,9 @@ __all__ = [
     "LLMInvalidOutput",
     "LLMRateLimited",
     "LLMRejected",
+    "LLMResult",
     "LLMUnavailable",
+    "PostProcessed",
     "Profile",
     "Settings",
     "TraceFields",
@@ -84,6 +92,8 @@ __all__ = [
     "degraded_metadata",
     "get_settings",
     "resolve_policy",
+    "run",
+    "run_sync",
     "trace_fields",
     "usage_limits",
 ]

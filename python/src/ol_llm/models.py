@@ -238,6 +238,23 @@ def _answered_by(response: ModelResponse) -> str | None:
     return answered_by
 
 
+def answering_model(messages: Sequence[ModelMessage]) -> str | None:
+    """Return the model id that gave the last response in a run's messages.
+
+    :param messages: the run's messages.
+    :returns: the id, or ``None`` when no response came from a ``PolicyModel``.
+    :rtype: str | None
+    """
+    return next(
+        (
+            _answered_by(message)
+            for message in reversed(messages)
+            if isinstance(message, ModelResponse)
+        ),
+        None,
+    )
+
+
 _NO_EVENT = object()
 
 
@@ -296,6 +313,7 @@ class PolicyModel(WrapperModel):
     """
 
     use_case: str
+    call_site: UseCase
     catalog_id: str
     profile_name: Profile
     policy: CallPolicy
@@ -312,6 +330,7 @@ class PolicyModel(WrapperModel):
         """
         super().__init__(wrapped)
         self.use_case = use_case.name
+        self.call_site = use_case
         self.catalog_id = model_id
         self.profile_name = use_case.profile
         self.policy = policy
@@ -422,14 +441,7 @@ class PolicyFallbackModel(FallbackModel):
             isinstance(part, RetryPromptPart) for part in last.parts
         ):
             return self
-        answered_by = next(
-            (
-                _answered_by(message)
-                for message in reversed(messages)
-                if isinstance(message, ModelResponse)
-            ),
-            None,
-        )
+        answered_by = answering_model(messages)
         ids = [cast("PolicyModel", model).catalog_id for model in self.models]
         if answered_by not in ids[1:]:
             return self
@@ -693,6 +705,21 @@ def build_model(use_case: UseCase, *, settings: Settings | None = None) -> Model
 
 def _chain(model: Model) -> Sequence[Model]:
     return model.models if isinstance(model, FallbackModel) else (model,)
+
+
+def call_site(model: Model) -> UseCase:
+    """Return the use case a model was built for.
+
+    :param model: a model from ``build_model``.
+    :returns: the use case.
+    :rtype: UseCase
+    :raises TypeError: if the model did not come from ``build_model``.
+    """
+    primary = _chain(model)[0]
+    if not isinstance(primary, PolicyModel):
+        msg = f"{model!r} was not built by ol_llm.build_model"
+        raise TypeError(msg)
+    return primary.call_site
 
 
 def instrumentation(use_case: UseCase) -> list[AbstractCapability[Any]]:
