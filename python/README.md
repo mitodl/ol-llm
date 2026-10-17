@@ -51,14 +51,50 @@ without a release, e.g. `OL_LLM_CONTENT_SUMMARY_TIMEOUT_SECONDS=120`.
 Call sites not built on PydanticAI (LangGraph, a plain SDK) apply the same numbers with
 `ol_llm.resolve_policy(use_case)`, which needs no extra.
 
-The entry points that wrap a run in an Opik trace (`run`, `run_stream`, `complete`) are not
-released yet; until they are, `build_agent` gives the policy and errors without the tracing.
+Run the agent with `ol_llm.run`, or `ol_llm.run_sync` in a Celery task or Dagster asset:
+
+```python
+result = ol_llm.run_sync(
+    summarizer,
+    text,
+    attribution=ol_llm.Attribution(user_id=user.global_id, run_id=task_id),
+)
+result.output  # a Summary
+result.degraded  # True when a fallback model answered
+```
+
+Each run is one Opik trace in the app's project, tagged with the use case and environment,
+with the model calls, token usage, and cost inside it. Model failures raise `LLMError`
+subclasses, and invalid output after its retries raises `LLMInvalidOutput`. A run inside the
+application's own `@opik.track` function becomes a span of that function's trace.
+`run_stream` and the single-call `complete` are not released yet.
+
+### Tracing
+
+Tracing reads the variables the Opik SDK reads, so the SDK and the span exporter always send
+to the same instance:
+
+| Variable | Meaning |
+| --- | --- |
+| `OPIK_URL_OVERRIDE` | the Opik API, e.g. `https://opik-qa.ol.mit.edu/api` |
+| `OPIK_WORKSPACE` | `default` on our instances |
+| `OPIK_KEYCLOAK_TOKEN_URL`, `OPIK_KEYCLOAK_CLIENT_ID`, `OPIK_KEYCLOAK_CLIENT_SECRET` | the Keycloak client the app authenticates to Opik with; `OPIK_KEYCLOAK_SCOPE` if it needs one. Leave `OPIK_API_KEY` unset |
+| `OPIK_TRACK_DISABLE` | `true` turns tracing off, for local development without an Opik |
+| `OL_LLM_TRACE_CONTENT` | `false` keeps prompts, completions, and tool arguments out of traces. On by default until the data-handling policy decides |
+
+Call `ol_llm.configure_tracing()` at startup (Django's `AppConfig.ready`, a Dagster resource)
+before anything else touches the Opik SDK: the SDK reads the Keycloak hook when it first
+builds its HTTP client. Short-lived processes should call `ol_llm.tracing.flush()` before
+they exit. An app that registers its own Keycloak hook on the SDK (learn-ai's
+`opik_keycloak_auth`) should drop it when it adopts the library.
 
 ### Testing
 
 `ol_llm.testing.override_models` makes `build_model` and `build_agent` use PydanticAI's
 `TestModel` or `FunctionModel` in place of a provider, still under the library's retry and
-error handling, and `tracing_disabled` turns Opik off. Script responses and failures with
+error handling. Set `OPIK_TRACK_DISABLE=true` for a test suite that should send nothing, or
+use `ol_llm.testing.tracing_disabled` around one test. `opik.record_traces_locally()`
+captures the root traces a test produces. Script responses and failures with
 `FunctionModel`; do not commit recorded provider responses.
 
 ## Extras
