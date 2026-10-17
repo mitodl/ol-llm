@@ -19,6 +19,7 @@ from typing import Any, Generic, TypeVar, cast
 
 import opik
 from opik import opik_context
+from opik.api_objects.trace import TraceData
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
@@ -113,15 +114,26 @@ class _Run(Generic[OutputT]):
         )(func)
         return tracked
 
+    def _current_trace(self) -> TraceData | None:
+        """Return the trace this run marks, or ``None`` when it is not traced.
+
+        Read from the context each time rather than trusted from the start of the
+        run: tracing can be switched on at runtime after the run started without
+        a trace, and marking a trace that is not there raises.
+        """
+        return opik_context.get_current_trace_data() if self.traced else None
+
     def agent_arguments(self) -> dict[str, Any]:
         """Return what every run passes the agent, and mark the trace.
 
         For a run the library opened the tags are already on the trace; for one
-        inside a caller's trace this adds them there.
+        inside a caller's trace this adds them there. A caller's trace that already
+        has a thread keeps it.
         """
-        if self.traced:
+        if (trace := self._current_trace()) is not None:
             opik_context.update_current_trace(
-                tags=list(self.fields.tags), thread_id=self.attribution.thread_id
+                tags=list(self.fields.tags),
+                thread_id=None if trace.thread_id else self.attribution.thread_id,
             )
         return {
             "usage_limits": usage_limits(self.use_case),
@@ -152,10 +164,9 @@ class _Run(Generic[OutputT]):
             output = processed.output
             reasons.extend(processed.degraded_reasons)
         degraded_reasons = tuple(dict.fromkeys(reasons))
-        if degraded_reasons and self.traced:
+        if degraded_reasons and (trace := self._current_trace()) is not None:
             # Another run in the same trace may have marked it already.
-            trace = opik_context.get_current_trace_data()
-            earlier = (trace.metadata or {}).get("degraded_reason") if trace else None
+            earlier = (trace.metadata or {}).get("degraded_reason")
             marked = cast("list[DegradedReason]", earlier.split(",") if earlier else [])
             opik_context.update_current_trace(
                 metadata=dict(degraded_metadata([*marked, *degraded_reasons]))
