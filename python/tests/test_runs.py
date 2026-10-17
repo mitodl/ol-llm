@@ -219,6 +219,45 @@ def test_invalid_output_reaches_the_caller_as_llm_invalid_output() -> None:
 
     assert isinstance(caught.value.__cause__, UnexpectedModelBehavior)
     assert caught.value.use_case == "summary"
+    assert caught.value.model == PRIMARY
+
+
+@pytest.mark.parametrize("entry", [run_sync, lambda *a: asyncio.run(run(*a))])
+def test_invalid_output_names_the_model_that_gave_it(
+    entry: Callable[..., object],
+) -> None:
+    agent = agent_for(
+        SUMMARY_WITH_FALLBACK,
+        {PRIMARY: failing(503), FALLBACK: replying("not a tool call")},
+        output_type=Summary,
+    )
+
+    with pytest.raises(LLMInvalidOutput) as caught:
+        entry(agent, "hi")
+
+    assert caught.value.model == FALLBACK
+
+
+def test_runs_in_one_trace_keep_each_degraded_reason() -> None:
+    def partial(output: str) -> PostProcessed[str]:
+        return PostProcessed(output=output, degraded_reasons=("partial_output",))
+
+    fallback = agent_for(
+        SUMMARY_WITH_FALLBACK, {PRIMARY: failing(503), FALLBACK: replying("backup")}
+    )
+    primary = agent_for(SUMMARY, replying("ok"))
+
+    @opik.track(project_name="mit-learn")
+    def handler() -> None:
+        run_sync(fallback, "hi")
+        run_sync(primary, "hi", postprocess=partial)
+
+    with opik.record_traces_locally() as storage:
+        handler()
+        [trace] = storage.trace_trees
+
+    assert trace.metadata is not None
+    assert trace.metadata["degraded_reason"] == "fallback_model,partial_output"
 
 
 def test_without_content_the_trace_omits_input_and_output() -> None:

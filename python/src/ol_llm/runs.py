@@ -15,7 +15,7 @@ tag still find it. With tracing off, runs open no trace.
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar, cast
 
 import opik
 from opik import opik_context
@@ -39,6 +39,7 @@ from ol_llm.models import (
     attribution_model_settings,
     call_site,
     classify_run_failure,
+    recording_answers,
     usage_limits,
 )
 from ol_llm.policy import UseCase, resolve_policy
@@ -128,11 +129,14 @@ class _Run(Generic[OutputT]):
             "conversation_id": self.attribution.thread_id,
         }
 
-    def replacement(self, exc: Exception) -> LLMError | None:
-        """Return the library error to raise in place of ``exc``, if any."""
-        error = classify_run_failure(
-            exc, use_case=self.use_case.name, model=self.use_case.model
-        )
+    def replacement(self, exc: Exception, answers: Sequence[str]) -> LLMError | None:
+        """Return the library error to raise in place of ``exc``, if any.
+
+        It names the model that gave the last response, which for invalid or
+        filtered output is the one that produced it.
+        """
+        model = answers[-1] if answers else self.use_case.model
+        error = classify_run_failure(exc, use_case=self.use_case.name, model=model)
         return None if error is exc else error
 
     def finish(self, result: AgentRunResult[OutputT]) -> LLMResult[OutputT]:
@@ -149,8 +153,12 @@ class _Run(Generic[OutputT]):
             reasons.extend(processed.degraded_reasons)
         degraded_reasons = tuple(dict.fromkeys(reasons))
         if degraded_reasons and self.traced:
+            # Another run in the same trace may have marked it already.
+            trace = opik_context.get_current_trace_data()
+            earlier = (trace.metadata or {}).get("degraded_reason") if trace else None
+            marked = cast("list[DegradedReason]", earlier.split(",") if earlier else [])
             opik_context.update_current_trace(
-                metadata=dict(degraded_metadata(degraded_reasons))
+                metadata=dict(degraded_metadata([*marked, *degraded_reasons]))
             )
         return LLMResult(
             output=output,
@@ -212,14 +220,15 @@ async def run(  # noqa: PLR0913
 
     async def traced(user_prompt: str | None) -> OutputT:
         arguments = state.agent_arguments()
-        try:
-            result = await agent.run(
-                user_prompt, deps=deps, message_history=message_history, **arguments
-            )
-        except Exception as exc:
-            if (error := state.replacement(exc)) is None:
-                raise
-            raise error from exc
+        with recording_answers() as answers:
+            try:
+                result = await agent.run(
+                    user_prompt, deps=deps, message_history=message_history, **arguments
+                )
+            except Exception as exc:
+                if (error := state.replacement(exc, answers)) is None:
+                    raise
+                raise error from exc
         results.append(state.finish(result))
         return results[0].output
 
@@ -250,14 +259,15 @@ def run_sync(  # noqa: PLR0913
 
     def traced(user_prompt: str | None) -> OutputT:
         arguments = state.agent_arguments()
-        try:
-            result = agent.run_sync(
-                user_prompt, deps=deps, message_history=message_history, **arguments
-            )
-        except Exception as exc:
-            if (error := state.replacement(exc)) is None:
-                raise
-            raise error from exc
+        with recording_answers() as answers:
+            try:
+                result = agent.run_sync(
+                    user_prompt, deps=deps, message_history=message_history, **arguments
+                )
+            except Exception as exc:
+                if (error := state.replacement(exc, answers)) is None:
+                    raise
+                raise error from exc
         results.append(state.finish(result))
         return results[0].output
 
