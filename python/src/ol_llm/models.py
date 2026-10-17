@@ -27,7 +27,11 @@ import anyio
 import httpx
 import httpx2
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.capabilities import RaiseContentFilterError
+from pydantic_ai.capabilities import (
+    AbstractCapability,
+    Instrumentation,
+    RaiseContentFilterError,
+)
 from pydantic_ai.exceptions import (
     ContentFilterError,
     FallbackExceptionGroup,
@@ -49,6 +53,7 @@ from pydantic_ai.models import (
     infer_model,
 )
 from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.output import NativeOutput, OutputSpec
 from pydantic_ai.providers import Provider
@@ -67,6 +72,7 @@ from ol_llm.errors import (
 )
 from ol_llm.policy import CallPolicy, Profile, UseCase, resolve_policy
 from ol_llm.settings import GatewayRoute, Settings, get_settings
+from ol_llm.tracing import include_content, tracer_provider
 
 OutputT = TypeVar("OutputT")
 _NO_DEPS: type[None] = type(None)
@@ -118,6 +124,10 @@ SUPPORTED_PROVIDERS = frozenset(
 _model_override: ContextVar[Model | Mapping[str, Model] | None] = ContextVar(
     "ol_llm_model_override", default=None
 )
+
+# Where recording_answers collects model ids. A list, not a value: the run's
+# tasks get a copy of the context, and an append is what reaches the caller.
+_answers: ContextVar[list[str] | None] = ContextVar("ol_llm_answers", default=None)
 
 # Patched in tests so retries do not wait.
 _sleep: Callable[[float], Any] = asyncio.sleep
@@ -223,6 +233,26 @@ def _stamp_answered_by(
     if response.metadata is None:
         response.metadata = {}
     response.metadata.setdefault(_METADATA_KEY, {})["model"] = catalog_id
+    if (answers := _answers.get()) is not None:
+        answers.append(catalog_id)
+
+
+@contextmanager
+def recording_answers() -> Generator[list[str]]:
+    """Collect the model id of every response given inside the block, in order.
+
+    A run that fails on a response (invalid output, a content filter) has no
+    history to read, so this is how its error names the model that gave it.
+
+    :returns: the list the ids are appended to.
+    :rtype: list[str]
+    """
+    answers: list[str] = []
+    token = _answers.set(answers)
+    try:
+        yield answers
+    finally:
+        _answers.reset(token)
 
 
 def _answered_by(response: ModelResponse) -> str | None:
@@ -230,6 +260,23 @@ def _answered_by(response: ModelResponse) -> str | None:
         (response.metadata or {}).get(_METADATA_KEY, {}).get("model")
     )
     return answered_by
+
+
+def answering_model(messages: Sequence[ModelMessage]) -> str | None:
+    """Return the model id that gave the last response in a run's messages.
+
+    :param messages: the run's messages.
+    :returns: the id, or ``None`` when no response came from a ``PolicyModel``.
+    :rtype: str | None
+    """
+    return next(
+        (
+            _answered_by(message)
+            for message in reversed(messages)
+            if isinstance(message, ModelResponse)
+        ),
+        None,
+    )
 
 
 _NO_EVENT = object()
@@ -290,6 +337,7 @@ class PolicyModel(WrapperModel):
     """
 
     use_case: str
+    call_site: UseCase
     catalog_id: str
     profile_name: Profile
     policy: CallPolicy
@@ -306,6 +354,7 @@ class PolicyModel(WrapperModel):
         """
         super().__init__(wrapped)
         self.use_case = use_case.name
+        self.call_site = use_case
         self.catalog_id = model_id
         self.profile_name = use_case.profile
         self.policy = policy
@@ -416,14 +465,7 @@ class PolicyFallbackModel(FallbackModel):
             isinstance(part, RetryPromptPart) for part in last.parts
         ):
             return self
-        answered_by = next(
-            (
-                _answered_by(message)
-                for message in reversed(messages)
-                if isinstance(message, ModelResponse)
-            ),
-            None,
-        )
+        answered_by = answering_model(messages)
         ids = [cast("PolicyModel", model).catalog_id for model in self.models]
         if answered_by not in ids[1:]:
             return self
@@ -689,6 +731,39 @@ def _chain(model: Model) -> Sequence[Model]:
     return model.models if isinstance(model, FallbackModel) else (model,)
 
 
+def call_site(model: Model) -> UseCase:
+    """Return the use case a model was built for.
+
+    :param model: a model from ``build_model``.
+    :returns: the use case.
+    :rtype: UseCase
+    :raises TypeError: if the model did not come from ``build_model``.
+    """
+    primary = _chain(model)[0]
+    if not isinstance(primary, PolicyModel):
+        msg = f"{model!r} was not built by ol_llm.build_model"
+        raise TypeError(msg)
+    return primary.call_site
+
+
+def instrumentation(use_case: UseCase) -> list[AbstractCapability[Any]]:
+    """Return the capability that sends a use case's model spans to Opik.
+
+    :param use_case: the call site; its app is the Opik project.
+    :returns: the ``Instrumentation`` capability, or nothing when tracing is off.
+    :rtype: list[AbstractCapability[Any]]
+    """
+    if (provider := tracer_provider(use_case.app)) is None:
+        return []
+    content = include_content()
+    settings = InstrumentationSettings(
+        tracer_provider=provider,
+        include_content=content,
+        include_binary_content=content,
+    )
+    return [Instrumentation(settings=settings)]
+
+
 def _uses_native_output(output_type: object) -> bool:
     # PydanticAI flattens nested sequences, so [NativeOutput(X), None] is native too.
     if isinstance(output_type, NativeOutput):
@@ -766,8 +841,9 @@ def build_agent(  # noqa: PLR0913
     """Build a PydanticAI agent over the use case's model.
 
     The agent raises on a content-filtered response even when the provider sent
-    partial text, and retries invalid output on the same model
-    ``use_case.output_retries`` times.
+    partial text, retries invalid output on the same model
+    ``use_case.output_retries`` times, and sends its spans to Opik unless tracing
+    is off.
 
     :param use_case: the call site.
     :param deps_type: the type of the run's dependencies.
@@ -794,7 +870,11 @@ def build_agent(  # noqa: PLR0913
         retries={"output": use_case.output_retries},
         tools=tools,
         toolsets=toolsets,
-        capabilities=[RaiseContentFilterError(), *(capabilities or ())],
+        capabilities=[
+            RaiseContentFilterError(),
+            *instrumentation(use_case),
+            *(capabilities or ()),
+        ],
     )
 
 
