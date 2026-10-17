@@ -27,7 +27,11 @@ import anyio
 import httpx
 import httpx2
 from pydantic_ai import Agent, RunContext
-from pydantic_ai.capabilities import RaiseContentFilterError
+from pydantic_ai.capabilities import (
+    AbstractCapability,
+    Instrumentation,
+    RaiseContentFilterError,
+)
 from pydantic_ai.exceptions import (
     ContentFilterError,
     FallbackExceptionGroup,
@@ -49,6 +53,7 @@ from pydantic_ai.models import (
     infer_model,
 )
 from pydantic_ai.models.fallback import FallbackModel
+from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.output import NativeOutput, OutputSpec
 from pydantic_ai.providers import Provider
@@ -67,6 +72,7 @@ from ol_llm.errors import (
 )
 from ol_llm.policy import CallPolicy, Profile, UseCase, resolve_policy
 from ol_llm.settings import GatewayRoute, Settings, get_settings
+from ol_llm.tracing import include_content, tracer_provider
 
 OutputT = TypeVar("OutputT")
 _NO_DEPS: type[None] = type(None)
@@ -689,6 +695,24 @@ def _chain(model: Model) -> Sequence[Model]:
     return model.models if isinstance(model, FallbackModel) else (model,)
 
 
+def instrumentation(use_case: UseCase) -> list[AbstractCapability[Any]]:
+    """Return the capability that sends a use case's model spans to Opik.
+
+    :param use_case: the call site; its app is the Opik project.
+    :returns: the ``Instrumentation`` capability, or nothing when tracing is off.
+    :rtype: list[AbstractCapability[Any]]
+    """
+    if (provider := tracer_provider(use_case.app)) is None:
+        return []
+    content = include_content()
+    settings = InstrumentationSettings(
+        tracer_provider=provider,
+        include_content=content,
+        include_binary_content=content,
+    )
+    return [Instrumentation(settings=settings)]
+
+
 def _uses_native_output(output_type: object) -> bool:
     # PydanticAI flattens nested sequences, so [NativeOutput(X), None] is native too.
     if isinstance(output_type, NativeOutput):
@@ -766,8 +790,9 @@ def build_agent(  # noqa: PLR0913
     """Build a PydanticAI agent over the use case's model.
 
     The agent raises on a content-filtered response even when the provider sent
-    partial text, and retries invalid output on the same model
-    ``use_case.output_retries`` times.
+    partial text, retries invalid output on the same model
+    ``use_case.output_retries`` times, and sends its spans to Opik unless tracing
+    is off.
 
     :param use_case: the call site.
     :param deps_type: the type of the run's dependencies.
@@ -794,7 +819,11 @@ def build_agent(  # noqa: PLR0913
         retries={"output": use_case.output_retries},
         tools=tools,
         toolsets=toolsets,
-        capabilities=[RaiseContentFilterError(), *(capabilities or ())],
+        capabilities=[
+            RaiseContentFilterError(),
+            *instrumentation(use_case),
+            *(capabilities or ()),
+        ],
     )
 
 
