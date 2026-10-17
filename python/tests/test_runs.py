@@ -16,7 +16,7 @@ from ol_llm import (
 )
 from ol_llm.models import build_agent, override_models
 from ol_llm.testing import tracing_disabled
-from ol_llm.tracing import configure_tracing
+from ol_llm.tracing import PROJECT_ATTRIBUTE, TracingConfig, configure_tracing
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
@@ -241,7 +241,7 @@ def test_without_content_the_trace_omits_input_and_output() -> None:
 
 def test_with_tracing_off_agents_are_not_instrumented() -> None:
     tracing.reset()
-    configure_tracing(replace(tracing.get_tracing_config(), enabled=False))
+    configure_tracing(TracingConfig(enabled=False))
     agent = agent_for(SUMMARY, replying("ok"))
 
     assert not [
@@ -264,10 +264,12 @@ def test_a_run_with_tracing_disabled_records_nothing(
     assert exported.get_finished_spans() == ()
 
 
-def test_a_run_inside_a_tracked_function_is_a_span_of_its_trace() -> None:
+def test_a_run_inside_a_tracked_function_is_a_span_of_its_trace(
+    exported: InMemorySpanExporter,
+) -> None:
     agent = agent_for(SUMMARY, replying("ok"))
 
-    @opik.track(project_name="mit-learn")
+    @opik.track(project_name="ol-data-platform")
     def handler() -> str:
         return run_sync(agent, "hi", attribution=ATTRIBUTION).output
 
@@ -275,11 +277,31 @@ def test_a_run_inside_a_tracked_function_is_a_span_of_its_trace() -> None:
         handler()
         [trace] = storage.trace_trees
         [root] = storage.span_trees
+    tracing.flush()
 
     assert trace.name == "handler"
+    assert trace.project_name == "ol-data-platform"
     assert trace.thread_id == "thread-1"
+    assert "use_case:summary" in (trace.tags or [])
     assert [span.name for span in root.spans] == ["summary"]
-    assert "use_case:summary" in (root.spans[0].tags or [])
+    spans = exported.get_finished_spans()
+    assert {(s.attributes or {}).get("opik.trace_id") for s in spans} == {trace.id}
+    assert {(s.attributes or {}).get(PROJECT_ATTRIBUTE) for s in spans} == {
+        "ol-data-platform"
+    }
+
+
+def test_with_tracing_off_a_run_opens_no_trace() -> None:
+    tracing.reset()
+    configure_tracing(TracingConfig(enabled=False))
+    agent = agent_for(SUMMARY, replying("ok"))
+
+    with opik.record_traces_locally() as storage:
+        result = run_sync(agent, "hi", attribution=ATTRIBUTION)
+        traces = storage.trace_trees
+
+    assert result.output == "ok"
+    assert traces == []
 
 
 @pytest.mark.parametrize("entry", [run_sync, lambda *a: asyncio.run(run(*a))])

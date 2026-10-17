@@ -65,8 +65,13 @@ result.degraded  # True when a fallback model answered
 
 Each run is one Opik trace in the app's project, tagged with the use case and environment,
 with the model calls, token usage, and cost inside it. Model failures raise `LLMError`
-subclasses, and invalid output after its retries raises `LLMInvalidOutput`. A run inside the
-application's own `@opik.track` function becomes a span of that function's trace.
+subclasses, and invalid output after its retries raises `LLMInvalidOutput`.
+
+A run inside the application's own `@opik.track` function becomes a span of that function's
+trace, in that function's project: Opik files a span under its trace's project, and the model
+spans follow. The use case's tags go on the outer trace so tag filters still find it; the
+attribution metadata stays on the run's span.
+
 `run_stream` and the single-call `complete` are not released yet.
 
 ### Tracing
@@ -82,10 +87,13 @@ to the same instance:
 | `OPIK_TRACK_DISABLE` | `true` turns tracing off, for local development without an Opik |
 | `OL_LLM_TRACE_CONTENT` | `false` keeps prompts, completions, and tool arguments out of traces. On by default until the data-handling policy decides |
 
-Call `ol_llm.configure_tracing()` at startup (Django's `AppConfig.ready`, a Dagster resource)
-before anything else touches the Opik SDK: the SDK reads the Keycloak hook when it first
-builds its HTTP client. Short-lived processes should call `ol_llm.tracing.flush()` before
-they exit. An app that registers its own Keycloak hook on the SDK (learn-ai's
+Without a call, tracing reads these the first time an agent is built or a run starts. A host
+that configures in code calls `ol_llm.configure_tracing(ol_llm.TracingConfig(...))` at
+startup, before anything else touches the Opik SDK (the SDK reads the Keycloak hook when it
+first builds its HTTP client) and before building agents (an agent keeps the instrumentation
+it was built with). Once tracing has been used, a different configuration raises
+`RuntimeError` and the one in effect stays. Short-lived processes should call
+`ol_llm.tracing.flush()` before they exit. An app that registers its own Keycloak hook on the SDK (learn-ai's
 `opik_keycloak_auth`) should drop it when it adopts the library.
 
 ### Testing

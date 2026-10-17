@@ -15,12 +15,16 @@ a client-credentials JWT on every ``/api`` request; ``OPIK_KEYCLOAK_TOKEN_URL``,
 
 ``OPIK_TRACK_DISABLE=true`` is the no-op mode for tests and local development: the
 SDK skips ``@track`` and the library builds no exporter.
+
+Spans are filed under the Opik project of the trace they belong to. That is the
+app's project for a run the library opened, and the caller's project for a run
+inside the caller's own ``@opik.track``, where Opik puts the run's span too.
 """
 
 import os
 import threading
 import time
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -30,11 +34,27 @@ import requests
 from opentelemetry.context import Context
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
+from opentelemetry.sdk.trace import (
+    ReadableSpan,
+    Span,
+    SpanProcessor,
+    TracerProvider,
+)
+from opentelemetry.sdk.trace.export import (
+    BatchSpanProcessor,
+    SpanExporter,
+    SpanExportResult,
+)
 from opentelemetry.sdk.trace.sampling import Decision, Sampler, SamplingResult
-from opentelemetry.trace import Link, SpanKind, TraceState
+from opentelemetry.trace import (
+    INVALID_SPAN,
+    Link,
+    SpanKind,
+    TraceState,
+    get_current_span,
+)
 from opentelemetry.util.types import Attributes
+from opik import opik_context
 from opik.config import OpikConfig
 from opik.hooks import HttpxClientHook, add_httpx_client_hook
 from opik.integrations.otel import OpikSpanProcessor
@@ -59,6 +79,9 @@ when it is absent, whatever trace the spans attach to."""
 
 WORKSPACE_HEADER = "Comet-Workspace"
 
+PROJECT_ATTRIBUTE = "ol_llm.opik_project"
+"""The span attribute that carries the project of the trace a span belongs to."""
+
 
 @dataclass(frozen=True, kw_only=True)
 class KeycloakClient:
@@ -78,20 +101,21 @@ class KeycloakClient:
 
 @dataclass(frozen=True, kw_only=True)
 class TracingConfig:
-    """Where traces go and how much of each call they carry.
+    """Whether runs are traced, how they authenticate, and what they carry.
 
-    :param enabled: false turns tracing off: no root traces and no span export.
-    :param url: the Opik API base URL, as the SDK's ``url_override``.
-    :param workspace: the Opik workspace.
+    The Opik URL and workspace are not here: the SDK reads them from its own
+    environment (``OPIK_URL_OVERRIDE``, ``OPIK_WORKSPACE``) or config file, and the
+    span exporter reads them from the same place so the two cannot disagree.
+
+    :param enabled: false turns tracing off: runs open no root trace and export no
+        spans.
     :param keycloak: the client to authenticate with; ``None`` sends no
         credentials, for an Opik with nothing in front of it.
     :param include_content: whether traces carry prompts, completions, and tool
         arguments. On until the data-handling policy says otherwise.
     """
 
-    enabled: bool
-    url: str
-    workspace: str
+    enabled: bool = True
     keycloak: KeycloakClient | None = None
     include_content: bool = True
 
@@ -118,8 +142,6 @@ class TracingConfig:
             raise ValueError(msg)
         return cls(
             enabled=not opik_config.track_disable,
-            url=opik_config.url_override,
-            workspace=opik_config.workspace,
             keycloak=keycloak,
             include_content=_parse_bool(env.get(_CONTENT_ENV, "true"), _CONTENT_ENV),
         )
@@ -204,29 +226,44 @@ class KeycloakTokens:
         self._token = payload["access_token"]
         self._expires_at = time.monotonic() + max(0.0, lifetime - REFRESH_SKEW_SECONDS)
 
+    def close(self) -> None:
+        """Close the token endpoint's HTTP client."""
+        self._http.close()
+
 
 class HttpxBearerAuth(httpx.Auth):
-    """Bearer auth for the Opik SDK's ``httpx`` client, retried once on a 401."""
+    """Bearer auth for the Opik SDK's ``httpx`` client, retried once on a 401.
 
-    def __init__(self, tokens: KeycloakTokens) -> None:
+    The SDK takes the auth once, when it builds its client, so ``tokens`` can be
+    replaced afterwards; with none, requests go out without credentials.
+    """
+
+    def __init__(self, tokens: KeycloakTokens | None) -> None:
         """Use the given token cache.
 
         :param tokens: the shared token cache.
         """
-        self._tokens = tokens
+        self.tokens = tokens
 
     def auth_flow(
         self, request: httpx.Request
     ) -> Generator[httpx.Request, httpx.Response]:
         """Send with the cached token; after a 401, once more with a new one."""
-        request.headers["Authorization"] = f"Bearer {self._tokens.token()}"
-        response = yield request
-        if response.status_code == httpx.codes.UNAUTHORIZED:
-            response.close()
-            request.headers["Authorization"] = (
-                f"Bearer {self._tokens.token(refresh=True)}"
-            )
+        if (tokens := self.tokens) is None:
             yield request
+            return
+        request.headers["Authorization"] = f"Bearer {tokens.token()}"
+        response = yield request
+        if response.status_code != httpx.codes.UNAUTHORIZED:
+            return
+        try:
+            _ = request.content
+        except httpx.RequestNotRead:
+            # A streamed body (the SDK's file uploads) cannot be sent twice.
+            return
+        response.close()
+        request.headers["Authorization"] = f"Bearer {tokens.token(refresh=True)}"
+        yield request
 
 
 class RequestsBearerAuth(AuthBase):
@@ -260,7 +297,12 @@ class RequestsBearerAuth(AuthBase):
         _ = response.content
         response.close()
         retry = response.request.copy()
-        retry.deregister_hook("response", self._retry_unauthorized)
+        # copy() shares the hook lists; removing ours from the shared list would
+        # skip whatever hook requests runs after it on this response.
+        retry.hooks = {
+            event: [hook for hook in hooks if hook != self._retry_unauthorized]
+            for event, hooks in retry.hooks.items()
+        }
         retry.headers["Authorization"] = f"Bearer {self._tokens.token(refresh=True)}"
         retried: requests.Response = response.connection.send(retry, **kwargs)
         retried.history.append(response)
@@ -296,34 +338,163 @@ class OpikActiveSampler(Sampler):
         return "OpikActiveSampler"
 
 
+class ProjectStampProcessor(SpanProcessor):
+    """Records on each span the Opik project of the trace it belongs to.
+
+    A span inherits its parent's project; a span with none takes the project of
+    the current ``@opik.track`` trace. Spans outside any trace get nothing, and
+    the exporter files them under the app's project.
+    """
+
+    def __init__(self, default_project: str) -> None:
+        """Use the SDK's default project for a trace that names none.
+
+        :param default_project: where Opik files a trace with no project.
+        """
+        self._default_project = default_project
+
+    def on_start(self, span: Span, parent_context: Context | None = None) -> None:
+        """Copy the project from the parent span or the current trace."""
+        parent = get_current_span(parent_context)
+        if parent is not INVALID_SPAN:
+            attributes = getattr(parent, "attributes", None) or {}
+            if (project := attributes.get(PROJECT_ATTRIBUTE)) is not None:
+                span.set_attribute(PROJECT_ATTRIBUTE, project)
+                return
+        trace = opik_context.get_current_trace_data()
+        if trace is not None:
+            span.set_attribute(
+                PROJECT_ATTRIBUTE, trace.project_name or self._default_project
+            )
+
+
+class ProjectExporter(SpanExporter):
+    """Exports each span to the Opik project recorded on it, else the app's.
+
+    Opik files OTLP spans under the project named on the export request, whatever
+    trace they attach to, so each project's spans go in their own request.
+    """
+
+    def __init__(self, app: str, exporter: Callable[[str], SpanExporter]) -> None:
+        """Build one exporter per project with ``exporter(project)``.
+
+        :param app: the project for spans that record none.
+        :param exporter: makes the exporter for a project.
+        """
+        self._app = app
+        self._make = exporter
+        self._lock = threading.Lock()
+        self._exporters: dict[str, SpanExporter] = {}
+
+    def _for(self, project: str) -> SpanExporter:
+        with self._lock:
+            if (exporter := self._exporters.get(project)) is None:
+                exporter = self._exporters[project] = self._make(project)
+            return exporter
+
+    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        """Send each project's spans in one request."""
+        by_project: dict[str, list[ReadableSpan]] = {}
+        for span in spans:
+            project = (span.attributes or {}).get(PROJECT_ATTRIBUTE, self._app)
+            by_project.setdefault(str(project), []).append(span)
+        results = [self._for(p).export(group) for p, group in by_project.items()]
+        if all(result == SpanExportResult.SUCCESS for result in results):
+            return SpanExportResult.SUCCESS
+        return SpanExportResult.FAILURE
+
+    def shutdown(self) -> None:
+        """Shut down every project's exporter."""
+        with self._lock:
+            exporters = list(self._exporters.values())
+        for exporter in exporters:
+            exporter.shutdown()
+
+
 @dataclass
 class _Tracing:
     config: TracingConfig
+    url: str
+    workspace: str
+    default_project: str
     tokens: KeycloakTokens | None
     providers: dict[str, TracerProvider] = field(default_factory=dict)
+    used: bool = False
+
+    def close(self) -> None:
+        for provider in self.providers.values():
+            provider.shutdown()
+        if self.tokens is not None:
+            self.tokens.close()
 
 
-_lock = threading.Lock()
-_config: TracingConfig | None = None
+_lock = threading.RLock()
 _tracing: _Tracing | None = None
-_sdk_hooked = False
+# Registered on the SDK at most once: the SDK reads its hooks only when it builds
+# its client, so a later configuration swaps the tokens this auth uses.
+_sdk_auth: HttpxBearerAuth | None = None
 
 
 def configure_tracing(config: TracingConfig | None = None) -> None:
     """Set up tracing for this process.
 
-    Call it once at startup, before anything uses the Opik SDK: the SDK reads its
-    client hooks when it first builds its ``httpx`` client, so a hook added after
-    that never applies. Without this call, tracing reads the environment the first
-    time a model is built or a run is traced.
+    Call it at startup, before anything uses the Opik SDK (the SDK reads its client
+    hooks when it first builds its HTTP client) and before building agents (each
+    agent keeps the instrumentation it was built with). Without this call, tracing
+    reads the environment the first time it is needed.
 
     :param config: the configuration; read from the environment when omitted.
     :raises ValueError: if the environment does not parse.
+    :raises RuntimeError: if tracing was already used under a different
+        configuration. The configuration in effect stays as it was.
     """
-    global _config  # noqa: PLW0603
+    global _tracing  # noqa: PLW0603
+    config = config if config is not None else TracingConfig.from_env()
     with _lock:
-        _config = config if config is not None else TracingConfig.from_env()
-    _state()
+        if _tracing is not None:
+            if _tracing.config == config:
+                return
+            if _tracing.used:
+                msg = (
+                    "Tracing was already used with a different configuration; "
+                    "call configure_tracing before building agents or running them"
+                )
+                raise RuntimeError(msg)
+            _tracing.close()
+        _tracing = _start(config)
+
+
+def _start(config: TracingConfig) -> _Tracing:
+    global _sdk_auth  # noqa: PLW0603
+    opik_config = OpikConfig()
+    tokens = KeycloakTokens(config.keycloak) if config.keycloak else None
+    sdk_tokens = tokens if config.enabled else None
+    if _sdk_auth is not None:
+        _sdk_auth.tokens = sdk_tokens
+    elif sdk_tokens is not None:
+        _sdk_auth = HttpxBearerAuth(sdk_tokens)
+        add_httpx_client_hook(
+            HttpxClientHook(
+                client_modifier=None, client_init_arguments={"auth": _sdk_auth}
+            )
+        )
+    return _Tracing(
+        config=config,
+        url=opik_config.url_override,
+        workspace=opik_config.workspace,
+        default_project=opik_config.project_name,
+        tokens=tokens,
+    )
+
+
+def _state() -> _Tracing:
+    """Return the tracing state, marking the configuration as used."""
+    global _tracing  # noqa: PLW0603
+    with _lock:
+        if _tracing is None:
+            _tracing = _start(TracingConfig.from_env())
+        _tracing.used = True
+        return _tracing
 
 
 def get_tracing_config() -> TracingConfig:
@@ -334,68 +505,46 @@ def get_tracing_config() -> TracingConfig:
     :raises ValueError: if nothing was configured and the environment does not
         parse.
     """
-    global _config  # noqa: PLW0603
-    with _lock:
-        if _config is None:
-            _config = TracingConfig.from_env()
-        return _config
+    return _state().config
 
 
-def _state() -> _Tracing:
-    global _tracing, _sdk_hooked  # noqa: PLW0603
-    config = get_tracing_config()
-    with _lock:
-        if _tracing is not None and _tracing.config == config:
-            return _tracing
-        if _tracing is not None:
-            for provider in _tracing.providers.values():
-                provider.shutdown()
-        tokens = KeycloakTokens(config.keycloak) if config.keycloak else None
-        if tokens is not None and config.enabled:
-            if _sdk_hooked:
-                # The SDK's client already exists with the first hook's auth.
-                msg = "The Keycloak client cannot change once the SDK is hooked"
-                raise RuntimeError(msg)
-            add_httpx_client_hook(
-                HttpxClientHook(
-                    client_modifier=None,
-                    client_init_arguments={"auth": HttpxBearerAuth(tokens)},
-                )
-            )
-            _sdk_hooked = True
-        _tracing = _Tracing(config=config, tokens=tokens)
-        return _tracing
+def enabled() -> bool:
+    """Return whether runs are traced.
+
+    :returns: the configured value.
+    :rtype: bool
+    """
+    return _state().config.enabled
 
 
 def tracer_provider(app: str) -> TracerProvider | None:
-    """Return the tracer provider that sends an app's model spans to Opik.
+    """Return the tracer provider for an app's model spans.
 
-    One provider per app, because Opik files OTLP spans under the project named on
-    the export request, and the project is the app.
-
-    :param app: the app, which is the Opik project.
+    :param app: the app; spans outside any Opik trace go to its project.
     :returns: the provider, or ``None`` when tracing is off.
     :rtype: TracerProvider | None
     """
-    state = _state()
-    if not state.config.enabled:
-        return None
     with _lock:
+        state = _state()
+        if not state.config.enabled:
+            return None
         if (provider := state.providers.get(app)) is None:
-            provider = _build_provider(app, state)
-            state.providers[app] = provider
+            provider = state.providers[app] = _build_provider(app, state)
         return provider
 
 
 def _exporter(app: str, state: _Tracing) -> SpanExporter:
-    session = requests.Session()
-    if state.tokens is not None:
-        session.auth = RequestsBearerAuth(state.tokens)
-    return OTLPSpanExporter(
-        endpoint=state.config.url.rstrip("/") + OTLP_TRACES_PATH,
-        headers={PROJECT_HEADER: app, WORKSPACE_HEADER: state.config.workspace},
-        session=session,
-    )
+    def otlp(project: str) -> SpanExporter:
+        session = requests.Session()
+        if state.tokens is not None:
+            session.auth = RequestsBearerAuth(state.tokens)
+        return OTLPSpanExporter(
+            endpoint=state.url.rstrip("/") + OTLP_TRACES_PATH,
+            headers={PROJECT_HEADER: project, WORKSPACE_HEADER: state.workspace},
+            session=session,
+        )
+
+    return ProjectExporter(app, otlp)
 
 
 def _build_provider(app: str, state: _Tracing) -> TracerProvider:
@@ -404,6 +553,7 @@ def _build_provider(app: str, state: _Tracing) -> TracerProvider:
         sampler=OpikActiveSampler(),
     )
     provider.add_span_processor(OpikSpanProcessor())
+    provider.add_span_processor(ProjectStampProcessor(state.default_project))
     provider.add_span_processor(BatchSpanProcessor(_exporter(app, state)))
     return provider
 
@@ -435,10 +585,10 @@ def flush(timeout_millis: int = 30_000) -> bool:
 
 def reset() -> None:
     """Forget the configuration and shut down every provider. For tests."""
-    global _config, _tracing  # noqa: PLW0603
+    global _tracing  # noqa: PLW0603
     with _lock:
         if _tracing is not None:
-            for provider in _tracing.providers.values():
-                provider.shutdown()
-        _config = None
+            _tracing.close()
+        if _sdk_auth is not None:
+            _sdk_auth.tokens = None
         _tracing = None
