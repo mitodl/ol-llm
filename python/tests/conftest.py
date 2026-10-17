@@ -49,7 +49,7 @@ os.environ["OPIK_URL_OVERRIDE"] = OPIK_URL
 os.environ["OPIK_WORKSPACE"] = "default"
 
 
-TRACING = TracingConfig(enabled=True, url=OPIK_URL, workspace="default")
+TRACING = TracingConfig()
 
 
 @pytest.fixture(autouse=True)

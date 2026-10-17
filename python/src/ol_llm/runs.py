@@ -6,9 +6,11 @@ model spans land inside that trace through ``OpikSpanProcessor`` (see
 ``ol_llm.tracing``). Model failures reach the caller as ``LLMError`` subclasses,
 and the trace records the same error.
 
-A run inside a caller's own ``@opik.track`` becomes a span of the caller's trace:
-the attribution tags and metadata go on that span, and ``thread_id`` and the
-degraded marking go on the caller's trace.
+A run inside a caller's own ``@opik.track`` becomes a span of the caller's trace,
+in the caller's project: Opik files a span under its trace's project. The
+attribution metadata goes on the run's span; the tags, ``thread_id``, and the
+degraded marking go on the caller's trace, so filters and scoring rules scoped by
+tag still find it. With tracing off, runs open no trace.
 """
 
 from collections.abc import Callable, Sequence
@@ -27,6 +29,7 @@ from ol_llm.attribution import (
     NO_ATTRIBUTION,
     Attribution,
     DegradedReason,
+    TraceFields,
     degraded_metadata,
     trace_fields,
 )
@@ -40,7 +43,7 @@ from ol_llm.models import (
 )
 from ol_llm.policy import UseCase, resolve_policy
 from ol_llm.settings import get_settings
-from ol_llm.tracing import include_content
+from ol_llm.tracing import enabled, include_content
 
 OutputT = TypeVar("OutputT")
 DepsT = TypeVar("DepsT")
@@ -90,31 +93,35 @@ class _Run(Generic[OutputT]):
     use_case: UseCase
     attribution: Attribution
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None
+    fields: TraceFields
+    traced: bool
 
     def track(self, func: Callable[..., _T]) -> Callable[..., _T]:
-        """Wrap ``func`` in the run's root trace."""
-        fields = trace_fields(
-            self.use_case,
-            environment=get_settings().environment,
-            policy=resolve_policy(self.use_case),
-            attribution=self.attribution,
-        )
+        """Wrap ``func`` in the run's root trace, unless tracing is off."""
+        if not self.traced:
+            return func
         content = include_content()
         tracked: Callable[..., _T] = opik.track(
             name=self.use_case.name,
-            project_name=fields.project_name,
-            tags=list(fields.tags),
-            metadata=dict(fields.metadata),
-            environment=fields.environment,
+            project_name=self.fields.project_name,
+            tags=list(self.fields.tags),
+            metadata=dict(self.fields.metadata),
+            environment=self.fields.environment,
             capture_input=content,
             capture_output=content,
         )(func)
         return tracked
 
     def agent_arguments(self) -> dict[str, Any]:
-        """Return what every run passes the agent, and mark the trace's thread."""
-        if self.attribution.thread_id is not None:
-            opik_context.update_current_trace(thread_id=self.attribution.thread_id)
+        """Return what every run passes the agent, and mark the trace.
+
+        For a run the library opened the tags are already on the trace; for one
+        inside a caller's trace this adds them there.
+        """
+        if self.traced:
+            opik_context.update_current_trace(
+                tags=list(self.fields.tags), thread_id=self.attribution.thread_id
+            )
         return {
             "usage_limits": usage_limits(self.use_case),
             "model_settings": attribution_model_settings(self.attribution),
@@ -141,7 +148,7 @@ class _Run(Generic[OutputT]):
             output = processed.output
             reasons.extend(processed.degraded_reasons)
         degraded_reasons = tuple(dict.fromkeys(reasons))
-        if degraded_reasons:
+        if degraded_reasons and self.traced:
             opik_context.update_current_trace(
                 metadata=dict(degraded_metadata(degraded_reasons))
             )
@@ -165,7 +172,14 @@ def _start(
     if not isinstance(agent.model, Model):
         msg = f"{agent!r} has no model from ol_llm.build_model"
         raise TypeError(msg)
-    return _Run(call_site(agent.model), attribution, postprocess)
+    use_case = call_site(agent.model)
+    fields = trace_fields(
+        use_case,
+        environment=get_settings().environment,
+        policy=resolve_policy(use_case),
+        attribution=attribution,
+    )
+    return _Run(use_case, attribution, postprocess, fields, traced=enabled())
 
 
 async def run(  # noqa: PLR0913
@@ -224,7 +238,9 @@ def run_sync(  # noqa: PLR0913
 ) -> LLMResult[OutputT]:
     """Run an agent synchronously, for Celery tasks and Dagster assets.
 
-    Takes the same arguments as ``run`` and behaves the same way.
+    Takes the same arguments as ``run`` and behaves the same way. Like PydanticAI's
+    ``run_sync``, it cannot be called while an event loop is running in the
+    thread; use ``run`` there.
 
     :returns: the result.
     :rtype: LLMResult

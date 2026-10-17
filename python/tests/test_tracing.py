@@ -1,5 +1,5 @@
-import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING
 
 import httpx
 import opik
@@ -8,18 +8,25 @@ import requests
 from ol_llm import tracing
 from ol_llm.testing import tracing_disabled
 from ol_llm.tracing import (
+    PROJECT_ATTRIBUTE,
     HttpxBearerAuth,
     KeycloakClient,
     KeycloakTokens,
+    ProjectExporter,
     RequestsBearerAuth,
     TracingConfig,
     configure_tracing,
     tracer_provider,
 )
+from opentelemetry.sdk.trace.export import SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
+from opik.hooks import HttpxClientHook
 from requests.adapters import BaseAdapter
+
+if TYPE_CHECKING:
+    from opentelemetry.sdk.trace import ReadableSpan
 
 KEYCLOAK = KeycloakClient(
     token_url="https://sso.example/token",
@@ -58,11 +65,7 @@ def test_from_env_reads_the_sdk_config_and_keycloak() -> None:
     config = TracingConfig.from_env({**KEYCLOAK_ENV, "OPIK_KEYCLOAK_SCOPE": "opik"})
 
     assert config == TracingConfig(
-        enabled=True,
-        url=os.environ["OPIK_URL_OVERRIDE"],
-        workspace="default",
-        keycloak=KEYCLOAK,
-        include_content=True,
+        enabled=True, keycloak=KEYCLOAK, include_content=True
     )
 
 
@@ -229,39 +232,75 @@ def test_requests_auth_returns_a_second_401() -> None:
     assert len(adapter.seen) == 2
 
 
-def test_keycloak_hooks_the_sdk_client_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    hooks: list[object] = []
-    monkeypatch.setattr(tracing, "add_httpx_client_hook", hooks.append)
-    monkeypatch.setattr(tracing, "_sdk_hooked", False)
-    config = TracingConfig(
-        enabled=True, url="http://127.0.0.1:9/api", workspace="w", keycloak=KEYCLOAK
-    )
+OTHER_KEYCLOAK = KeycloakClient(
+    token_url="https://other/token", client_id="c", client_secret="s"
+)
 
-    configure_tracing(config)
-    configure_tracing(config)
+
+@pytest.fixture
+def hooks(monkeypatch: pytest.MonkeyPatch) -> list[HttpxClientHook]:
+    """Record SDK hooks in place of registering them on the real SDK."""
+    registered: list[HttpxClientHook] = []
+    monkeypatch.setattr(tracing, "add_httpx_client_hook", registered.append)
+    monkeypatch.setattr(tracing, "_sdk_auth", None)
+    tracing.reset()
+    return registered
+
+
+def sdk_auth(hooks: list[HttpxClientHook]) -> HttpxBearerAuth:
+    [hook] = hooks
+    auth = hook.update_init_arguments({})["auth"]
+    assert isinstance(auth, HttpxBearerAuth)
+    return auth
+
+
+def test_keycloak_hooks_the_sdk_client_once(hooks: list[HttpxClientHook]) -> None:
+    configure_tracing(TracingConfig(keycloak=KEYCLOAK))
+    first = sdk_auth(hooks).tokens
+    configure_tracing(TracingConfig(keycloak=OTHER_KEYCLOAK))
 
     assert len(hooks) == 1
-    with pytest.raises(RuntimeError, match="cannot change"):
-        configure_tracing(
-            TracingConfig(
-                enabled=True,
-                url="http://127.0.0.1:9/api",
-                workspace="w",
-                keycloak=KeycloakClient(
-                    token_url="https://other/token",
-                    client_id="c",
-                    client_secret="s",
-                ),
-            )
-        )
+    assert sdk_auth(hooks).tokens is not first
+    assert sdk_auth(hooks).tokens is tracing._state().tokens  # noqa: SLF001
 
 
-def test_disabled_tracing_builds_no_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    hooks: list[object] = []
-    monkeypatch.setattr(tracing, "add_httpx_client_hook", hooks.append)
-    configure_tracing(
-        TracingConfig(enabled=False, url="u", workspace="w", keycloak=KEYCLOAK)
-    )
+def test_configuration_can_change_until_it_is_used(
+    hooks: list[HttpxClientHook],  # noqa: ARG001
+) -> None:
+    configure_tracing(TracingConfig(keycloak=KEYCLOAK))
+    configure_tracing(TracingConfig(keycloak=KEYCLOAK, include_content=False))
+
+    assert not tracing.include_content()
+
+
+def test_the_same_configuration_again_is_accepted_after_use(
+    hooks: list[HttpxClientHook],  # noqa: ARG001
+) -> None:
+    configure_tracing(TracingConfig(keycloak=KEYCLOAK))
+    provider = tracer_provider("mit-learn")
+
+    configure_tracing(TracingConfig(keycloak=KEYCLOAK))
+
+    assert tracer_provider("mit-learn") is provider
+
+
+def test_a_different_configuration_after_use_is_refused_and_not_kept(
+    hooks: list[HttpxClientHook],  # noqa: ARG001
+) -> None:
+    configure_tracing(TracingConfig(keycloak=KEYCLOAK))
+    provider = tracer_provider("mit-learn")
+
+    with pytest.raises(RuntimeError, match="before building agents"):
+        configure_tracing(TracingConfig(keycloak=KEYCLOAK, include_content=False))
+
+    assert tracing.include_content()
+    assert tracer_provider("mit-learn") is provider
+
+
+def test_disabled_tracing_builds_no_provider_and_no_hook(
+    hooks: list[HttpxClientHook],
+) -> None:
+    configure_tracing(TracingConfig(enabled=False, keycloak=KEYCLOAK))
 
     assert tracer_provider("mit-learn") is None
     assert hooks == []
@@ -309,3 +348,104 @@ def test_spans_inside_a_tracked_function_carry_its_trace_id(
 
     [span] = exported.get_finished_spans()
     assert (span.attributes or {})["opik.trace_id"] == trace_id
+
+
+def test_spans_record_the_project_of_their_trace(
+    exported: InMemorySpanExporter,
+) -> None:
+    provider = tracer_provider("mit-learn")
+    assert provider is not None
+    tracer = provider.get_tracer("test")
+
+    @opik.track(project_name="ol-data-platform")
+    def tracked() -> None:
+        with tracer.start_as_current_span("agent"), tracer.start_as_current_span("llm"):
+            pass
+
+    with opik.record_traces_locally():
+        tracked()
+    with tracer.start_as_current_span("untraced"):
+        pass
+    tracing.flush()
+
+    projects = {
+        span.name: (span.attributes or {}).get(PROJECT_ATTRIBUTE)
+        for span in exported.get_finished_spans()
+    }
+    assert projects == {
+        "agent": "ol-data-platform",
+        "llm": "ol-data-platform",
+        "untraced": None,
+    }
+
+
+def test_spans_are_exported_per_project() -> None:
+    by_project: dict[str, InMemorySpanExporter] = {}
+
+    def make(project: str) -> InMemorySpanExporter:
+        return by_project.setdefault(project, InMemorySpanExporter())
+
+    exporter = ProjectExporter("mit-learn", make)
+    provider = tracer_provider("mit-learn")
+    assert provider is not None
+    tracer = provider.get_tracer("test")
+    spans: list[ReadableSpan] = []
+    for project in ("ol-data-platform", None):
+        with tracer.start_as_current_span("s") as span:
+            if project:
+                span.set_attribute(PROJECT_ATTRIBUTE, project)
+        spans.append(span)  # type: ignore[arg-type]
+
+    assert exporter.export(spans) == SpanExportResult.SUCCESS
+    assert {p: len(e.get_finished_spans()) for p, e in by_project.items()} == {
+        "ol-data-platform": 1,
+        "mit-learn": 1,
+    }
+
+
+class StreamingTransport(httpx.BaseTransport):
+    """Consumes the body as a stream, as httpx's real transport does.
+
+    MockTransport reads the whole request first, which would hide the case.
+    """
+
+    def __init__(self, statuses: list[int]) -> None:
+        self.statuses = statuses
+        self.bodies: list[bytes] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self.bodies.append(b"".join(request.stream))  # type: ignore[arg-type]
+        return httpx.Response(self.statuses[len(self.bodies) - 1])
+
+
+def test_httpx_auth_does_not_resend_a_streamed_body() -> None:
+    http, _ = token_server([300, 300])
+    transport = StreamingTransport([401, 200])
+    client = httpx.Client(
+        transport=transport,
+        auth=HttpxBearerAuth(KeycloakTokens(KEYCLOAK, http=http)),
+    )
+
+    def body() -> Iterator[bytes]:
+        yield b"attachment"
+
+    response = client.post("https://opik.example/api/upload", content=body())
+
+    assert response.status_code == 401
+    assert transport.bodies == [b"attachment"]
+
+
+def test_httpx_auth_without_tokens_sends_no_credentials() -> None:
+    seen: list[str | None] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("Authorization"))
+        return httpx.Response(200)
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handle), auth=HttpxBearerAuth(None)
+    )
+
+    client.get("https://opik.example/api")
+
+    assert seen == [None]

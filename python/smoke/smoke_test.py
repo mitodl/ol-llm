@@ -9,7 +9,8 @@ What it proves, in an environment shaped like a consumer's runtime image:
   and the OTLP model spans to Opik, and the spans carry the root trace's id;
 - both halves authenticate with a Keycloak client-credentials token, and the span
   exporter fetches a new token after a 401;
-- the spans are filed under the app's project;
+- the spans are filed under the app's project, or under the caller's project for
+  a run inside the caller's own @opik.track, where Opik files that run's trace;
 - importing ol_llm first leaves no Sentry client running.
 
 Opik and Keycloak are one fake server in this process, which records what it is
@@ -27,6 +28,7 @@ from typing import Any
 
 DROPPED = ("litellm", "openai", "pytest", "tree_sitter", "click")
 APP = "ol-llm-smoke"
+CALLER = "ol-llm-smoke-caller"
 OTLP_PATH = "/api/v1/private/otel/v1/traces"
 TOKEN_PATH = "/token"  # noqa: S105
 
@@ -107,6 +109,7 @@ os.environ.update(
 
 # ol_llm before opik, so OPIK_SENTRY_ENABLE is set before opik reads it.
 import ol_llm  # noqa: E402
+import opik  # noqa: E402
 import sentry_sdk  # noqa: E402
 from ol_llm.models import override_models  # noqa: E402
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (  # noqa: E402
@@ -140,6 +143,12 @@ def check() -> list[str]:  # noqa: C901
     result = ol_llm.run_sync(
         agent, "ping", attribution=ol_llm.Attribution(thread_id="smoke-thread")
     )
+
+    @opik.track(name="caller", project_name=CALLER)
+    def caller() -> str:
+        return ol_llm.run_sync(agent, "ping").output
+
+    caller()
     if not ol_llm.tracing.flush():
         return ["the span exporter did not finish"]
 
@@ -151,6 +160,9 @@ def check() -> list[str]:  # noqa: C901
     if len(ended) != 1:
         return [*failures, f"expected one ended root trace named smoke, got {ended}"]
     [trace] = ended
+    callers = [t for t in sdk_traces() if t.get("name") == "caller" and "end_time" in t]
+    if len(callers) != 1:
+        return [*failures, f"expected one ended caller trace, got {callers}"]
     expected = {
         "project_name": APP,
         "environment": "ci",
@@ -168,13 +180,17 @@ def check() -> list[str]:  # noqa: C901
         "Bearer token-2",
     ]:
         failures.append("the span exporter did not retry its 401 with a new token")
-    if {r.headers.get("projectname") for r in otlp} != {APP}:
-        failures.append("OTLP requests did not name the app's project")
-    spans = [s for r in otlp[1:] for s in _spans(r)]
-    if not spans:
-        failures.append("no model spans were accepted")
-    if {s.get("opik.trace_id") for s in spans} != {trace["id"]}:
-        failures.append("model spans do not carry the root trace's id")
+    # The first request was refused and sent again, so it is left out.
+    trace_ids: dict[str, set[str]] = {}
+    for request in otlp[1:]:
+        project = request.headers.get("projectname", "")
+        ids = {span.get("opik.trace_id", "") for span in _spans(request)}
+        trace_ids.setdefault(project, set()).update(ids)
+    expected_ids = {APP: {trace["id"]}, CALLER: {callers[0]["id"]}}
+    if trace_ids != expected_ids:
+        failures.append(
+            f"model spans by project and trace were {trace_ids}, not {expected_ids}"
+        )
     unauthenticated = [
         r.path
         for r in FakeOpik.received
