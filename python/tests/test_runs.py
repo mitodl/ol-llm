@@ -330,6 +330,21 @@ def test_a_run_inside_a_tracked_function_is_a_span_of_its_trace(
     }
 
 
+def test_a_nested_run_keeps_the_callers_thread() -> None:
+    agent = agent_for(SUMMARY, replying("ok"))
+
+    @opik.track(project_name="mit-learn")
+    def handler() -> None:
+        opik.opik_context.update_current_trace(thread_id="caller-thread")
+        run_sync(agent, "hi", attribution=ATTRIBUTION)
+
+    with opik.record_traces_locally() as storage:
+        handler()
+        [trace] = storage.trace_trees
+
+    assert trace.thread_id == "caller-thread"
+
+
 def test_with_tracing_off_a_run_opens_no_trace() -> None:
     tracing.reset()
     configure_tracing(TracingConfig(enabled=False))

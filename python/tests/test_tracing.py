@@ -160,7 +160,7 @@ def test_httpx_auth_sends_the_token_and_retries_a_401_once() -> None:
     handle, seen = opik_server([401, 200])
     client = httpx.Client(
         transport=httpx.MockTransport(handle),
-        auth=HttpxBearerAuth(KeycloakTokens(KEYCLOAK, http=http)),
+        auth=HttpxBearerAuth(KeycloakTokens(KEYCLOAK, http=http), host="opik.example"),
     )
 
     response = client.get("https://opik.example/api/v1/private/projects")
@@ -174,7 +174,7 @@ def test_httpx_auth_returns_a_second_401() -> None:
     handle, seen = opik_server([401, 401])
     client = httpx.Client(
         transport=httpx.MockTransport(handle),
-        auth=HttpxBearerAuth(KeycloakTokens(KEYCLOAK, http=http)),
+        auth=HttpxBearerAuth(KeycloakTokens(KEYCLOAK, http=http), host="opik.example"),
     )
 
     assert client.get("https://opik.example/api").status_code == 401
@@ -404,18 +404,51 @@ def test_spans_are_exported_per_project() -> None:
 
 
 class StreamingTransport(httpx.BaseTransport):
-    """Consumes the body as a stream, as httpx's real transport does.
+    """Streams the request body and the response, as httpx's real transport does.
 
-    MockTransport reads the whole request first, which would hide the case.
+    MockTransport reads the whole request and response, which would hide both a
+    body that cannot be resent and a response closed before httpx reads it.
     """
 
     def __init__(self, statuses: list[int]) -> None:
         self.statuses = statuses
         self.bodies: list[bytes] = []
+        self.tokens: list[str | None] = []
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         self.bodies.append(b"".join(request.stream))  # type: ignore[arg-type]
-        return httpx.Response(self.statuses[len(self.bodies) - 1])
+        self.tokens.append(request.headers.get("Authorization"))
+        return httpx.Response(
+            self.statuses[len(self.bodies) - 1], stream=httpx.ByteStream(b"{}")
+        )
+
+
+def test_httpx_auth_retries_a_401_whose_body_is_unread() -> None:
+    http, _ = token_server([300, 300])
+    transport = StreamingTransport([401, 200])
+    client = httpx.Client(
+        transport=transport,
+        auth=HttpxBearerAuth(KeycloakTokens(KEYCLOAK, http=http), host="opik.example"),
+    )
+
+    response = client.post("https://opik.example/api/v1/private/traces", json={})
+
+    assert response.status_code == 200
+    assert transport.tokens == ["Bearer token-1", "Bearer token-2"]
+
+
+def test_httpx_auth_sends_the_token_only_to_the_opik_host() -> None:
+    http, seen = token_server([300])
+    transport = StreamingTransport([200])
+    client = httpx.Client(
+        transport=transport,
+        auth=HttpxBearerAuth(KeycloakTokens(KEYCLOAK, http=http), host="opik.example"),
+    )
+
+    client.put("https://bucket.s3.amazonaws.com/upload?X-Amz-Signature=x", content=b"a")
+
+    assert transport.tokens == [None]
+    assert seen == []
 
 
 def test_httpx_auth_does_not_resend_a_streamed_body() -> None:
@@ -423,7 +456,7 @@ def test_httpx_auth_does_not_resend_a_streamed_body() -> None:
     transport = StreamingTransport([401, 200])
     client = httpx.Client(
         transport=transport,
-        auth=HttpxBearerAuth(KeycloakTokens(KEYCLOAK, http=http)),
+        auth=HttpxBearerAuth(KeycloakTokens(KEYCLOAK, http=http), host="opik.example"),
     )
 
     def body() -> Iterator[bytes]:
@@ -443,7 +476,8 @@ def test_httpx_auth_without_tokens_sends_no_credentials() -> None:
         return httpx.Response(200)
 
     client = httpx.Client(
-        transport=httpx.MockTransport(handle), auth=HttpxBearerAuth(None)
+        transport=httpx.MockTransport(handle),
+        auth=HttpxBearerAuth(None, host="opik.example"),
     )
 
     client.get("https://opik.example/api")

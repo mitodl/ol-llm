@@ -234,22 +234,26 @@ class KeycloakTokens:
 class HttpxBearerAuth(httpx.Auth):
     """Bearer auth for the Opik SDK's ``httpx`` client, retried once on a 401.
 
-    The SDK takes the auth once, when it builds its client, so ``tokens`` can be
-    replaced afterwards; with none, requests go out without credentials.
+    The SDK takes the auth once, when it builds its client, so ``tokens`` and
+    ``host`` can be replaced afterwards; with no tokens, requests go out without
+    credentials. Only requests to the Opik host get the token: the SDK builds its
+    client for presigned S3 uploads from the same hooks.
     """
 
-    def __init__(self, tokens: KeycloakTokens | None) -> None:
-        """Use the given token cache.
+    def __init__(self, tokens: KeycloakTokens | None, *, host: str) -> None:
+        """Use the given token cache for requests to one host.
 
         :param tokens: the shared token cache.
+        :param host: the Opik API's host.
         """
         self.tokens = tokens
+        self.host = host
 
     def auth_flow(
         self, request: httpx.Request
     ) -> Generator[httpx.Request, httpx.Response]:
         """Send with the cached token; after a 401, once more with a new one."""
-        if (tokens := self.tokens) is None:
+        if (tokens := self.tokens) is None or request.url.host != self.host:
             yield request
             return
         request.headers["Authorization"] = f"Bearer {tokens.token()}"
@@ -261,7 +265,8 @@ class HttpxBearerAuth(httpx.Auth):
         except httpx.RequestNotRead:
             # A streamed body (the SDK's file uploads) cannot be sent twice.
             return
-        response.close()
+        # httpx reads and closes the 401 itself before sending the retry; closing
+        # it here first makes that read raise StreamClosed.
         request.headers["Authorization"] = f"Bearer {tokens.token(refresh=True)}"
         yield request
 
@@ -448,7 +453,7 @@ def configure_tracing(config: TracingConfig | None = None) -> None:
     :raises RuntimeError: if tracing was already used under a different
         configuration. The configuration in effect stays as it was.
     """
-    global _tracing  # noqa: PLW0603
+    global _tracing
     config = config if config is not None else TracingConfig.from_env()
     with _lock:
         if _tracing is not None:
@@ -460,19 +465,23 @@ def configure_tracing(config: TracingConfig | None = None) -> None:
                     "call configure_tracing before building agents or running them"
                 )
                 raise RuntimeError(msg)
-            _tracing.close()
-        _tracing = _start(config)
+        # Start the new state before closing the old, so a failure keeps the old.
+        previous, _tracing = _tracing, _start(config)
+        if previous is not None:
+            previous.close()
 
 
 def _start(config: TracingConfig) -> _Tracing:
     global _sdk_auth  # noqa: PLW0603
     opik_config = OpikConfig()
+    host = httpx.URL(opik_config.url_override).host
     tokens = KeycloakTokens(config.keycloak) if config.keycloak else None
     sdk_tokens = tokens if config.enabled else None
     if _sdk_auth is not None:
         _sdk_auth.tokens = sdk_tokens
+        _sdk_auth.host = host
     elif sdk_tokens is not None:
-        _sdk_auth = HttpxBearerAuth(sdk_tokens)
+        _sdk_auth = HttpxBearerAuth(sdk_tokens, host=host)
         add_httpx_client_hook(
             HttpxClientHook(
                 client_modifier=None, client_init_arguments={"auth": _sdk_auth}
