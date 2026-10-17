@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          version: "0.12.20"
+          version: "0.12.22"
           python-version: ${{ matrix.python-version }}
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -46,7 +46,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          version: "0.12.20"
+          version: "0.12.22"
           python-version: "3.14"
       - name: Install ol-llm alone
         run: |
@@ -90,7 +90,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          version: "0.12.20"
+          version: "0.12.22"
           python-version: "3.14"
       - name: Install
         run: uv sync --frozen
@@ -109,7 +109,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          version: "0.12.20"
+          version: "0.12.22"
       - name: Fetch edx-platform master requirements
         run: |
           curl -fsSL -o "$RUNNER_TEMP/edx-base.txt" \
