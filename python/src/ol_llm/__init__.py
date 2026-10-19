@@ -49,7 +49,14 @@ from ol_llm.tracing import (
 
 if TYPE_CHECKING:
     from ol_llm.models import build_agent, build_model, usage_limits
-    from ol_llm.runs import LLMResult, PostProcessed, run, run_sync
+    from ol_llm.runs import (
+        LLMResult,
+        PostProcessed,
+        complete,
+        complete_sync,
+        run,
+        run_sync,
+    )
 
 # The version lives only in python/pyproject.toml, which is what a release bumps.
 __version__ = version("ol-llm")
@@ -60,6 +67,8 @@ _PYDANTIC_AI_EXPORTS = {
     "usage_limits": "ol_llm.models",
     "LLMResult": "ol_llm.runs",
     "PostProcessed": "ol_llm.runs",
+    "complete": "ol_llm.runs",
+    "complete_sync": "ol_llm.runs",
     "run": "ol_llm.runs",
     "run_sync": "ol_llm.runs",
 }
@@ -90,6 +99,8 @@ __all__ = [
     "build_agent",
     "build_model",
     "check_model_ids",
+    "complete",
+    "complete_sync",
     "configure",
     "configure_tracing",
     "degraded_metadata",

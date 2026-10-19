@@ -1,4 +1,4 @@
-"""The agent entry points (spec §6.6): one Opik root trace per run.
+"""The entry points (spec §6.6): one Opik root trace per run.
 
 ``run`` and ``run_sync`` open the root trace with the §4 attribution fields, run the
 agent under the use case's usage limits, and return an ``LLMResult``. The agent's
@@ -11,11 +11,16 @@ in the caller's project: Opik files a span under its trace's project. The
 attribution metadata goes on the run's span; the tags, ``thread_id``, and the
 degraded marking go on the caller's trace, so filters and scoring rules scoped by
 tag still find it. With tracing off, runs open no trace.
+
+``complete`` and ``complete_sync`` are the single-call path: a tool-less agent over
+the use case's model, run by ``run``, so a call site that outgrows them builds the
+same agent with ``build_agent`` and keeps everything else.
 """
 
+import asyncio
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Generic, TypeVar, cast
+from typing import Any, Generic, TypeVar, cast, overload
 
 import opik
 from opik import opik_context
@@ -23,6 +28,7 @@ from opik.api_objects.trace import TraceData
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
+from pydantic_ai.output import OutputSpec
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.usage import RunUsage
 
@@ -36,12 +42,14 @@ from ol_llm.attribution import (
 )
 from ol_llm.errors import LLMError
 from ol_llm.models import (
+    agent_over,
     answering_model,
     attribution_model_settings,
     call_site,
     catalog_tags,
     classify_run_failure,
     recording_answers,
+    shared_model,
     usage_limits,
 )
 from ol_llm.policy import UseCase, resolve_policy
@@ -286,3 +294,147 @@ def run_sync(  # noqa: PLR0913
 
     state.track(traced)(user_prompt)
     return results[0]
+
+
+def _sync_loop() -> asyncio.AbstractEventLoop:
+    """Return the event loop ``run_sync`` will use in this thread.
+
+    PydanticAI's sync entry points run on the thread's current loop, and set a new
+    one when there is none or it is closed
+    (``pydantic_graph._utils.get_event_loop``). This does the same first, so the
+    loop it returns is the one the call runs on.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop
+
+
+def _completion(
+    use_case: UseCase,
+    messages: Sequence[ModelMessage] | str,
+    output_type: OutputSpec[Any],
+    instructions: str | None,
+    loop: asyncio.AbstractEventLoop,
+) -> tuple[Agent[None, Any], str | None, Sequence[ModelMessage] | None]:
+    """Return the agent, user prompt, and history a single call runs with."""
+    agent = agent_over(
+        shared_model(use_case, loop), output_type=output_type, instructions=instructions
+    )
+    if isinstance(messages, str):
+        return agent, messages, None
+    # A history that ends in a request is sent as is, with no new user prompt.
+    return agent, None, messages
+
+
+@overload
+async def complete(
+    use_case: UseCase,
+    messages: Sequence[ModelMessage] | str,
+    *,
+    instructions: str | None = None,
+    attribution: Attribution = NO_ATTRIBUTION,
+    postprocess: Callable[[str], PostProcessed[str]] | None = None,
+) -> LLMResult[str]: ...
+@overload
+async def complete(
+    use_case: UseCase,
+    messages: Sequence[ModelMessage] | str,
+    *,
+    output_type: OutputSpec[OutputT],
+    instructions: str | None = None,
+    attribution: Attribution = NO_ATTRIBUTION,
+    postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None = None,
+) -> LLMResult[OutputT]: ...
+async def complete(  # noqa: PLR0913
+    use_case: UseCase,
+    messages: Sequence[ModelMessage] | str,
+    *,
+    output_type: OutputSpec[Any] = str,
+    instructions: str | None = None,
+    attribution: Attribution = NO_ATTRIBUTION,
+    postprocess: Callable[[Any], PostProcessed[Any]] | None = None,
+) -> LLMResult[Any]:
+    """Make one model call for a use case, with no agent to build.
+
+    The same as ``run`` over ``build_agent(use_case, output_type=...,
+    instructions=...)``: the same model, policy, trace, and errors. The model is
+    built once per use case and reused.
+
+    :param use_case: the call site.
+    :param messages: the user's message, or the conversation so far ending in the
+        request to send.
+    :param output_type: the output spec, ``str`` for free text; ``ToolOutput``
+        names the tool the model is made to call.
+    :param instructions: the instructions.
+    :param attribution: the per-call attribution fields.
+    :param postprocess: as for ``run``.
+    :returns: the result.
+    :rtype: LLMResult
+    :raises LLMError: on a model failure, invalid output, a content filter, or an
+        exceeded usage limit.
+    :raises ValueError: if ``NativeOutput`` is asked of a model that lacks it, or
+        ``build_model`` rejects the use case.
+    """
+    agent, user_prompt, history = _completion(
+        use_case, messages, output_type, instructions, asyncio.get_running_loop()
+    )
+    return await run(
+        agent,
+        user_prompt,
+        attribution=attribution,
+        message_history=history,
+        postprocess=postprocess,
+    )
+
+
+@overload
+def complete_sync(
+    use_case: UseCase,
+    messages: Sequence[ModelMessage] | str,
+    *,
+    instructions: str | None = None,
+    attribution: Attribution = NO_ATTRIBUTION,
+    postprocess: Callable[[str], PostProcessed[str]] | None = None,
+) -> LLMResult[str]: ...
+@overload
+def complete_sync(
+    use_case: UseCase,
+    messages: Sequence[ModelMessage] | str,
+    *,
+    output_type: OutputSpec[OutputT],
+    instructions: str | None = None,
+    attribution: Attribution = NO_ATTRIBUTION,
+    postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None = None,
+) -> LLMResult[OutputT]: ...
+def complete_sync(  # noqa: PLR0913
+    use_case: UseCase,
+    messages: Sequence[ModelMessage] | str,
+    *,
+    output_type: OutputSpec[Any] = str,
+    instructions: str | None = None,
+    attribution: Attribution = NO_ATTRIBUTION,
+    postprocess: Callable[[Any], PostProcessed[Any]] | None = None,
+) -> LLMResult[Any]:
+    """Make one model call synchronously, for Celery tasks and Dagster assets.
+
+    Takes the same arguments as ``complete`` and behaves the same way; like
+    ``run_sync``, it cannot be called while an event loop is running in the thread.
+
+    :returns: the result.
+    :rtype: LLMResult
+    """
+    agent, user_prompt, history = _completion(
+        use_case, messages, output_type, instructions, _sync_loop()
+    )
+    return run_sync(
+        agent,
+        user_prompt,
+        attribution=attribution,
+        message_history=history,
+        postprocess=postprocess,
+    )

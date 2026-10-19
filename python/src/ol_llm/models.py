@@ -11,6 +11,7 @@ import logging
 import os
 import random
 import sys
+import threading
 from collections.abc import (
     AsyncGenerator,
     Callable,
@@ -132,6 +133,13 @@ _model_override: ContextVar[Model | Mapping[str, Model] | None] = ContextVar(
 # Where recording_answers collects model ids. A list, not a value: the run's
 # tasks get a copy of the context, and an append is what reaches the caller.
 _answers: ContextVar[list[str] | None] = ContextVar("ol_llm_answers", default=None)
+
+# The models complete runs on, one per event loop and use case: each build creates
+# provider clients, and those bind to the loop they first run on (see shared_model).
+_shared_lock = threading.Lock()
+_shared_models: dict[
+    tuple[asyncio.AbstractEventLoop, UseCase], tuple[Settings, Model]
+] = {}
 
 # Patched in tests so retries do not wait.
 _sleep: Callable[[float], Any] = asyncio.sleep
@@ -929,7 +937,42 @@ def build_agent(  # noqa: PLR0913
     :raises ValueError: if ``NativeOutput`` is asked of a model that lacks it, or
         ``build_model`` rejects the use case.
     """
-    model = build_model(use_case, settings=settings)
+    return agent_over(
+        build_model(use_case, settings=settings),
+        deps_type=deps_type,
+        output_type=output_type,
+        instructions=instructions,
+        tools=tools,
+        toolsets=toolsets,
+        capabilities=capabilities,
+    )
+
+
+def agent_over(  # noqa: PLR0913
+    model: Model,
+    *,
+    deps_type: type[Any] = _NO_DEPS,
+    output_type: OutputSpec[Any] = str,
+    instructions: str | None = None,
+    tools: Sequence[Any] = (),
+    toolsets: Sequence[Any] | None = None,
+    capabilities: Sequence[Any] | None = None,
+) -> Agent[Any, Any]:
+    """Build the agent ``build_agent`` would, over a model already built.
+
+    :param model: a model from ``build_model``.
+    :param deps_type: the type of the run's dependencies.
+    :param output_type: the output spec.
+    :param instructions: the agent's instructions.
+    :param tools: function tools.
+    :param toolsets: toolsets.
+    :param capabilities: capabilities added after the library's own.
+    :returns: the agent.
+    :rtype: Agent
+    :raises ValueError: if ``NativeOutput`` is asked of a model that lacks it.
+    :raises TypeError: if the model did not come from ``build_model``.
+    """
+    use_case = call_site(model)
     _check_output_mode(output_type, model)
     return Agent(
         model,
@@ -946,6 +989,39 @@ def build_agent(  # noqa: PLR0913
             *(capabilities or ()),
         ],
     )
+
+
+def shared_model(use_case: UseCase, loop: asyncio.AbstractEventLoop) -> Model:
+    """Return the model ``complete`` runs a use case on in one event loop.
+
+    Provider clients bind to the loop they first run on: a pooled ``httpx``
+    connection belongs to that loop's transport, and SDK clients keep asyncio locks
+    and events (the provider's own enter lock among them). Reused on another loop,
+    they fail with "bound to a different event loop", or "Event loop is closed"
+    once the first loop is gone. So each loop gets its own model, and a closed
+    loop's models are dropped.
+
+    A model is rebuilt after ``configure`` replaces the settings. Under
+    ``override_models`` every call builds a new one, so an override never outlives
+    its block.
+
+    :param use_case: the call site.
+    :param loop: the event loop the call will run on.
+    :returns: the model.
+    :rtype: Model
+    :raises ValueError: if ``build_model`` rejects the use case.
+    """
+    if _model_override.get() is not None:
+        return build_model(use_case)
+    settings = get_settings()
+    with _shared_lock:
+        for key in [key for key in _shared_models if key[0].is_closed()]:
+            del _shared_models[key]
+        cached = _shared_models.get((loop, use_case))
+        if cached is None or cached[0] is not settings:
+            cached = (settings, build_model(use_case, settings=settings))
+            _shared_models[loop, use_case] = cached
+        return cached[1]
 
 
 def usage_limits(use_case: UseCase) -> UsageLimits:

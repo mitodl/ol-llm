@@ -72,7 +72,54 @@ trace, in that function's project: Opik files a span under its trace's project, 
 spans follow. The use case's tags go on the outer trace so tag filters still find it; the
 attribution metadata stays on the run's span.
 
-`run_stream` and the single-call `complete` are not released yet.
+A single model call needs no agent. `ol_llm.complete` (or `ol_llm.complete_sync`) takes the use
+case and the prompt, or the conversation so far as a list of PydanticAI messages ending in the
+request to send:
+
+```python
+from pydantic_ai import ToolOutput
+
+# Plain text.
+result = await ol_llm.complete(SUMMARY, text, instructions="Summarize in one sentence.")
+result.output  # a str
+
+# Structured output, validated into the schema and retried on the same model when invalid.
+result = ol_llm.complete_sync(
+    SUMMARY, text, output_type=Summary, instructions="Summarize."
+)
+result.output  # a Summary
+
+
+# A forced tool call: the model gets one tool and no text output, so it has to call it.
+class Rubric(BaseModel):
+    score: int
+    rationale: str
+
+
+result = ol_llm.complete_sync(
+    GRADING,
+    submission,
+    output_type=ToolOutput(
+        Rubric, name="record_grade", description="Record the grade."
+    ),
+    attribution=ol_llm.Attribution(user_id=user.global_id),
+)
+result.output  # a Rubric
+```
+
+`complete` runs a tool-less agent over the use case's model through `run`, so the timeout,
+retries, fallback, trace, errors, and `LLMResult` are the same. The model is built on the first
+call for a use case and reused after that. A call site that grows tools or more steps moves to
+the agent path by building the same agent itself, with the arguments it already passes:
+
+```python
+grader = ol_llm.build_agent(
+    GRADING, output_type=ToolOutput(Rubric, name="record_grade"), tools=[lookup_rubric]
+)
+result = ol_llm.run_sync(grader, submission, attribution=attribution)
+```
+
+`run_stream` is not released yet.
 
 ### Tracing
 
