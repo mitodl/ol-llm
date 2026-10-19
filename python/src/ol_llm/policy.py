@@ -51,9 +51,11 @@ class UseCase:
         ``batch``, and goes in a request header.
     :param profile: ``request`` for a user waiting on the answer, ``batch`` for
         pipelines and background jobs.
-    :param model: the model id in PydanticAI form, ``provider:model``.
+    :param model: the model id in PydanticAI form, ``provider:model``. Must be in
+        the model catalog (``ol_llm.catalog``) for ``build_model`` to build it.
     :param fallback_models: model ids tried in order once the primary has spent its
-        retries on a rate limit or an outage. Empty means no fallback.
+        retries on a rate limit or an outage. Empty means no fallback, and must be
+        empty when the primary's route falls back on its own.
     :param timeout_seconds: overrides the profile default; needs ``policy_reason``.
     :param max_retries: overrides the profile default; needs ``policy_reason``.
     :param max_backoff_seconds: overrides the profile default; needs

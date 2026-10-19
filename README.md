@@ -13,6 +13,29 @@ The design and the decisions behind it are in
 [mitodl/ol-infrastructure `docs/plans/shared-llm-library-spec.md`](https://github.com/mitodl/ol-infrastructure/blob/main/docs/plans/shared-llm-library-spec.md).
 The contracts move into `docs/` here as they are implemented.
 
+## Model catalog
+
+[`python/src/ol_llm/catalog.toml`](python/src/ol_llm/catalog.toml) lists every model an
+application may call, with its status, whether the id floats, the name Opik prices it under,
+and its list price. `build_model` builds only catalog chat models and refuses retired ones.
+Adding or changing an entry is a pull request here; the policy is
+[`llm-usage-policies-spec.md` §2.2](https://github.com/mitodl/ol-infrastructure/blob/main/docs/plans/llm-usage-policies-spec.md).
+
+An application keeps its own model lists (database rows, settings) to the catalog in CI, so
+a release that retires a model fails the CI of any app still naming it:
+
+```sh
+ol-llm-catalog check openai:gpt-4o-mini azure:gpt-5-mini
+ol-llm-catalog check --file models.txt   # one id per line, # comments
+```
+
+or from a test, `assert ol_llm.check_model_ids(ids).ok`. `ol-llm-catalog prices` prints the
+prices as a Prometheus recording rule group for the spend dashboard and alerts.
+
+The test suite checks that genai-prices can price every chat model, which a `cost_limit`
+needs, and that Opik prices every model at the catalog price. The Opik check downloads
+Opik's price table, so offline runs deselect it with `-m "not network"`.
+
 ## Development
 
 ```sh

@@ -31,3 +31,21 @@ def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
     monkeypatch.setattr(models, "_sleep", record)
     return recorded
+
+
+@pytest.fixture
+def provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in {
+        "OPENAI_API_KEY": "test-key",
+        "ANTHROPIC_API_KEY": "test-key",
+        "AZURE_OPENAI_API_KEY": "test-key",
+        "AZURE_OPENAI_ENDPOINT": "https://example.openai.azure.com",
+        "OPENAI_API_VERSION": "2024-10-21",
+        "GOOGLE_API_KEY": "test-key",
+        "MISTRAL_API_KEY": "test-key",
+        "TOGETHER_API_KEY": "test-key",
+        "AWS_DEFAULT_REGION": "us-east-1",
+        "AWS_ACCESS_KEY_ID": "test",
+        "AWS_SECRET_ACCESS_KEY": "test",
+    }.items():
+        monkeypatch.setenv(name, value)

@@ -37,7 +37,7 @@ from pydantic_ai.models.test import TestModel
 DROPPED = ("litellm", "openai", "pytest", "tree_sitter", "click")
 OPIK_TRACE_ID = "opik.trace_id"
 SMOKE = ol_llm.UseCase(
-    app="ol-llm-smoke", name="smoke", profile="request", model="openai:smoke"
+    app="ol-llm-smoke", name="smoke", profile="request", model="openai:gpt-4o-mini"
 )
 
 

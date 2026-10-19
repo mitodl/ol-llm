@@ -23,6 +23,7 @@ from ol_llm.attribution import (
     degraded_metadata,
     trace_fields,
 )
+from ol_llm.catalog import CatalogEntry, check_model_ids, load_catalog
 from ol_llm.errors import (
     LLMBudgetExceeded,
     LLMContentFiltered,
@@ -53,6 +54,7 @@ _PYDANTIC_AI_MODULES = frozenset({"pydantic_ai", "httpx2"})
 __all__ = [
     "Attribution",
     "CallPolicy",
+    "CatalogEntry",
     "DegradedReason",
     "GatewayRoute",
     "LLMBudgetExceeded",
@@ -68,9 +70,11 @@ __all__ = [
     "UseCase",
     "build_agent",
     "build_model",
+    "check_model_ids",
     "configure",
     "degraded_metadata",
     "get_settings",
+    "load_catalog",
     "resolve_policy",
     "trace_fields",
     "usage_limits",
