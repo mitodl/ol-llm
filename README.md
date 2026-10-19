@@ -18,8 +18,8 @@ The contracts move into `docs/` here as they are implemented.
 [`python/src/ol_llm/catalog.toml`](python/src/ol_llm/catalog.toml) records the models
 applications call, with each one's status, whether the id floats, the name Opik prices it
 under, and its list price. It is not an allowlist, so a new model needs no release here:
-`build_model` builds an id the catalog does not list, logs a warning, and tags the run's trace
-`model_status:uncataloged`. It refuses a retired id, and tags a deprecated one
+`build_model` and `embed` build an id the catalog does not list, log a warning, and tag the
+trace `model_status:uncataloged`. They refuse a retired id, and tag a deprecated one
 `model_status:deprecated`. A model with no entry has no price in the spend rules, so a model
 that stays in use should get one. Adding or changing an entry is a pull request here; the
 policy is
@@ -38,8 +38,8 @@ or from a test, `assert ol_llm.check_model_ids(ids).ok`. `ol-llm-catalog prices`
 prices as a Prometheus recording rule group for the spend dashboard and alerts.
 
 The test suite checks that genai-prices can price every chat model, which a `cost_limit`
-needs, and that Opik prices every model at the catalog price. The Opik check downloads
-Opik's price table, so offline runs deselect it with `-m "not network"`.
+needs, and every embedding model, and that Opik prices every model at the catalog price. The
+Opik check downloads Opik's price table, so offline runs deselect it with `-m "not network"`.
 
 ## Development
 

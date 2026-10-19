@@ -19,6 +19,7 @@ from ol_llm.catalog import (
     main,
     price_rules,
 )
+from ol_llm.embeddings import PolicyEmbeddingModel, build_embedder
 from ol_llm.models import (
     PolicyFallbackModel,
     PolicyModel,
@@ -27,6 +28,7 @@ from ol_llm.models import (
     override_models,
 )
 from ol_llm.testing import policy_model
+from pydantic_ai.embeddings import EmbeddingResult
 from pydantic_ai.messages import ModelResponse
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.usage import RequestUsage
@@ -38,6 +40,11 @@ CATALOG = load_catalog()
 # The chat models build_model will build.
 CHAT_ENTRIES = [
     e for e in CATALOG.entries.values() if e.kind == "chat" and e.status != "retired"
+]
+EMBEDDING_ENTRIES = [
+    e
+    for e in CATALOG.entries.values()
+    if e.kind == "embedding" and e.status != "retired"
 ]
 
 TEST_CATALOG = """
@@ -364,6 +371,23 @@ def test_pydantic_ai_can_price_every_chat_model(entry: CatalogEntry) -> None:
     )
 
     assert response.cost().total_price > 0
+
+
+@pytest.mark.parametrize("entry", EMBEDDING_ENTRIES, ids=lambda e: e.id)
+def test_pydantic_ai_can_price_every_embedding_model(entry: CatalogEntry) -> None:
+    """The embedding span's cost, looked up the way PydanticAI does it."""
+    model = build_embedder(use_case(entry.id)).model
+    assert isinstance(model, PolicyEmbeddingModel)
+    result = EmbeddingResult(
+        embeddings=[],
+        inputs=[],
+        input_type="document",
+        model_name=model.model_name,
+        provider_name=model.system,
+        usage=RequestUsage(input_tokens=1000),
+    )
+
+    assert result.cost().total_price > 0
 
 
 # Opik prices a span from its own table, which ships in the backend image rather

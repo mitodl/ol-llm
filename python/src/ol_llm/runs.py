@@ -129,19 +129,52 @@ class LLMResult(Generic[OutputT]):
     new_messages: Sequence[ModelMessage]
 
 
-@dataclass(frozen=True)
-class _Run(Generic[OutputT]):
-    """The parts of a run shared by the async and sync entry points."""
+@dataclass(frozen=True, kw_only=True)
+class TracedCall:
+    """The root trace of one entry-point call, for runs and embeddings alike.
+
+    :param use_case: the call site.
+    :param attribution: the per-call fields.
+    :param fields: what the root trace is opened with.
+    :param traced: whether tracing was on when the call started.
+    :param prompt: the managed prompt the call uses, linked to its trace.
+    """
 
     use_case: UseCase
     attribution: Attribution
-    postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None
     fields: TraceFields
     traced: bool
     prompt: ManagedPrompt[Any] | None = None
 
+    @staticmethod
+    def fields_for(
+        use_case: UseCase,
+        attribution: Attribution,
+        prompt: ManagedPrompt[Any] | None = None,
+        *,
+        model_tags: Sequence[str] = (),
+    ) -> TraceFields:
+        """Return the root-trace fields for a call, with the policy it resolves to.
+
+        :param use_case: the call site.
+        :param attribution: the per-call fields.
+        :param prompt: the managed prompt the call uses, if any.
+        :param model_tags: the models' catalog-status tags, from ``status_tags``.
+        :returns: the fields.
+        :rtype: TraceFields
+        """
+        return trace_fields(
+            use_case,
+            environment=get_settings().environment,
+            policy=resolve_policy(use_case),
+            attribution=attribution,
+            model_tags=model_tags,
+            prompt_name=prompt.name if prompt else None,
+            prompt_version=prompt.version if prompt else None,
+        )
+
     def track(self, func: Callable[..., _T]) -> Callable[..., _T]:
-        """Wrap ``func`` in the run's root trace, unless tracing is off."""
+        """Wrap ``func`` in the call's root trace, unless tracing is off."""
         if not self.traced:
             return func
         content = include_content()
@@ -165,12 +198,12 @@ class _Run(Generic[OutputT]):
         """
         return opik_context.get_current_trace_data() if self.traced else None
 
-    def agent_arguments(self) -> dict[str, Any]:
-        """Return what every run passes the agent, and mark the trace.
+    def mark_trace(self) -> None:
+        """Put the use case's tags, the thread, and the prompt link on the trace.
 
-        For a run the library opened the tags and prompt are already on the trace;
-        for one inside a caller's trace, whose own metadata lands on its span, this
-        adds them there. A caller's trace that already has a thread keeps it.
+        For a call the library opened the tags and prompt are already there; for
+        one inside a caller's trace, whose own metadata lands on its span, this adds
+        them there. A caller's trace that already has a thread keeps it.
         """
         if (trace := self._current_trace()) is not None:
             opik_context.update_current_trace(
@@ -184,58 +217,10 @@ class _Run(Generic[OutputT]):
             )
             if self.prompt is not None:
                 attach_prompt(self.prompt)
-        return {
-            "usage_limits": usage_limits(self.use_case),
-            "model_settings": attribution_model_settings(self.attribution),
-            "conversation_id": self.attribution.thread_id,
-        }
-
-    def replacement(self, exc: Exception, answers: Sequence[str]) -> LLMError | None:
-        """Return the library error to raise in place of ``exc``, if any.
-
-        It names the model that gave the last response, which for invalid or
-        filtered output is the one that produced it.
-        """
-        model = answers[-1] if answers else self.use_case.model
-        error = classify_run_failure(exc, use_case=self.use_case.name, model=model)
-        return None if error is exc else error
-
-    def finish(self, result: AgentRunResult[OutputT]) -> LLMResult[OutputT]:
-        """Apply ``postprocess``, mark a degraded result, and build the result."""
-        new_messages = result.new_messages()
-        model = answering_model(new_messages) or self.use_case.model
-        reasons: list[DegradedReason] = []
-        if model != self.use_case.model:
-            reasons.append("fallback_model")
-        if self.prompt is not None:
-            reasons.extend(self.prompt.degraded_reasons)
-        output = result.output
-        if self.postprocess is not None:
-            processed = self.postprocess(output)
-            output = processed.output
-            reasons.extend(processed.degraded_reasons)
-        degraded_reasons = tuple(dict.fromkeys(reasons))
-        if degraded_reasons and (trace := self._current_trace()) is not None:
-            # Another run in the same trace may have marked it already.
-            earlier = (trace.metadata or {}).get("degraded_reason")
-            marked = cast("list[DegradedReason]", earlier.split(",") if earlier else [])
-            opik_context.update_current_trace(
-                metadata=dict(degraded_metadata([*marked, *degraded_reasons]))
-            )
-        return LLMResult(
-            output=output,
-            model=model,
-            usage=result.usage,
-            degraded=bool(degraded_reasons),
-            degraded_reasons=degraded_reasons,
-            prompt_name=self.prompt.name if self.prompt else None,
-            prompt_version=self.prompt.version if self.prompt else None,
-            new_messages=new_messages,
-        )
 
     @contextmanager
     def trace_scope(self, user_prompt: str | None) -> Generator[_TraceOutput]:
-        """Hold the run's root trace current for the block, unless tracing is off.
+        """Hold the call's root trace current for the block, unless tracing is off.
 
         The trace opened here matches the one ``track`` opens. It records the
         block's exception, or else the output set on what this yields.
@@ -284,6 +269,65 @@ class _Run(Generic[OutputT]):
             error_info=None,
             capture_output=content,
             should_process_span_data=span_started,
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class _Run(TracedCall, Generic[OutputT]):
+    """The parts of a run shared by the async and sync entry points."""
+
+    postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None
+
+    def agent_arguments(self) -> dict[str, Any]:
+        """Return what every run passes the agent, and mark the trace."""
+        self.mark_trace()
+        return {
+            "usage_limits": usage_limits(self.use_case),
+            "model_settings": attribution_model_settings(self.attribution),
+            "conversation_id": self.attribution.thread_id,
+        }
+
+    def replacement(self, exc: Exception, answers: Sequence[str]) -> LLMError | None:
+        """Return the library error to raise in place of ``exc``, if any.
+
+        It names the model that gave the last response, which for invalid or
+        filtered output is the one that produced it.
+        """
+        model = answers[-1] if answers else self.use_case.model
+        error = classify_run_failure(exc, use_case=self.use_case.name, model=model)
+        return None if error is exc else error
+
+    def finish(self, result: AgentRunResult[OutputT]) -> LLMResult[OutputT]:
+        """Apply ``postprocess``, mark a degraded result, and build the result."""
+        new_messages = result.new_messages()
+        model = answering_model(new_messages) or self.use_case.model
+        reasons: list[DegradedReason] = []
+        if model != self.use_case.model:
+            reasons.append("fallback_model")
+        if self.prompt is not None:
+            reasons.extend(self.prompt.degraded_reasons)
+        output = result.output
+        if self.postprocess is not None:
+            processed = self.postprocess(output)
+            output = processed.output
+            reasons.extend(processed.degraded_reasons)
+        degraded_reasons = tuple(dict.fromkeys(reasons))
+        if degraded_reasons and (trace := self._current_trace()) is not None:
+            # Another run in the same trace may have marked it already.
+            earlier = (trace.metadata or {}).get("degraded_reason")
+            marked = cast("list[DegradedReason]", earlier.split(",") if earlier else [])
+            opik_context.update_current_trace(
+                metadata=dict(degraded_metadata([*marked, *degraded_reasons]))
+            )
+        return LLMResult(
+            output=output,
+            model=model,
+            usage=result.usage,
+            degraded=bool(degraded_reasons),
+            degraded_reasons=degraded_reasons,
+            prompt_name=self.prompt.name if self.prompt else None,
+            prompt_version=self.prompt.version if self.prompt else None,
+            new_messages=new_messages,
         )
 
     def stream_replacement(
@@ -375,17 +419,15 @@ def _start(
         msg = f"{agent!r} has no model from ol_llm.build_model"
         raise TypeError(msg)
     use_case = call_site(agent.model)
-    fields = trace_fields(
-        use_case,
-        environment=get_settings().environment,
-        policy=resolve_policy(use_case),
-        attribution=attribution,
-        model_tags=catalog_tags(agent.model),
-        prompt_name=prompt.name if prompt else None,
-        prompt_version=prompt.version if prompt else None,
-    )
     return _Run(
-        use_case, attribution, postprocess, fields, traced=enabled(), prompt=prompt
+        use_case=use_case,
+        attribution=attribution,
+        fields=TracedCall.fields_for(
+            use_case, attribution, prompt, model_tags=catalog_tags(agent.model)
+        ),
+        traced=enabled(),
+        prompt=prompt,
+        postprocess=postprocess,
     )
 
 

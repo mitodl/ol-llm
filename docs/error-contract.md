@@ -49,6 +49,14 @@ Failures are classified by type and status, never by message text:
 | invalid output once output retries are spent | `LLMInvalidOutput` | no | no |
 | a run's usage limit | `LLMBudgetExceeded` | no | no |
 
+Embedding calls go through the same layer. An embedding response that cannot be read, or
+whose vector count does not match the texts, is `LLMInvalidOutput` and is not retried. An
+embedding call can make several provider requests (Bedrock's Titan models take one text per
+request) and fail with a group of their failures: the group maps to its first failure that is
+not retryable, else its first failure, and a retry sends the whole call again. An embedding
+use case takes no fallback models, since another model's vectors are not comparable with the
+primary's.
+
 Every error carries the use case name, the model id, whether it is retryable, and the
 provider's exception as its cause. Provider messages never reach users; request-time surfaces
 map the error class to their own text.
@@ -90,8 +98,8 @@ count toward the circuit's threshold. The other errors fail only their row.
 
 Implemented: use cases, policy resolution, the error classes, classification of model
 requests, the retry wrapper, fallback composition, the content-filter and output-retry
-settings on agents, and the entry points `run`, `run_sync`, `run_stream`, `complete`, and
-`complete_sync`.
+settings on agents, the entry points `run`, `run_sync`, `run_stream`, `complete`, and
+`complete_sync`, and the embedding entry points `embed` and `embed_sync`.
 
 Not yet: the batch helpers. A bare `agent.run` outside the entry points raises
 PydanticAI's own `ContentFilterError`, `UnexpectedModelBehavior`, and `UsageLimitExceeded`
