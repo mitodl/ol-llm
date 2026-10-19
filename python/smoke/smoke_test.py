@@ -117,7 +117,9 @@ from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (  # noqa: 
 )
 from pydantic_ai.models.test import TestModel  # noqa: E402
 
-SMOKE = ol_llm.UseCase(app=APP, name="smoke", profile="request", model="openai:gpt-4o-mini")
+SMOKE = ol_llm.UseCase(
+    app=APP, name="smoke", profile="request", model="openai:gpt-4o-mini"
+)
 
 
 def sdk_traces() -> list[dict[str, Any]]:

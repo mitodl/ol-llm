@@ -29,7 +29,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 
 PRIMARY = "openai:gpt-4o-mini"
-FALLBACK = "anthropic:claude-haiku-4-5"
+FALLBACK = "bedrock:global.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 SUMMARY = UseCase(
     app="mit-learn",
