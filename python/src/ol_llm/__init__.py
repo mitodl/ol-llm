@@ -35,6 +35,13 @@ from ol_llm.errors import (
     LLMUnavailable,
 )
 from ol_llm.policy import CallPolicy, Profile, UseCase, resolve_policy
+from ol_llm.prompts import (
+    ChatTemplate,
+    ManagedPrompt,
+    TemplateType,
+    TextTemplate,
+    get_prompt,
+)
 from ol_llm.settings import (
     GatewayRoute,
     Settings,
@@ -83,6 +90,7 @@ __all__ = [
     "Attribution",
     "CallPolicy",
     "CatalogEntry",
+    "ChatTemplate",
     "DegradedReason",
     "GatewayRoute",
     "KeycloakClient",
@@ -95,9 +103,12 @@ __all__ = [
     "LLMResult",
     "LLMStream",
     "LLMUnavailable",
+    "ManagedPrompt",
     "PostProcessed",
     "Profile",
     "Settings",
+    "TemplateType",
+    "TextTemplate",
     "TraceFields",
     "TracingConfig",
     "UseCase",
@@ -109,6 +120,7 @@ __all__ = [
     "configure",
     "configure_tracing",
     "degraded_metadata",
+    "get_prompt",
     "get_settings",
     "load_catalog",
     "resolve_policy",

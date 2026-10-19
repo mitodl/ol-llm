@@ -140,6 +140,63 @@ failure before the first chunk is retried and falls back as in `run` and raises 
 failure after it raises `LLMUnavailable` (or another `LLMError`) where the stream is read, and
 is not retried.
 
+### Prompts
+
+Prompts live in the app's Opik project and are fetched by environment label. Each call site
+passes an embedded default: the text of the version production points at, exported into the
+image at build time.
+
+```python
+SUMMARY_PROMPT = ol_llm.TextTemplate(template=EXPORTED_TEXT, version="v7")
+
+
+def summarize(text: str, audience: str) -> Summary:
+    prompt = ol_llm.get_prompt(
+        "content-summary", project_name="mit-learn", default=SUMMARY_PROMPT
+    )
+    result = ol_llm.complete_sync(
+        SUMMARY,
+        text,
+        output_type=Summary,
+        instructions=prompt.format(audience=audience),
+        prompt=prompt,
+    )
+    return result.output  # result.prompt_version is "v7"
+```
+
+The label defaults to `Settings.environment`; pass `environment=` to choose another, or
+`version="v7"` to pin one for a batch run or evaluation. The SDK caches each prompt for
+`OPIK_PROMPT_CACHE_TTL_SECONDS` (300) and refreshes it in the background, so fetching on every
+call, as above, costs nothing and picks up a moved label within five minutes.
+
+An agent keeps the instructions it was built with, so a label move does not reach an agent
+built once at startup; `run`, `run_sync`, and `run_stream` take `prompt=` for the trace link
+and the result fields, not to change the instructions. Use `complete` where the prompt should
+follow the label per call. A batch run fetches once at its start, builds its agent from that
+version, and uses it throughout.
+
+When nothing is cached and Opik does not answer within two seconds, `get_prompt` returns the
+embedded default, and a run given it is marked degraded with `embedded_prompt` on the result
+and the trace. A missing prompt, label, or version raises `LookupError`, and any other refusal
+from Opik (a 401, say) raises the SDK's error: those are configuration errors, not an outage.
+With tracing off (`OPIK_TRACK_DISABLE=true`) `get_prompt` returns the embedded default
+unmarked, so local development needs no Opik.
+
+Passing the prompt to `complete`, `run`, or `run_stream` links its version to the run's trace and puts `prompt_name` and
+`prompt_version` on the result and in the trace metadata. A call site that is not built on
+PydanticAI gets the link by calling `get_prompt` inside its own `@opik.track`, and marks a
+fallback itself with `degraded_metadata(prompt.degraded_reasons)`.
+
+`ChatTemplate(messages=[...])` declares a chat prompt; text or chat is fixed per prompt name.
+Templates are mustache (`{{key}}`, every placeholder must be given) unless declared
+`type="jinja2"`. The fetched version and the embedded default render through the same SDK
+code.
+
+`prompt.template_hash` is a hash of the template text and type, which batch idempotency keys
+are built on in place of the version. A run that fell back to the embedded default then gets
+the same key as one that fetched the same text, so an Opik outage does not trigger
+reprocessing.
+
 ### Tracing
 
 Tracing reads the variables the Opik SDK reads, so the SDK and the span exporter always send

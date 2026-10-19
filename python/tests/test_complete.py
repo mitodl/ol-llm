@@ -8,16 +8,20 @@ from typing import Any
 
 import opik
 import pytest
+from conftest import PromptLibrary
 from ol_llm import (
     Attribution,
     LLMInvalidOutput,
     LLMRateLimited,
+    ManagedPrompt,
     PostProcessed,
     Settings,
+    TextTemplate,
     UseCase,
     complete,
     complete_sync,
     configure,
+    get_prompt,
     models,
     run_sync,
     tracing,
@@ -325,3 +329,50 @@ def test_complete_works_under_successive_event_loops(real_client: UseCase) -> No
     outputs = [asyncio.run(complete(real_client, "hi")).output for _ in range(2)]
 
     assert outputs == ["ok", "ok"]
+
+
+@ENTRIES
+def test_a_managed_prompt_is_linked_to_the_call(
+    prompt_library: PromptLibrary, entry: Callable[..., object]
+) -> None:
+    prompt_library.add("summary", "Summarize {{tone}}.", environments=("production",))
+    prompt = get_prompt(
+        "summary",
+        project_name="mit-learn",
+        default=TextTemplate(template="Summarize {{tone}}."),
+        environment="production",
+    )
+    seen: list[AgentInfo] = []
+
+    with override_models(replying("ok", seen)), opik.record_traces_locally() as storage:
+        result = entry(
+            SUMMARY, "hi", instructions=prompt.format(tone="briefly"), prompt=prompt
+        )
+        [trace] = storage.trace_trees
+
+    assert seen[0].instructions == "Summarize briefly."
+    assert (result.prompt_name, result.prompt_version) == ("summary", "v1")  # type: ignore[attr-defined]
+    assert trace.metadata is not None
+    assert trace.metadata["prompt_version"] == "v1"
+    [linked] = trace.metadata["opik_prompts"]
+    assert linked["version"]["version_number"] == "v1"
+
+
+def test_an_embedded_prompt_marks_the_call_degraded() -> None:
+    prompt = ManagedPrompt(
+        name="summary",
+        template=TextTemplate(template="Summarize.", version="v3"),
+        source="embedded",
+        degraded_reasons=("embedded_prompt",),
+    )
+
+    with override_models(replying("ok")), opik.record_traces_locally() as storage:
+        result = complete_sync(
+            SUMMARY, "hi", instructions=prompt.format(), prompt=prompt
+        )
+        [trace] = storage.trace_trees
+
+    assert (result.prompt_name, result.prompt_version) == ("summary", "v3")
+    assert result.degraded_reasons == ("embedded_prompt",)
+    assert trace.metadata is not None
+    assert trace.metadata["degraded_reason"] == "embedded_prompt"

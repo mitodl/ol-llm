@@ -57,13 +57,15 @@ class TraceFields:
     thread_id: str | None
 
 
-def trace_fields(
+def trace_fields(  # noqa: PLR0913
     use_case: UseCase,
     *,
     environment: str,
     policy: CallPolicy,
     attribution: Attribution = NO_ATTRIBUTION,
     model_tags: Sequence[str] = (),
+    prompt_name: str | None = None,
+    prompt_version: str | None = None,
 ) -> TraceFields:
     """Build the root-trace fields for one run.
 
@@ -76,6 +78,8 @@ def trace_fields(
     :param attribution: the per-call fields.
     :param model_tags: tags for the models' catalog status, from
         ``ol_llm.models.catalog_tags``.
+    :param prompt_name: the managed prompt the run uses, if any.
+    :param prompt_version: that prompt's version, when known.
     :returns: the fields to open the root trace with.
     :rtype: TraceFields
     """
@@ -91,6 +95,10 @@ def trace_fields(
         metadata["user_id"] = attribution.user_id
     if attribution.run_id is not None:
         metadata["run_id"] = attribution.run_id
+    if prompt_name is not None:
+        metadata["prompt_name"] = prompt_name
+    if prompt_version is not None:
+        metadata["prompt_version"] = prompt_version
     return TraceFields(
         project_name=use_case.app,
         environment=environment,

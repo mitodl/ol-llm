@@ -70,6 +70,7 @@ from ol_llm.models import (
     usage_limits,
 )
 from ol_llm.policy import UseCase, resolve_policy
+from ol_llm.prompts import ManagedPrompt, attach_prompt
 from ol_llm.settings import get_settings
 from ol_llm.tracing import enabled, include_content
 
@@ -137,6 +138,7 @@ class _Run(Generic[OutputT]):
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None
     fields: TraceFields
     traced: bool
+    prompt: ManagedPrompt[Any] | None = None
 
     def track(self, func: Callable[..., _T]) -> Callable[..., _T]:
         """Wrap ``func`` in the run's root trace, unless tracing is off."""
@@ -175,6 +177,8 @@ class _Run(Generic[OutputT]):
                 tags=list(self.fields.tags),
                 thread_id=None if trace.thread_id else self.attribution.thread_id,
             )
+            if self.prompt is not None:
+                attach_prompt(self.prompt)
         return {
             "usage_limits": usage_limits(self.use_case),
             "model_settings": attribution_model_settings(self.attribution),
@@ -198,6 +202,8 @@ class _Run(Generic[OutputT]):
         reasons: list[DegradedReason] = []
         if model != self.use_case.model:
             reasons.append("fallback_model")
+        if self.prompt is not None:
+            reasons.extend(self.prompt.degraded_reasons)
         output = result.output
         if self.postprocess is not None:
             processed = self.postprocess(output)
@@ -217,8 +223,8 @@ class _Run(Generic[OutputT]):
             usage=result.usage,
             degraded=bool(degraded_reasons),
             degraded_reasons=degraded_reasons,
-            prompt_name=None,
-            prompt_version=None,
+            prompt_name=self.prompt.name if self.prompt else None,
+            prompt_version=self.prompt.version if self.prompt else None,
             new_messages=new_messages,
         )
 
@@ -358,6 +364,7 @@ def _start(
     agent: Agent[Any, OutputT],
     attribution: Attribution,
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None,
+    prompt: ManagedPrompt[Any] | None = None,
 ) -> _Run[OutputT]:
     if not isinstance(agent.model, Model):
         msg = f"{agent!r} has no model from ol_llm.build_model"
@@ -369,8 +376,12 @@ def _start(
         policy=resolve_policy(use_case),
         attribution=attribution,
         model_tags=catalog_tags(agent.model),
+        prompt_name=prompt.name if prompt else None,
+        prompt_version=prompt.version if prompt else None,
     )
-    return _Run(use_case, attribution, postprocess, fields, traced=enabled())
+    return _Run(
+        use_case, attribution, postprocess, fields, traced=enabled(), prompt=prompt
+    )
 
 
 async def run(  # noqa: PLR0913
@@ -381,6 +392,7 @@ async def run(  # noqa: PLR0913
     attribution: Attribution = NO_ATTRIBUTION,
     message_history: Sequence[ModelMessage] | None = None,
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None = None,
+    prompt: ManagedPrompt[Any] | None = None,
 ) -> LLMResult[OutputT]:
     """Run an agent from ``build_agent`` under a traced root.
 
@@ -392,13 +404,17 @@ async def run(  # noqa: PLR0913
     :param postprocess: called on the validated output inside the trace; returns
         the output to use and any degraded reasons. An exception it raises reaches
         the caller unchanged.
+    :param prompt: the managed prompt the agent's instructions came from, from
+        ``get_prompt``. The run links its version to the trace and puts its name
+        and version on the result; an embedded default used because Opik was
+        unreachable marks the result and trace ``embedded_prompt``.
     :returns: the result.
     :rtype: LLMResult
     :raises LLMError: on a model failure, invalid output, a content filter, or an
         exceeded usage limit.
     :raises TypeError: if the agent's model did not come from ``build_model``.
     """
-    state = _start(agent, attribution, postprocess)
+    state = _start(agent, attribution, postprocess, prompt)
     results: list[LLMResult[OutputT]] = []
 
     async def traced(user_prompt: str | None) -> OutputT:
@@ -427,6 +443,7 @@ def run_sync(  # noqa: PLR0913
     attribution: Attribution = NO_ATTRIBUTION,
     message_history: Sequence[ModelMessage] | None = None,
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None = None,
+    prompt: ManagedPrompt[Any] | None = None,
 ) -> LLMResult[OutputT]:
     """Run an agent synchronously, for Celery tasks and Dagster assets.
 
@@ -437,7 +454,7 @@ def run_sync(  # noqa: PLR0913
     :returns: the result.
     :rtype: LLMResult
     """
-    state = _start(agent, attribution, postprocess)
+    state = _start(agent, attribution, postprocess, prompt)
     results: list[LLMResult[OutputT]] = []
 
     def traced(user_prompt: str | None) -> OutputT:
@@ -467,6 +484,7 @@ async def run_stream(  # noqa: PLR0913
     attribution: Attribution = NO_ATTRIBUTION,
     message_history: Sequence[ModelMessage] | None = None,
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None = None,
+    prompt: ManagedPrompt[Any] | None = None,
 ) -> AsyncGenerator[LLMStream[OutputT]]:
     """Stream a run of an agent from ``build_agent`` under a traced root.
 
@@ -485,7 +503,7 @@ async def run_stream(  # noqa: PLR0913
         exceeded usage limit.
     :raises TypeError: if the agent's model did not come from ``build_model``.
     """
-    state = _start(agent, attribution, postprocess)
+    state = _start(agent, attribution, postprocess, prompt)
     with state.trace_scope(user_prompt) as outcome, recording_answers() as answers:
         arguments = state.agent_arguments()
         # What the caller's block or postprocess raised. LLMStream already
@@ -538,6 +556,7 @@ async def complete(
     instructions: str | None = None,
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[str], PostProcessed[str]] | None = None,
+    prompt: ManagedPrompt[Any] | None = None,
 ) -> LLMResult[str]: ...
 @overload
 async def complete(
@@ -548,6 +567,7 @@ async def complete(
     instructions: str | None = None,
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None = None,
+    prompt: ManagedPrompt[Any] | None = None,
 ) -> LLMResult[OutputT]: ...
 async def complete(  # noqa: PLR0913
     use_case: UseCase,
@@ -557,6 +577,7 @@ async def complete(  # noqa: PLR0913
     instructions: str | None = None,
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[Any], PostProcessed[Any]] | None = None,
+    prompt: ManagedPrompt[Any] | None = None,
 ) -> LLMResult[Any]:
     """Make one model call for a use case, with no agent to build.
 
@@ -572,6 +593,7 @@ async def complete(  # noqa: PLR0913
     :param instructions: the instructions.
     :param attribution: the per-call attribution fields.
     :param postprocess: as for ``run``.
+    :param prompt: the managed prompt ``instructions`` came from, as for ``run``.
     :returns: the result.
     :rtype: LLMResult
     :raises LLMError: on a model failure, invalid output, a content filter, or an
@@ -588,6 +610,7 @@ async def complete(  # noqa: PLR0913
         attribution=attribution,
         message_history=history,
         postprocess=postprocess,
+        prompt=prompt,
     )
 
 
@@ -599,6 +622,7 @@ def complete_sync(
     instructions: str | None = None,
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[str], PostProcessed[str]] | None = None,
+    prompt: ManagedPrompt[Any] | None = None,
 ) -> LLMResult[str]: ...
 @overload
 def complete_sync(
@@ -609,6 +633,7 @@ def complete_sync(
     instructions: str | None = None,
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None = None,
+    prompt: ManagedPrompt[Any] | None = None,
 ) -> LLMResult[OutputT]: ...
 def complete_sync(  # noqa: PLR0913
     use_case: UseCase,
@@ -618,6 +643,7 @@ def complete_sync(  # noqa: PLR0913
     instructions: str | None = None,
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[Any], PostProcessed[Any]] | None = None,
+    prompt: ManagedPrompt[Any] | None = None,
 ) -> LLMResult[Any]:
     """Make one model call synchronously, for Celery tasks and Dagster assets.
 
@@ -636,4 +662,5 @@ def complete_sync(  # noqa: PLR0913
         attribution=attribution,
         message_history=history,
         postprocess=postprocess,
+        prompt=prompt,
     )

@@ -12,6 +12,8 @@ What it proves, in an environment shaped like a consumer's runtime image:
   exporter fetches a new token after a 401;
 - the spans are filed under the app's project, or under the caller's project for
   a run inside the caller's own @opik.track, where Opik files that run's trace;
+- ol_llm.get_prompt fetches a prompt by label through the SDK, and the run links
+  its version to the root trace;
 - importing ol_llm first leaves no Sentry client running.
 
 Opik and Keycloak are one fake server in this process, which records what it is
@@ -33,6 +35,17 @@ APP = "ol-llm-smoke"
 CALLER = "ol-llm-smoke-caller"
 OTLP_PATH = "/api/v1/private/otel/v1/traces"
 TOKEN_PATH = "/token"  # noqa: S105
+PROMPT_PATH = "/api/v1/private/prompts/versions/retrieve"
+PROMPT_VERSION = {
+    "id": "00000000-0000-7000-8000-000000000002",
+    "prompt_id": "00000000-0000-7000-8000-000000000001",
+    "commit": "00000002",
+    "version_number": "v2",
+    "template": "Reply {{word}}.",
+    "type": "mustache",
+    "template_structure": "text",
+    "environments": ["production"],
+}
 
 
 @dataclass
@@ -80,6 +93,9 @@ class FakeOpik(BaseHTTPRequestHandler):
         if self.path == OTLP_PATH and not cls.otlp_refused:
             cls.otlp_refused = True
             self._reply(401, None)
+            return
+        if self.path == PROMPT_PATH:
+            self._reply(200, PROMPT_VERSION)
             return
         self._reply(204 if self.command != "GET" else 200, None)
 
@@ -162,13 +178,22 @@ def check() -> list[str]:  # noqa: C901
     ol_llm.configure_tracing()
     # The test model stands in for the provider; the policy wrapper, the agent's
     # capabilities, and the import graph are the library's own.
+    prompt = ol_llm.get_prompt(
+        "smoke",
+        project_name=APP,
+        default=ol_llm.TextTemplate(template="Reply {{word}}."),
+        environment="production",
+    )
     with override_models(TestModel(custom_output_text="pong")):
-        agent = ol_llm.build_agent(SMOKE)
+        agent = ol_llm.build_agent(SMOKE, instructions=prompt.format(word="pong"))
         stream_agent = ol_llm.build_agent(SMOKE_STREAM)
         completed = ol_llm.complete_sync(SMOKE_COMPLETE, "ping")
     streamed = asyncio.run(stream(stream_agent))
     result = ol_llm.run_sync(
-        agent, "ping", attribution=ol_llm.Attribution(thread_id="smoke-thread")
+        agent,
+        "ping",
+        attribution=ol_llm.Attribution(thread_id="smoke-thread"),
+        prompt=prompt,
     )
 
     @opik.track(name="caller", project_name=CALLER)
@@ -198,6 +223,11 @@ def check() -> list[str]:  # noqa: C901
         failures.append(f"root trace fields were {got}")
     if "use_case:smoke" not in trace.get("tags", []):
         failures.append(f"root trace tags were {trace.get('tags')}")
+    if (prompt.source, result.prompt_version) != ("opik", "v2"):
+        failures.append(f"the prompt was {prompt}, the result named {result}")
+    linked = (trace.get("metadata") or {}).get("opik_prompts", [])
+    if [p.get("version", {}).get("version_number") for p in linked] != ["v2"]:
+        failures.append(f"root trace linked prompts {linked}")
 
     otlp = [r for r in FakeOpik.received if r.path == OTLP_PATH]
     if [r.headers.get("authorization") for r in otlp[:2]] != [
