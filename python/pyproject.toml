@@ -31,6 +31,9 @@ dependencies = [
     "opik==2.2.87",
     # Validates the model catalog. opik requires it already.
     "pydantic>=2,<3",
+    # The OTLP exporter takes a requests session, which is where the refreshing
+    # Keycloak auth for span export attaches.
+    "requests>=2.32",
 ]
 
 [project.optional-dependencies]

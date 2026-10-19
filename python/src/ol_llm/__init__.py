@@ -5,8 +5,9 @@ that replaces whatever Sentry client the host application already configured.
 Setting OPIK_SENTRY_ENABLE before anything imports opik stops it. This module
 does that first, so every consumer gets it by importing ol_llm before opik.
 
-The model factory and agent builder need the ``pydantic-ai`` extra. They are
-imported on first use, so the base package imports without it.
+The model factory, the agent builder, and the run entry points need the
+``pydantic-ai`` extra. They are imported on first use, so the base package imports
+without it.
 """
 
 import os
@@ -40,14 +41,28 @@ from ol_llm.settings import (
     configure,
     get_settings,
 )
+from ol_llm.tracing import (
+    KeycloakClient,
+    TracingConfig,
+    configure_tracing,
+)
 
 if TYPE_CHECKING:
     from ol_llm.models import build_agent, build_model, usage_limits
+    from ol_llm.runs import LLMResult, PostProcessed, run, run_sync
 
 # The version lives only in python/pyproject.toml, which is what a release bumps.
 __version__ = version("ol-llm")
 
-_PYDANTIC_AI_EXPORTS = frozenset({"build_agent", "build_model", "usage_limits"})
+_PYDANTIC_AI_EXPORTS = {
+    "build_agent": "ol_llm.models",
+    "build_model": "ol_llm.models",
+    "usage_limits": "ol_llm.models",
+    "LLMResult": "ol_llm.runs",
+    "PostProcessed": "ol_llm.runs",
+    "run": "ol_llm.runs",
+    "run_sync": "ol_llm.runs",
+}
 # What the pydantic-ai extra installs that ol_llm.models imports directly.
 _PYDANTIC_AI_MODULES = frozenset({"pydantic_ai", "httpx2"})
 
@@ -57,25 +72,32 @@ __all__ = [
     "CatalogEntry",
     "DegradedReason",
     "GatewayRoute",
+    "KeycloakClient",
     "LLMBudgetExceeded",
     "LLMContentFiltered",
     "LLMError",
     "LLMInvalidOutput",
     "LLMRateLimited",
     "LLMRejected",
+    "LLMResult",
     "LLMUnavailable",
+    "PostProcessed",
     "Profile",
     "Settings",
     "TraceFields",
+    "TracingConfig",
     "UseCase",
     "build_agent",
     "build_model",
     "check_model_ids",
     "configure",
+    "configure_tracing",
     "degraded_metadata",
     "get_settings",
     "load_catalog",
     "resolve_policy",
+    "run",
+    "run_sync",
     "trace_fields",
     "usage_limits",
 ]
@@ -83,11 +105,11 @@ __all__ = [
 
 def __getattr__(name: str) -> Any:  # noqa: ANN401
     """Import the PydanticAI-backed API on first use."""
-    if name not in _PYDANTIC_AI_EXPORTS:
+    if (module_name := _PYDANTIC_AI_EXPORTS.get(name)) is None:
         msg = f"module {__name__!r} has no attribute {name!r}"
         raise AttributeError(msg)
     try:
-        module = import_module("ol_llm.models")
+        module = import_module(module_name)
     except ModuleNotFoundError as exc:
         # Only a missing extra gets the hint; any other import failure is a bug
         # and should surface as itself.

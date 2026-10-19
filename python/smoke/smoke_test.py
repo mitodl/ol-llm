@@ -5,83 +5,223 @@ overrides drop. Exits non-zero on any failure.
 
 What it proves, in an environment shaped like a consumer's runtime image:
 - ol_llm and opik import with litellm, openai, pytest, and tree-sitter absent;
-- an @opik.track root with an instrumented agent from ol_llm.build_agent inside it
-  produces OTel spans that OpikSpanProcessor attaches to the tracked trace;
+- ol_llm.run_sync over an agent from ol_llm.build_agent sends the SDK root trace
+  and the OTLP model spans to Opik, and the spans carry the root trace's id;
+- both halves authenticate with a Keycloak client-credentials token, and the span
+  exporter fetches a new token after a 401;
+- the spans are filed under the app's project, or under the caller's project for
+  a run inside the caller's own @opik.track, where Opik files that run's trace;
 - importing ol_llm first leaves no Sentry client running.
 
-No Opik server is needed. The SDK is pointed at a closed port, so its background
-sender fails quietly; the assertions read the spans from an in-memory exporter.
+Opik and Keycloak are one fake server in this process, which records what it is
+sent. The first OTLP request gets a 401, as an expired token would.
 """
 
+import gzip
+import json
 import os
 import sys
-
-os.environ["OPIK_URL_OVERRIDE"] = "http://127.0.0.1:9/api"
-os.environ["OPIK_WORKSPACE"] = "default"
-
-# ol_llm before opik, so OPIK_SENTRY_ENABLE is set before opik reads it.
-import ol_llm
-import opik
-import sentry_sdk
-from ol_llm.models import build_agent, override_models
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
-    InMemorySpanExporter,
-)
-from opik.integrations.otel import OpikSpanProcessor
-from pydantic_ai.capabilities import Instrumentation
-from pydantic_ai.models.instrumented import InstrumentationSettings
-from pydantic_ai.models.test import TestModel
+import threading
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 
 DROPPED = ("litellm", "openai", "pytest", "tree_sitter", "click")
-OPIK_TRACE_ID = "opik.trace_id"
-SMOKE = ol_llm.UseCase(
-    app="ol-llm-smoke", name="smoke", profile="request", model="openai:gpt-4o-mini"
+APP = "ol-llm-smoke"
+CALLER = "ol-llm-smoke-caller"
+OTLP_PATH = "/api/v1/private/otel/v1/traces"
+TOKEN_PATH = "/token"  # noqa: S105
+
+
+@dataclass
+class Request:
+    """One request the fake server received."""
+
+    path: str
+    headers: dict[str, str]
+    body: bytes
+
+
+class FakeOpik(BaseHTTPRequestHandler):
+    """Opik's API and Keycloak's token endpoint, recording every request."""
+
+    received: list[Request] = []  # noqa: RUF012
+    tokens_issued = 0
+    otlp_refused = False
+
+    def do_GET(self) -> None:
+        """Record and accept."""
+        self._handle()
+
+    def do_POST(self) -> None:
+        """Record and accept, except the first OTLP export."""
+        self._handle()
+
+    def do_PATCH(self) -> None:
+        """Record and accept."""
+        self._handle()
+
+    def do_PUT(self) -> None:
+        """Record and accept."""
+        self._handle()
+
+    def _handle(self) -> None:
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        cls = type(self)
+        if self.path == TOKEN_PATH:
+            cls.tokens_issued += 1
+            self._reply(200, {"access_token": f"token-{cls.tokens_issued}"})
+            return
+        # HTTP header names are case-insensitive; the OTLP client lowercases them.
+        headers = {name.lower(): value for name, value in self.headers.items()}
+        cls.received.append(Request(self.path, headers, body))
+        if self.path == OTLP_PATH and not cls.otlp_refused:
+            cls.otlp_refused = True
+            self._reply(401, None)
+            return
+        self._reply(204 if self.command != "GET" else 200, None)
+
+    def _reply(self, status: int, payload: dict[str, Any] | None) -> None:
+        data = json.dumps(payload).encode() if payload is not None else b""
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        """Keep the server quiet."""
+
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOpik)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+base = f"http://127.0.0.1:{server.server_address[1]}"
+os.environ.update(
+    {
+        "OL_LLM_ENVIRONMENT": "ci",
+        "OPIK_URL_OVERRIDE": f"{base}/api",
+        "OPIK_WORKSPACE": "default",
+        "OPIK_KEYCLOAK_TOKEN_URL": f"{base}{TOKEN_PATH}",
+        "OPIK_KEYCLOAK_CLIENT_ID": "ol-llm-smoke",
+        "OPIK_KEYCLOAK_CLIENT_SECRET": "smoke",
+    }
 )
+
+# ol_llm before opik, so OPIK_SENTRY_ENABLE is set before opik reads it.
+import ol_llm  # noqa: E402
+import opik  # noqa: E402
+import sentry_sdk  # noqa: E402
+from ol_llm.models import override_models  # noqa: E402
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (  # noqa: E402
+    ExportTraceServiceRequest,
+)
+from pydantic_ai.models.test import TestModel  # noqa: E402
+
+SMOKE = ol_llm.UseCase(
+    app=APP, name="smoke", profile="request", model="openai:gpt-4o-mini"
+)
+
+
+def sdk_traces() -> list[dict[str, Any]]:
+    """Return the traces the SDK sent, from every batch request."""
+    traces = []
+    for request in FakeOpik.received:
+        if not request.path.endswith("/traces/batch"):
+            continue
+        body = request.body
+        if body[:2] == b"\x1f\x8b":
+            body = gzip.decompress(body)
+        traces.extend(json.loads(body)["traces"])
+    return traces
+
+
+def check() -> list[str]:  # noqa: C901
+    """Run a traced call and return what is wrong with what Opik received."""
+    ol_llm.configure_tracing()
+    # The test model stands in for the provider; the policy wrapper, the agent's
+    # capabilities, and the import graph are the library's own.
+    with override_models(TestModel(custom_output_text="pong")):
+        agent = ol_llm.build_agent(SMOKE)
+    result = ol_llm.run_sync(
+        agent, "ping", attribution=ol_llm.Attribution(thread_id="smoke-thread")
+    )
+
+    @opik.track(name="caller", project_name=CALLER)
+    def caller() -> str:
+        return ol_llm.run_sync(agent, "ping").output
+
+    caller()
+    if not ol_llm.tracing.flush():
+        return ["the span exporter did not finish"]
+
+    failures = []
+    if result.output != "pong":
+        failures.append(f"output was {result.output!r}")
+    # The SDK sends a trace when it starts and again, complete, when it ends.
+    ended = [t for t in sdk_traces() if t.get("name") == "smoke" and "end_time" in t]
+    if len(ended) != 1:
+        return [*failures, f"expected one ended root trace named smoke, got {ended}"]
+    [trace] = ended
+    callers = [t for t in sdk_traces() if t.get("name") == "caller" and "end_time" in t]
+    if len(callers) != 1:
+        return [*failures, f"expected one ended caller trace, got {callers}"]
+    expected = {
+        "project_name": APP,
+        "environment": "ci",
+        "thread_id": "smoke-thread",
+    }
+    got = {k: trace.get(k) for k in expected}
+    if got != expected:
+        failures.append(f"root trace fields were {got}")
+    if "use_case:smoke" not in trace.get("tags", []):
+        failures.append(f"root trace tags were {trace.get('tags')}")
+
+    otlp = [r for r in FakeOpik.received if r.path == OTLP_PATH]
+    if [r.headers.get("authorization") for r in otlp[:2]] != [
+        "Bearer token-1",
+        "Bearer token-2",
+    ]:
+        failures.append("the span exporter did not retry its 401 with a new token")
+    # The first request was refused and sent again, so it is left out.
+    trace_ids: dict[str, set[str]] = {}
+    for request in otlp[1:]:
+        project = request.headers.get("projectname", "")
+        ids = {span.get("opik.trace_id", "") for span in _spans(request)}
+        trace_ids.setdefault(project, set()).update(ids)
+    expected_ids = {APP: {trace["id"]}, CALLER: {callers[0]["id"]}}
+    if trace_ids != expected_ids:
+        failures.append(
+            f"model spans by project and trace were {trace_ids}, not {expected_ids}"
+        )
+    unauthenticated = [
+        r.path
+        for r in FakeOpik.received
+        if not r.headers.get("authorization", "").startswith("Bearer token-")
+    ]
+    if unauthenticated:
+        failures.append(f"requests without a token: {unauthenticated}")
+    return failures
+
+
+def _spans(request: Request) -> list[dict[str, str]]:
+    export = ExportTraceServiceRequest.FromString(request.body)
+    return [
+        {a.key: a.value.string_value for a in span.attributes}
+        for resource in export.resource_spans
+        for scope in resource.scope_spans
+        for span in scope.spans
+    ]
 
 
 def main() -> int:
     """Run the checks and return a process exit status."""
-    exporter = InMemorySpanExporter()
-    provider = TracerProvider()
-    provider.add_span_processor(OpikSpanProcessor())
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-
-    ol_llm.configure(ol_llm.Settings(environment="ci"))
-    # The test model stands in for the provider; the policy wrapper, the agent's
-    # capabilities, and the import graph are the library's own.
-    with override_models(TestModel()):
-        agent = build_agent(
-            SMOKE,
-            capabilities=[
-                Instrumentation(
-                    settings=InstrumentationSettings(tracer_provider=provider)
-                )
-            ],
-        )
-
-    @opik.track(name="smoke", project_name="ol-llm-smoke")
-    def run() -> str:
-        return agent.run_sync("ping").output
-
-    output = run()
-    spans = exporter.get_finished_spans()
-    attached = [s for s in spans if (s.attributes or {}).get(OPIK_TRACE_ID)]
-    imported = [name for name in DROPPED if name in sys.modules]
-    failures = []
-    if not spans:
-        failures.append("the agent emitted no OTel spans")
-    if len(attached) != len(spans):
-        failures.append(
-            f"{len(spans) - len(attached)} of {len(spans)} spans lack {OPIK_TRACE_ID}"
-        )
-    if imported:
+    failures = check()
+    if imported := [name for name in DROPPED if name in sys.modules]:
         failures.append(f"dropped packages were imported: {imported}")
     if sentry_sdk.get_client().dsn is not None:
         failures.append("a Sentry client is running after importing opik")
 
-    print(f"ol-llm {ol_llm.__version__}: output={output!r} spans={len(spans)}")
+    print(f"ol-llm {ol_llm.__version__}: {len(FakeOpik.received)} requests to Opik")
     for failure in failures:
         print(f"FAIL: {failure}")
     return 1 if failures else 0
