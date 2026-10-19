@@ -12,22 +12,39 @@ attribution metadata goes on the run's span; the tags, ``thread_id``, and the
 degraded marking go on the caller's trace, so filters and scoring rules scoped by
 tag still find it. With tracing off, runs open no trace.
 
+``run_stream`` holds the same root trace open while the caller consumes the stream
+inside its own ``async with``. ``opik.track`` cannot do that: on an async generator
+it makes the trace current only during each ``__anext__``. So the entry and exit
+halves of the SDK's decorator run around the caller's block instead, which reaches
+into opik internals that the exact opik pin and the smoke test keep honest.
+
 ``complete`` and ``complete_sync`` are the single-call path: a tool-less agent over
 the use case's model, run by ``run``, so a call site that outgrows them builds the
 same agent with ``build_agent`` and keeps everything else.
 """
 
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Generator,
+    Sequence,
+)
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar, cast, overload
 
 import opik
 from opik import opik_context
 from opik.api_objects.trace import TraceData
+from opik.decorator import error_info_collector
+from opik.decorator.arguments_helpers import TrackOptions
+from opik.decorator.tracker import OpikTrackDecorator
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
 from pydantic_ai.output import OutputSpec
+from pydantic_ai.result import StreamedRunResult
 from pydantic_ai.run import AgentRunResult
 from pydantic_ai.usage import RunUsage
 
@@ -46,6 +63,7 @@ from ol_llm.models import (
     attribution_model_settings,
     call_site,
     catalog_tags,
+    classify_failure,
     classify_run_failure,
     recording_answers,
     shared_model,
@@ -58,6 +76,20 @@ from ol_llm.tracing import enabled, include_content
 OutputT = TypeVar("OutputT")
 DepsT = TypeVar("DepsT")
 _T = TypeVar("_T")
+
+# Drives run_stream's root trace with the halves of opik.track's own wrapper.
+_TRACKER = OpikTrackDecorator()
+
+
+def _root_input(user_prompt: str | None) -> None:
+    """Stand in for a traced function, so a stream's trace input matches ``run``'s."""
+
+
+@dataclass
+class _TraceOutput:
+    """What a trace opened by ``_Run.trace_scope`` records as its output."""
+
+    value: Any = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -190,6 +222,137 @@ class _Run(Generic[OutputT]):
             new_messages=new_messages,
         )
 
+    @contextmanager
+    def trace_scope(self, user_prompt: str | None) -> Generator[_TraceOutput]:
+        """Hold the run's root trace current for the block, unless tracing is off.
+
+        The trace opened here matches the one ``track`` opens. It records the
+        block's exception, or else the output set on what this yields.
+        """
+        outcome = _TraceOutput()
+        if not (self.traced and opik.is_tracing_active()):
+            yield outcome
+            return
+        content = include_content()
+        options = TrackOptions(
+            name=self.use_case.name,
+            type="general",
+            tags=list(self.fields.tags),
+            metadata=dict(self.fields.metadata),
+            capture_input=content,
+            ignore_arguments=None,
+            capture_output=content,
+            generations_aggregator=None,
+            flush=False,
+            project_name=self.fields.project_name,
+            create_duplicate_root_span=True,
+            source=None,
+            environment=self.fields.environment,
+        )
+        # The two halves opik.track's wrapper runs around a call; the exact opik
+        # pin keeps these private methods stable.
+        span_started = _TRACKER._before_call(  # noqa: SLF001
+            func=_root_input, track_options=options, args=(user_prompt,), kwargs={}
+        )
+        try:
+            yield outcome
+        except BaseException as exc:
+            # A cancelled block closes the trace too, so the caller's context is
+            # left as it was.
+            _TRACKER._after_call(  # noqa: SLF001
+                output=None,
+                error_info=error_info_collector.collect(exc)
+                if isinstance(exc, Exception)
+                else None,
+                capture_output=content,
+                should_process_span_data=span_started,
+            )
+            raise
+        _TRACKER._after_call(  # noqa: SLF001
+            output=outcome.value,
+            error_info=None,
+            capture_output=content,
+            should_process_span_data=span_started,
+        )
+
+    def stream_replacement(
+        self, exc: Exception, answers: Sequence[str]
+    ) -> LLMError | None:
+        """Return the library error for a failure while a stream is read, if any.
+
+        Unlike ``replacement`` it also classifies a provider failure, which reaches
+        the reader of an open stream before ``PolicyModel`` sees it.
+        """
+        model = answers[-1] if answers else self.use_case.model
+        name = self.use_case.name
+        if (error := classify_failure(exc, use_case=name, model=model)) is not None:
+            return error
+        return self.replacement(exc, answers)
+
+
+@dataclass
+class LLMStream(Generic[OutputT]):
+    """A streamed run, yielded by ``run_stream``.
+
+    Read it with ``stream_text`` or ``stream_output``, then call ``result``. A model
+    failure while reading raises an ``LLMError``.
+    """
+
+    _stream: StreamedRunResult[Any, OutputT]
+    _run: _Run[OutputT]
+    _answers: list[str]
+    _result: LLMResult[OutputT] | None = field(default=None, init=False)
+
+    @contextmanager
+    def _library_errors(self) -> Generator[None]:
+        try:
+            yield
+        except Exception as exc:
+            if (error := self._run.stream_replacement(exc, self._answers)) is None:
+                raise
+            raise error from exc
+
+    async def stream_text(self, *, delta: bool = True) -> AsyncIterator[str]:
+        """Stream the response text.
+
+        :param delta: yield each new piece of text; false yields the whole text so
+            far each time.
+        :returns: the text.
+        :rtype: AsyncIterator[str]
+        :raises LLMError: on a model failure after the stream opened.
+        """
+        with self._library_errors():
+            async for text in self._stream.stream_text(delta=delta):
+                yield text
+
+    async def stream_output(self) -> AsyncIterator[OutputT]:
+        """Stream the output, validated in partial mode as it arrives.
+
+        :returns: each partial output, then the complete one.
+        :rtype: AsyncIterator
+        :raises LLMError: on a model failure after the stream opened.
+        """
+        with self._library_errors():
+            async for output in self._stream.stream_output():
+                yield output
+
+    async def result(self) -> LLMResult[OutputT]:
+        """Return the result, reading what is left of the stream first.
+
+        Call it inside the ``async with``: it runs ``postprocess`` and marks the
+        trace, which closes when the block ends.
+
+        :returns: the result, with the same markers ``run`` sets.
+        :rtype: LLMResult
+        :raises LLMError: on a model failure or invalid output.
+        """
+        if self._result is None:
+            if not self._stream.is_complete:
+                with self._library_errors():
+                    await self._stream.get_output()
+            self._result = self._run.finish(self._stream.result)
+        return self._result
+
 
 def _start(
     agent: Agent[Any, OutputT],
@@ -293,6 +456,59 @@ def run_sync(  # noqa: PLR0913
 
     state.track(traced)(user_prompt)
     return results[0]
+
+
+@asynccontextmanager
+async def run_stream(  # noqa: PLR0913
+    agent: Agent[DepsT, OutputT],
+    user_prompt: str | None = None,
+    *,
+    deps: DepsT = None,  # type: ignore[assignment]
+    attribution: Attribution = NO_ATTRIBUTION,
+    message_history: Sequence[ModelMessage] | None = None,
+    postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None = None,
+) -> AsyncGenerator[LLMStream[OutputT]]:
+    """Stream a run of an agent from ``build_agent`` under a traced root.
+
+    For the request profile. Takes the same arguments as ``run``. The root trace
+    stays current until the ``async with`` block ends, so the model spans land in
+    it. A failure before the first chunk is retried and falls back as in ``run``
+    and raises on entry; a failure after it reaches the caller. When the block
+    ends with the stream read, the result is built if ``result`` was not called.
+
+    :returns: the stream.
+    :rtype: AbstractAsyncContextManager[LLMStream]
+    :raises LLMError: on a model failure, invalid output, a content filter, or an
+        exceeded usage limit.
+    :raises TypeError: if the agent's model did not come from ``build_model``.
+    """
+    state = _start(agent, attribution, postprocess)
+    with state.trace_scope(user_prompt) as outcome, recording_answers() as answers:
+        arguments = state.agent_arguments()
+        # What the caller's block raised. LLMStream already converts failures
+        # reading the stream; anything else is the caller's and passes through
+        # unchanged, including past PolicyModel, which would classify a provider
+        # error the caller's own code raised.
+        raised_in_block: Exception | None = None
+        try:
+            async with agent.run_stream(
+                user_prompt, deps=deps, message_history=message_history, **arguments
+            ) as streamed:
+                stream = LLMStream(streamed, state, answers)
+                try:
+                    yield stream
+                except Exception as exc:
+                    raised_in_block = exc
+                    raise
+                if streamed.is_complete:
+                    outcome.value = (await stream.result()).output
+        except Exception as exc:
+            if raised_in_block is None:
+                if (error := state.replacement(exc, answers)) is None:
+                    raise
+                raise error from exc
+        if raised_in_block is not None:
+            raise raised_in_block
 
 
 def _completion(

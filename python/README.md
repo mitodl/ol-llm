@@ -121,7 +121,24 @@ grader = ol_llm.build_agent(
 result = ol_llm.run_sync(grader, submission, attribution=attribution)
 ```
 
-`run_stream` is not released yet.
+Request-time call sites that show the answer as it arrives use `ol_llm.run_stream`, an async
+context manager that takes the same arguments as `run`:
+
+```python
+async with ol_llm.run_stream(tutor, message, attribution=attribution) as stream:
+    async for text in stream.stream_text():
+        await send(text)
+    result = await stream.result()
+```
+
+`stream_text()` yields each new piece of text (`delta=False` yields the whole text so far), and
+`stream_output()` yields structured output as it validates. `result()` returns the same
+`LLMResult` as `run`, and runs `postprocess`; call it inside the block, since the trace closes
+when the block ends. A block that reads the whole stream without calling `result()` still marks
+the trace. The run's trace stays current for the whole block, so the model spans land in it. A
+failure before the first chunk is retried and falls back as in `run` and raises on entry; a
+failure after it raises `LLMUnavailable` (or another `LLMError`) where the stream is read, and
+is not retried.
 
 ### Tracing
 

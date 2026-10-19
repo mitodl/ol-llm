@@ -88,9 +88,10 @@ count toward the circuit's threshold. The other errors fail only their row.
 
 Implemented: use cases, policy resolution, the error classes, classification of model
 requests, the retry wrapper, fallback composition, the content-filter and output-retry
-settings on agents, and the entry points `run`, `run_sync`, `complete`, and `complete_sync`.
+settings on agents, and the entry points `run`, `run_sync`, `run_stream`, `complete`, and
+`complete_sync`.
 
-Not yet: `run_stream` and the batch helpers. A bare `agent.run` outside the entry points raises
+Not yet: the batch helpers. A bare `agent.run` outside the entry points raises
 PydanticAI's own `ContentFilterError`, `UnexpectedModelBehavior`, and `UsageLimitExceeded`
 rather than `LLMContentFiltered`, `LLMInvalidOutput`, and `LLMBudgetExceeded`, does not apply
 `usage_limits`, does not pass the user id to the provider, and never sets `degraded`.
