@@ -16,6 +16,9 @@ so the next call gets the managed version.
 
 With tracing off (``OPIK_TRACK_DISABLE=true``) there is no Opik to fetch from, so
 ``get_prompt`` returns the embedded default unmarked: that is local development.
+
+``create_prompt`` and ``promote_prompt`` are for the CI jobs that sync prompts
+and move the ``production`` label from the pointer file (spec §2.3).
 """
 
 import contextvars
@@ -40,6 +43,7 @@ from opik.api_objects.prompt import (
     mask_context,
 )
 from opik.rest_api.core import ApiError
+from opik.rest_api.types import PromptVersionDetail
 
 from ol_llm import tracing
 from ol_llm.attribution import DegradedReason
@@ -292,6 +296,99 @@ def attach_prompt(prompt: ManagedPrompt[Any]) -> None:
         opik_context.attach_prompt_to_current_span(prompt.opik_prompt)
 
 
+def create_prompt(
+    name: str,
+    template: TemplateT,
+    *,
+    project_name: str,
+    change_description: str | None = None,
+) -> ManagedPrompt[TemplateT]:
+    """Make ``template`` the latest version of a prompt, for a CI sync job.
+
+    Idempotent: a new version is created only when the template text or type
+    differs from the latest version's. Metadata is not compared, so a version
+    created in the Opik UI with the same text is not duplicated.
+
+    :param name: the prompt's name.
+    :param template: the template; its class says whether the prompt is text or
+        chat, which cannot change once the prompt exists.
+    :param project_name: the app's Opik project.
+    :param change_description: recorded on a new version.
+    :returns: the latest version, new or existing.
+    :rtype: ManagedPrompt
+    :raises opik.exceptions.PromptTemplateStructureMismatch: if the prompt exists
+        with the other structure.
+    """
+    client = _client()
+    latest = client.get_prompts_client().get_prompt(
+        name=name,
+        project_name=project_name,
+        raise_if_not_template_structure=_structure(template),
+    )
+    if latest is not None:
+        existing = _prompt_from_detail(name, latest, project_name)
+        if _template(existing).template_hash == template.template_hash:
+            return ManagedPrompt(
+                name=name,
+                template=cast("TemplateT", _template(existing)),
+                source="opik",
+                opik_prompt=existing,
+            )
+    created: BasePrompt
+    if isinstance(template, TextTemplate):
+        created = client.create_prompt(
+            name=name,
+            prompt=template.template,
+            type=PromptType(template.type),
+            change_description=change_description,
+            project_name=project_name,
+        )
+    else:
+        created = client.create_chat_prompt(
+            name=name,
+            messages=template._content(),  # noqa: SLF001
+            type=PromptType(template.type),
+            change_description=change_description,
+            project_name=project_name,
+        )
+    return ManagedPrompt(
+        name=name,
+        template=cast("TemplateT", _template(created)),
+        source="opik",
+        opik_prompt=created,
+    )
+
+
+def promote_prompt(
+    name: str, *, version: str, environment: str, project_name: str
+) -> None:
+    """Move an environment label to a version, for the promotion CI job.
+
+    The version keeps the labels it already has; the SDK's
+    ``set_prompt_environments`` replaces a version's whole set, so calling it with
+    only the new label would strip e.g. ``qa`` from a version being promoted to
+    ``production``. Clears this process's cached entries for the prompt.
+
+    :param name: the prompt's name.
+    :param version: the version to label, e.g. ``v7``.
+    :param environment: the label to move, e.g. ``production``.
+    :param project_name: the app's Opik project.
+    :raises opik.exceptions.PromptNotFoundError: if there is no such prompt or
+        version.
+    :raises opik.exceptions.EnvironmentNotFoundError: if the environment is not
+        registered in the workspace (Opik seeds only ``development``, ``staging``,
+        and ``production``).
+    """
+    client = _client()
+    detail = client.get_prompts_client().get_prompt(
+        name=name, version=version, project_name=project_name
+    )
+    current = (detail.environments or []) if detail is not None else []
+    client.set_prompt_environments(
+        name, [*current, environment], version=version, project_name=project_name
+    )
+
+
 @dataclass(frozen=True, kw_only=True)
 class _Lookup:
     name: str
@@ -398,6 +495,17 @@ def _unreachable(exc: Exception) -> bool:
             and exc.status_code >= httpx.codes.INTERNAL_SERVER_ERROR
         )
     return False
+
+
+def _structure(template: TextTemplate | ChatTemplate) -> Literal["text", "chat"]:
+    return "chat" if isinstance(template, ChatTemplate) else "text"
+
+
+def _prompt_from_detail(
+    name: str, detail: PromptVersionDetail, project_name: str
+) -> BasePrompt:
+    cls = opik.ChatPrompt if detail.template_structure == "chat" else opik.Prompt
+    return cls.from_fern_prompt_version(name, detail, project_name=project_name)
 
 
 def _template(prompt: BasePrompt) -> TextTemplate | ChatTemplate:

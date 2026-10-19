@@ -197,6 +197,12 @@ are built on in place of the version. A run that fell back to the embedded defau
 the same key as one that fetched the same text, so an Opik outage does not trigger
 reprocessing.
 
+The CI jobs use `ol_llm.create_prompt(name, template, project_name=...)`, which adds a version
+only when the text or template type changed, and `ol_llm.promote_prompt(name, version="v7",
+environment="production", project_name=...)`, which moves one label and leaves the version's
+other labels in place. Opik seeds only `development`, `staging`, and `production`; create `ci`
+and `qa` once per instance before promoting to them.
+
 ### Tracing
 
 Tracing reads the variables the Opik SDK reads, so the SDK and the span exporter always send

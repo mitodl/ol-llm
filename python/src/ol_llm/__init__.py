@@ -40,7 +40,9 @@ from ol_llm.prompts import (
     ManagedPrompt,
     TemplateType,
     TextTemplate,
+    create_prompt,
     get_prompt,
+    promote_prompt,
 )
 from ol_llm.settings import (
     GatewayRoute,
@@ -119,10 +121,12 @@ __all__ = [
     "complete_sync",
     "configure",
     "configure_tracing",
+    "create_prompt",
     "degraded_metadata",
     "get_prompt",
     "get_settings",
     "load_catalog",
+    "promote_prompt",
     "resolve_policy",
     "run",
     "run_stream",

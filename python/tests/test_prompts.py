@@ -8,7 +8,9 @@ from conftest import PromptLibrary
 from ol_llm import (
     ChatTemplate,
     TextTemplate,
+    create_prompt,
     get_prompt,
+    promote_prompt,
     prompts,
     tracing,
 )
@@ -21,6 +23,7 @@ from ol_llm.tracing import (
 from opik import context_storage
 from opik.api_objects.prompt import mask_context
 from opik.exceptions import (
+    EnvironmentNotFoundError,
     PromptPlaceholdersDontMatchFormatArguments,
     PromptTemplateStructureMismatch,
 )
@@ -341,3 +344,88 @@ def test_the_hash_follows_the_text_not_where_it_came_from(
     assert fetched.source != fallback.source
     assert fetched.template_hash == fallback.template_hash
     assert fetched.template_hash != edited.template_hash
+
+
+def test_create_prompt_adds_a_version_only_on_change(
+    prompt_library: PromptLibrary,
+) -> None:
+    template = TextTemplate(template="Summarize {{text}}.")
+
+    first = create_prompt("summary", template, project_name=PROJECT)
+    again = create_prompt("summary", template, project_name=PROJECT)
+    changed = create_prompt(
+        "summary", TextTemplate(template="Summarize {{text}}!"), project_name=PROJECT
+    )
+    retyped = create_prompt(
+        "summary",
+        TextTemplate(template="Summarize {{text}}!", type="jinja2"),
+        project_name=PROJECT,
+    )
+
+    assert [first.version, again.version, changed.version, retyped.version] == [
+        "v1",
+        "v1",
+        "v2",
+        "v3",
+    ]
+    assert prompt_library.versions("summary") == ["v1", "v2", "v3"]
+
+
+def test_create_prompt_ignores_metadata_set_in_the_ui(
+    prompt_library: PromptLibrary,
+) -> None:
+    prompt_library.add("summary", "Summarize {{text}}.", metadata={"by": "ui"})
+
+    created = create_prompt(
+        "summary", TextTemplate(template="Summarize {{text}}."), project_name=PROJECT
+    )
+
+    assert created.version == "v1"
+    assert prompt_library.versions("summary") == ["v1"]
+
+
+def test_create_prompt_for_a_chat_prompt(prompt_library: PromptLibrary) -> None:
+    template = ChatTemplate(messages=CHAT)
+
+    create_prompt("tutor", template, project_name=PROJECT)
+    created = create_prompt("tutor", template, project_name=PROJECT)
+
+    assert created.template.messages == CHAT
+    assert prompt_library.versions("tutor") == ["v1"]
+
+
+def test_promote_keeps_the_versions_other_labels(
+    prompt_library: PromptLibrary,
+) -> None:
+    prompt_library.environments.add("qa")
+    prompt_library.add("summary", "one", environments=("production",))
+    prompt_library.add("summary", "two", environments=("qa",))
+
+    promote_prompt(
+        "summary", version="v2", environment="production", project_name=PROJECT
+    )
+
+    assert prompt_library.labels("summary") == {"v1": [], "v2": ["qa", "production"]}
+
+
+def test_promote_reaches_the_next_fetch_in_this_process(
+    prompt_library: PromptLibrary,
+) -> None:
+    prompt_library.add("summary", "one {{text}}", environments=("production",))
+    prompt_library.add("summary", "two {{text}}")
+    assert fetch(environment="production").version == "v1"
+
+    promote_prompt(
+        "summary", version="v2", environment="production", project_name=PROJECT
+    )
+
+    assert fetch(environment="production").version == "v2"
+
+
+def test_promote_to_an_unregistered_environment_raises(
+    prompt_library: PromptLibrary,
+) -> None:
+    prompt_library.add("summary", "one")
+
+    with pytest.raises(EnvironmentNotFoundError):
+        promote_prompt("summary", version="v1", environment="ci", project_name=PROJECT)
