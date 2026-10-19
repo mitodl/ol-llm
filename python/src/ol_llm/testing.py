@@ -35,14 +35,14 @@ def policy_model(use_case: UseCase, model: Model) -> PolicyModel:
     :param model: the model standing in for the provider.
     :returns: the wrapped model.
     :rtype: PolicyModel
-    :raises ValueError: if the use case's model is not a chat model in the
-        catalog, or is retired.
+    :raises ValueError: if the catalog lists the use case's model as retired or
+        as an embedding model.
     """
     return PolicyModel(
         model,
         use_case=use_case,
         model_id=use_case.model,
-        catalog_entry=load_catalog().require(use_case.model, kind="chat"),
+        catalog_entry=load_catalog().buildable(use_case.model, kind="chat"),
         policy=resolve_policy(use_case),
     )
 

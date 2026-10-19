@@ -51,11 +51,13 @@ class UseCase:
         ``batch``, and goes in a request header.
     :param profile: ``request`` for a user waiting on the answer, ``batch`` for
         pipelines and background jobs.
-    :param model: the model id in PydanticAI form, ``provider:model``. Must be in
-        the model catalog (``ol_llm.catalog``) for ``build_model`` to build it.
+    :param model: the model id in PydanticAI form, ``provider:model``. The model
+        catalog (``ol_llm.catalog``) need not list it, but must not list it as
+        retired.
     :param fallback_models: model ids tried in order once the primary has spent its
         retries on a rate limit or an outage. Empty means no fallback, and must be
-        empty when the primary's route falls back on its own.
+        empty when the primary's route falls back on its own. That is checked only
+        for a primary the catalog lists, since the catalog records the route.
     :param timeout_seconds: overrides the profile default; needs ``policy_reason``.
     :param max_retries: overrides the profile default; needs ``policy_reason``.
     :param max_backoff_seconds: overrides the profile default; needs
@@ -65,7 +67,8 @@ class UseCase:
         fails with ``LLMInvalidOutput``.
     :param request_limit: model requests allowed per run.
     :param cost_limit: dollar ceiling per run. Unset in phase one, where budgets
-        are alerts only.
+        are alerts only. PydanticAI only warns when it has no price for the model,
+        so this enforces nothing for a model genai-prices does not price.
     """
 
     app: str

@@ -1,11 +1,14 @@
-"""The model catalog: the models applications may call, and what each costs.
+"""The model catalog: what we know about the models applications call.
 
 The catalog is ``catalog.toml``, released with the library (usage policies spec
-§2.2). ``build_model`` accepts only its ids. An application holds its own model
-lists (database rows, settings) to it in CI with ``check_model_ids`` or the
-``ol-llm-catalog check`` command, so a release that retires a model fails the CI of
-every app still naming it. ``price_rules`` exports the prices as the Prometheus
-recording rules the spend dashboard and alerts join token counters against.
+§2.2). It records each model's status and price; it is not an allowlist.
+``build_model`` builds an id the catalog does not list, with a warning and a trace
+tag, so a new model needs no library release. It refuses a retired id. An
+application holds its own model lists (database rows, settings) to the catalog in
+CI with ``check_model_ids`` or the ``ol-llm-catalog check`` command, so a release
+that retires a model fails the CI of every app still naming it. ``price_rules``
+exports the prices as the Prometheus recording rules the spend dashboard and alerts
+join token counters against; a model the catalog does not list has no price there.
 
 Needs no extra: call sites not built on PydanticAI check their ids here too.
 """
@@ -48,6 +51,21 @@ _PROVIDER_ALIASES: Mapping[str, str] = {
 }
 
 
+def require_model_id_form(model_id: str) -> str:
+    """Return a model id that is in ``provider:model`` form.
+
+    :param model_id: the id to check.
+    :returns: the id, unchanged.
+    :rtype: str
+    :raises ValueError: if either half is missing.
+    """
+    provider, sep, name = model_id.partition(":")
+    if not (provider and sep and name):
+        msg = f"{model_id!r} is not in provider:model form"
+        raise ValueError(msg)
+    return model_id
+
+
 class CatalogEntry(BaseModel):
     """One model in the catalog. The fields are described in ``catalog.toml``.
 
@@ -87,11 +105,7 @@ class CatalogEntry(BaseModel):
     @field_validator("id")
     @classmethod
     def _provider_model_form(cls, value: str) -> str:
-        provider, sep, name = value.partition(":")
-        if not (provider and sep and name):
-            msg = f"{value!r} is not in provider:model form"
-            raise ValueError(msg)
-        return value
+        return require_model_id_form(value)
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
@@ -160,22 +174,19 @@ class Catalog:
             f"{_PROVIDER_ALIASES.get(provider, provider)}{sep}{name}"
         )
 
-    def require(self, model_id: str, *, kind: ModelKind) -> CatalogEntry:
+    def buildable(self, model_id: str, *, kind: ModelKind) -> CatalogEntry | None:
         """Return the entry for a model id that may be built.
 
         :param model_id: a ``provider:model`` id.
         :param kind: the kind of model the caller builds.
-        :returns: the entry, which may be deprecated.
-        :rtype: CatalogEntry
-        :raises ValueError: if the id is not in the catalog, is retired, or is
-            another kind of model.
+        :returns: the entry, which may be deprecated, or ``None`` when the catalog
+            does not list the id.
+        :rtype: CatalogEntry | None
+        :raises ValueError: if the id is not in ``provider:model`` form, is
+            retired, or is another kind of model.
         """
-        if (entry := self.get(model_id)) is None:
-            msg = (
-                f"{model_id!r} is not in the ol-llm model catalog; add it to "
-                "catalog.toml in mitodl/ol-llm, or use a listed model"
-            )
-            raise ValueError(msg)
+        if (entry := self.get(require_model_id_form(model_id))) is None:
+            return None
         if entry.status == "retired":
             msg = f"{model_id!r} is retired; pick a replacement from the catalog"
             raise ValueError(msg)
@@ -208,8 +219,8 @@ def load_catalog() -> Catalog:
 class CheckResult:
     """What ``check_model_ids`` found.
 
-    :param errors: ids that are not in the catalog or are retired.
-    :param warnings: ids that are deprecated.
+    :param errors: ids that are retired or not in ``provider:model`` form.
+    :param warnings: ids that are deprecated or not in the catalog.
     """
 
     errors: tuple[str, ...]
@@ -233,17 +244,21 @@ def check_model_ids(
 
     :param model_ids: the ids the application may use.
     :param catalog: the catalog to check against; the released one when omitted.
-    :returns: errors for ids that may not be built and warnings for deprecated
-        ones.
+    :returns: errors for ids that may not be built, and warnings for deprecated
+        ids and ids the catalog does not list.
     :rtype: CheckResult
     """
     catalog = catalog or load_catalog()
     errors: list[str] = []
     warnings: list[str] = []
     for model_id in dict.fromkeys(model_ids):
-        entry = catalog.get(model_id)
-        if entry is None:
-            errors.append(f"{model_id}: not in the model catalog")
+        try:
+            require_model_id_form(model_id)
+        except ValueError:
+            errors.append(f"{model_id}: not in provider:model form")
+            continue
+        if (entry := catalog.get(model_id)) is None:
+            warnings.append(f"{model_id}: not in the model catalog, so it has no price")
         elif entry.status == "retired":
             errors.append(f"{model_id}: retired")
         elif entry.status == "deprecated":
@@ -291,8 +306,8 @@ def _read_ids(path: Path) -> Iterator[str]:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the ``ol-llm-catalog`` command.
 
-    ``check`` exits 1 when any id is unlisted or retired, and prints deprecated
-    ids as warnings. ``prices`` prints ``price_rules`` as JSON.
+    ``check`` exits 1 when any id is retired or malformed, and prints deprecated
+    and unlisted ids as warnings. ``prices`` prints ``price_rules`` as JSON.
 
     :param argv: the arguments; ``sys.argv[1:]`` when omitted.
     :returns: the exit status.

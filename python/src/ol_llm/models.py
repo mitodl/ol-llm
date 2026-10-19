@@ -343,7 +343,7 @@ class PolicyModel(WrapperModel):
     use_case: str
     call_site: UseCase
     catalog_id: str
-    catalog_entry: CatalogEntry
+    catalog_entry: CatalogEntry | None
     profile_name: Profile
     policy: CallPolicy
 
@@ -353,7 +353,7 @@ class PolicyModel(WrapperModel):
         *,
         use_case: UseCase,
         model_id: str,
-        catalog_entry: CatalogEntry,
+        catalog_entry: CatalogEntry | None,
         policy: CallPolicy,
     ) -> None:
         """Wrap a provider model.
@@ -362,7 +362,7 @@ class PolicyModel(WrapperModel):
         :param use_case: the call site.
         :param model_id: the id the model was built from, for errors.
         :param catalog_entry: the model's catalog entry, for tracing to tag a
-            deprecated model and name it as Opik prices it.
+            deprecated model; ``None`` for a model the catalog does not list.
         :param policy: the resolved policy.
         """
         super().__init__(wrapped)
@@ -702,20 +702,28 @@ def _provider_model(
     return infer_model(model_id, provider_factory=factory)
 
 
-def _catalog_entries(use_case: UseCase) -> list[CatalogEntry]:
-    """Look up every model the use case names; only catalog chat models build."""
+def _catalog_entries(use_case: UseCase) -> list[CatalogEntry | None]:
+    """Look up every model the use case names; retired and embedding models raise."""
     catalog = load_catalog()
     entries = [
-        catalog.require(model_id, kind="chat") for model_id in use_case.model_ids
+        catalog.buildable(model_id, kind="chat") for model_id in use_case.model_ids
     ]
-    if use_case.fallback_models and entries[0].route_falls_back:
+    primary = entries[0]
+    if use_case.fallback_models and primary is not None and primary.route_falls_back:
         msg = (
             f"Use case {use_case.name!r} declares fallback_models, but the route to "
             f"{use_case.model!r} already falls back on its own (spec §6.4)"
         )
         raise ValueError(msg)
     for model_id, entry in zip(use_case.model_ids, entries, strict=True):
-        if entry.status == "deprecated":
+        if entry is None:
+            log.warning(
+                "Use case %s names %s, which the model catalog does not list, so "
+                "the spend rules have no price for it",
+                use_case.name,
+                model_id,
+            )
+        elif entry.status == "deprecated":
             log.warning(
                 "Use case %s names %s, which is deprecated and retires on %s",
                 use_case.name,
@@ -735,10 +743,10 @@ def build_model(use_case: UseCase, *, settings: Settings | None = None) -> Model
     :returns: a ``PolicyModel``, or a ``PolicyFallbackModel`` over one per model id
         when the use case declares fallbacks.
     :rtype: Model
-    :raises ValueError: on a model id that is not a chat model in the catalog or
-        is retired, fallbacks behind a route that falls back on its own, a
-        provider the library does not build, or an environment policy value that
-        does not parse.
+    :raises ValueError: on a model id not in ``provider:model`` form or that the
+        catalog lists as retired or as an embedding model, fallbacks behind a
+        route that falls back on its own, a provider the library does not build,
+        or an environment policy value that does not parse.
     """
     entries = _catalog_entries(use_case)
     policy = resolve_policy(use_case)
@@ -780,6 +788,32 @@ def call_site(model: Model) -> UseCase:
         msg = f"{model!r} was not built by ol_llm.build_model"
         raise TypeError(msg)
     return primary.call_site
+
+
+def catalog_tags(model: Model) -> tuple[str, ...]:
+    """Return the trace tags for the catalog status of a model's chain.
+
+    ``model_status:deprecated`` when any member is deprecated, and
+    ``model_status:uncataloged`` when the catalog does not list one, so Opik
+    filters and rules can find the traces that still need a catalog change. The
+    tags describe the chain the use case names, whether or not a fallback answered,
+    so they count traces to fix, not calls to each model.
+
+    :param model: a model from ``build_model``.
+    :returns: the tags, in a stable order.
+    :rtype: tuple[str, ...]
+    :raises TypeError: if a member of the chain did not come from ``build_model``.
+    """
+    statuses = set()
+    for member in _chain(model):
+        if not isinstance(member, PolicyModel):
+            msg = f"{model!r} was not built by ol_llm.build_model"
+            raise TypeError(msg)
+        if (entry := member.catalog_entry) is None:
+            statuses.add("uncataloged")
+        elif entry.status == "deprecated":
+            statuses.add("deprecated")
+    return tuple(f"model_status:{status}" for status in sorted(statuses))
 
 
 def instrumentation(use_case: UseCase) -> list[AbstractCapability[Any]]:

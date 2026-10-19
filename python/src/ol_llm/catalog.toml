@@ -1,9 +1,12 @@
-# The model catalog: every model an Open Learning application may call.
+# The model catalog: the status and price of the models Open Learning
+# applications call.
 #
-# build_model accepts only ids listed here, and apps check their own model lists
-# against it in CI. Policy: mitodl/ol-infrastructure
+# It is not an allowlist. build_model builds an id missing from here, with a warning
+# and a model_status:uncataloged trace tag, and refuses a retired one. Apps check
+# their own model lists against it in CI. Policy: mitodl/ol-infrastructure
 # docs/plans/llm-usage-policies-spec.md §2.2. Adding or changing an entry is a pull
-# request approved by the catalog owner (Platform Engineering).
+# request approved by the catalog owner (Platform Engineering); a model in use
+# without an entry has no price in the spend rules until it gets one.
 #
 # Fields, with defaults in brackets:
 #   id                  PydanticAI form, provider:model. Bedrock ids are inference
@@ -11,7 +14,8 @@
 #                       deployed under the model's own name.
 #   kind                chat or embedding.
 #   status              [allowed] allowed, deprecated (needs retires_on), or
-#                       retired. A deprecated id still builds; a retired id raises.
+#                       retired. A deprecated id builds and tags the trace
+#                       model_status:deprecated; a retired id raises.
 #   retires_on          the date the provider retires the model, or the date we
 #                       stop allowing it.
 #   floating            [false] true when the id can change behavior without
