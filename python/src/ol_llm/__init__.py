@@ -34,7 +34,13 @@ from ol_llm.errors import (
     LLMRejected,
     LLMUnavailable,
 )
-from ol_llm.policy import CallPolicy, Profile, UseCase, resolve_policy
+from ol_llm.policy import (
+    CallPolicy,
+    Profile,
+    UseCase,
+    resolve_policy,
+    worst_case_seconds,
+)
 from ol_llm.prompts import (
     ChatTemplate,
     ManagedPrompt,
@@ -133,6 +139,7 @@ __all__ = [
     "run_sync",
     "trace_fields",
     "usage_limits",
+    "worst_case_seconds",
 ]
 
 

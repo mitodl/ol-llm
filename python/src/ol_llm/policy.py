@@ -190,6 +190,33 @@ def resolve_policy(
     )
 
 
+def worst_case_seconds(
+    use_case: UseCase, environ: Mapping[str, str] | None = None
+) -> float:
+    """Return the longest one model request can take under the policy (spec §6.2).
+
+    Every attempt runs to its timeout and every wait is as long as the policy
+    allows, on the primary and then on each fallback: 190 s on the request profile
+    and 3,300 s on the batch profile at the defaults, per model. A Celery time
+    limit, an arq ``job_timeout``, or a Dagster ``dagster/max_runtime`` has to sit
+    above this times the model requests the job makes, or it kills a call the
+    policy is still retrying.
+
+    :param use_case: the call site.
+    :param environ: the environment to read; ``os.environ`` when omitted.
+    :returns: the worst case in seconds.
+    :rtype: float
+    """
+    policy = resolve_policy(use_case, environ)
+    waits = (
+        policy.max_backoff_seconds
+        if use_case.profile == "request"
+        else policy.max_retries * policy.max_backoff_seconds
+    )
+    per_model = (policy.max_retries + 1) * policy.timeout_seconds + waits
+    return per_model * len(use_case.model_ids)
+
+
 _Number = TypeVar("_Number", int, float)
 
 
