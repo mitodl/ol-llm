@@ -33,6 +33,10 @@
 #   input_usd_per_mtok, list price in US dollars per million tokens, at the lowest
 #   output_usd_per_mtok tier where the price is tiered by prompt length. The
 #                       Prometheus spend rules use these.
+#   dimensions          embedding entries only, and required there: the length of
+#                       the vectors the model returns when a request asks for no
+#                       other size. Vectors are stored with the id and dimension
+#                       that produced them, so changing either means re-embedding.
 #
 # Sources for the initial entries are in llm-usage-policies-spec.md §2.1.
 # Prices were read from Opik 2.2.87's price table where it has the model.
@@ -77,9 +81,21 @@ output_usd_per_mtok = "14.00"
 [[model]]
 id = "openai:text-embedding-3-large"
 kind = "embedding"
+dimensions = 3072
 opik_provider = "openai"
 opik_model = "text-embedding-3-large"
 input_usd_per_mtok = "0.13"
+output_usd_per_mtok = "0"
+
+# mit-learn's CI dense model. Its LiteLLMEncoder sends a bare model name to OpenAI,
+# since LITELLM_CUSTOM_PROVIDER defaults to openai and CI does not set it.
+[[model]]
+id = "openai:text-embedding-3-small"
+kind = "embedding"
+dimensions = 1536
+opik_provider = "openai"
+opik_model = "text-embedding-3-small"
+input_usd_per_mtok = "0.02"
 output_usd_per_mtok = "0"
 
 # Azure OpenAI, GlobalStandard deployments named after the model. Left unset,
@@ -115,15 +131,17 @@ output_usd_per_mtok = "14.00"
 [[model]]
 id = "azure:text-embedding-3-large"
 kind = "embedding"
+dimensions = 3072
 opik_provider = "azure"
 opik_model = "text-embedding-3-large"
 input_usd_per_mtok = "0.13"
 output_usd_per_mtok = "0"
 
-# mit-learn's CI embeddings.
+# Deployed to mit-learn's Azure OpenAI account, which only CI enables.
 [[model]]
 id = "azure:text-embedding-3-small"
 kind = "embedding"
+dimensions = 1536
 opik_provider = "azure"
 opik_model = "text-embedding-3-small"
 input_usd_per_mtok = "0.02"
@@ -151,6 +169,7 @@ output_usd_per_mtok = "11.00"
 [[model]]
 id = "bedrock:amazon.titan-embed-text-v2:0"
 kind = "embedding"
+dimensions = 1024
 opik_provider = "bedrock"
 opik_model = "amazon.titan-embed-text-v2:0"
 input_usd_per_mtok = "0.02"

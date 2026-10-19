@@ -73,6 +73,7 @@ output_usd_per_mtok = "10"
 [[model]]
 id = "openai:text-embedding-3-small"
 kind = "embedding"
+dimensions = 1536
 input_usd_per_mtok = "0.02"
 output_usd_per_mtok = "0"
 """
@@ -266,6 +267,12 @@ def test_policy_model_checks_the_catalog() -> None:
             lambda t: t.replace("retires_on = 2027-01-01", 'retires_on = "2027-01-01"'),
             "date",
         ),
+        (lambda t: t.replace("dimensions = 1536\n", ""), "positive dimensions"),
+        (lambda t: t.replace("dimensions = 1536", "dimensions = 0"), "positive"),
+        (
+            lambda t: t.replace('kind = "chat"', 'kind = "chat"\ndimensions = 8', 1),
+            "only an embedding entry",
+        ),
     ],
 )
 def test_malformed_catalog_is_refused(
@@ -430,3 +437,6 @@ def test_opik_prices_every_model_at_the_catalog_price(
         entry.input_usd_per_mtok,
         entry.output_usd_per_mtok,
     )
+    # Opik's table records the default vector size for some embedding models.
+    if (size := row.get("output_vector_size")) is not None:
+        assert size == entry.dimensions

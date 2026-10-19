@@ -74,7 +74,8 @@ class CatalogEntry(BaseModel):
     :raises ValueError: on a malformed id, an unknown field, kind, status, or
         route, a price that is not a quoted decimal, a deprecated entry with no
         ``retires_on``, ``route_falls_back`` on a direct route, only one of the two
-        Opik names, or a negative price.
+        Opik names, a negative price, an embedding entry without a positive
+        ``dimensions``, or a chat entry with one.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
@@ -90,6 +91,7 @@ class CatalogEntry(BaseModel):
     route_falls_back: bool = False
     opik_provider: str | None = None
     opik_model: str | None = None
+    dimensions: int | None = None
 
     @field_validator("input_usd_per_mtok", "output_usd_per_mtok", mode="before")
     @classmethod
@@ -120,6 +122,12 @@ class CatalogEntry(BaseModel):
             raise ValueError(msg)
         if self.input_usd_per_mtok < 0 or self.output_usd_per_mtok < 0:
             msg = "prices must not be negative"
+            raise ValueError(msg)
+        if self.kind == "embedding" and (self.dimensions or 0) <= 0:
+            msg = "an embedding entry needs a positive dimensions"
+            raise ValueError(msg)
+        if self.kind == "chat" and self.dimensions is not None:
+            msg = "only an embedding entry has dimensions"
             raise ValueError(msg)
         return self
 
