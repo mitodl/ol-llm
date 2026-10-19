@@ -84,16 +84,25 @@ is marked degraded, on the returned value and on the trace as `degraded` and
 
 A row failure records its class and does not fail the chunk. `LLMRejected` opens the circuit at
 once, since retrying a configuration bug burns budget. `LLMRateLimited` and `LLMUnavailable`
-count toward the circuit's threshold. The other errors fail only their row.
+count toward the circuit's threshold (three in a row by default). The other errors fail only
+their row, and like a success they reset the count.
+
+The next run retries a row that failed with `LLMRateLimited`, `LLMUnavailable`, or
+`LLMRejected`, none of which is about the row. `LLMInvalidOutput`, `LLMContentFiltered`, and
+`LLMBudgetExceeded` would repeat under the same prompt and model, so the row waits for its
+idempotency key to change. The key hashes the row's input, the prompt name, the prompt's
+template hash (its text and template type), and the use case's primary model; the prompt
+version is recorded beside it, not in it.
+A batch whose circuit opened, or whose every attempted row failed, raises.
 
 ## Python status
 
 Implemented: use cases, policy resolution, the error classes, classification of model
 requests, the retry wrapper, fallback composition, the content-filter and output-retry
-settings on agents, and the entry points `run`, `run_sync`, `run_stream`, `complete`, and
-`complete_sync`.
+settings on agents, the entry points `run`, `run_sync`, `run_stream`, `complete`, and
+`complete_sync`, and the batch helpers (`ol_llm.batch`).
 
-Not yet: the batch helpers. A bare `agent.run` outside the entry points raises
-PydanticAI's own `ContentFilterError`, `UnexpectedModelBehavior`, and `UsageLimitExceeded`
-rather than `LLMContentFiltered`, `LLMInvalidOutput`, and `LLMBudgetExceeded`, does not apply
-`usage_limits`, does not pass the user id to the provider, and never sets `degraded`.
+A bare `agent.run` outside the entry points raises PydanticAI's own `ContentFilterError`,
+`UnexpectedModelBehavior`, and `UsageLimitExceeded` rather than `LLMContentFiltered`,
+`LLMInvalidOutput`, and `LLMBudgetExceeded`, does not apply `usage_limits`, does not pass the
+user id to the provider, and never sets `degraded`.
