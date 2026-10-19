@@ -1863,7 +1863,7 @@ wheels = [
 
 [[package]]
 name = "ol-llm"
-version = "0.0.1"
+version = "0.0.2"
 source = { editable = "python" }
 dependencies = [
     { name = "httpx" },

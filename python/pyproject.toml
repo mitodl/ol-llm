@@ -1,6 +1,6 @@
 [project]
 name = "ol-llm"
-version = "0.0.1"
+version = "0.0.2"
 description = "Shared library for LLM calls at MIT Open Learning, with Opik tracing, prompt management, and evaluation built in"
 readme = "README.md"
 license = "BSD-3-Clause"
