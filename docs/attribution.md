@@ -15,10 +15,11 @@ gateway logs, and metrics. Decided 2026-10-01; the reasoning is in
 | `user_id` | request-time with a user | the call | metadata | OpenAI `user`, Anthropic `metadata.user_id` |
 | `thread_id` | conversations | the call | native thread field | |
 | `run_id` | batch | the call | metadata | |
+| `model_status` | a model in the use case's chain is deprecated or not in the catalog | the model catalog | tag `model_status:deprecated` or `model_status:uncataloged` | |
 | `degraded` | when true | the library, or the call site for partial output | `degraded`, `degraded_reason` metadata | |
 
-Tags carry only `app`, `use_case`, and `environment`. User, thread, and run identifiers go in
-metadata and never in tags or metric labels.
+Tags carry only `app`, `use_case`, `environment`, and `model_status`. User, thread, and run
+identifiers go in metadata and never in tags or metric labels.
 
 `user_id` is pseudonymous and stable: the platform's global user id for a signed-in user, and
 for an anonymous one `anon-` followed by an HMAC-SHA256 of the session identifier under one
@@ -37,5 +38,6 @@ the same way, per API shape:
 | `OL_LLM_GATEWAY_ANTHROPIC_BASE_URL`, `OL_LLM_GATEWAY_ANTHROPIC_API_KEY` | send `anthropic` models through this Anthropic-format route |
 
 A family with no route is called directly with the provider SDK's own credentials. The gateway
-is optional in phase one, and which routes exist is the gateway PoCs' to decide; once the
-model catalog exists it records the route for each model id.
+is optional in phase one, and which routes exist is the gateway PoCs' to decide. The model
+catalog records whether each model it lists is reached through a gateway route, but the
+routing itself comes from these settings.

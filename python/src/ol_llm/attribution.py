@@ -63,6 +63,7 @@ def trace_fields(
     environment: str,
     policy: CallPolicy,
     attribution: Attribution = NO_ATTRIBUTION,
+    model_tags: Sequence[str] = (),
 ) -> TraceFields:
     """Build the root-trace fields for one run.
 
@@ -73,6 +74,8 @@ def trace_fields(
     :param environment: the deployment environment.
     :param policy: the policy the run resolved to.
     :param attribution: the per-call fields.
+    :param model_tags: tags for the models' catalog status, from
+        ``ol_llm.models.catalog_tags``.
     :returns: the fields to open the root trace with.
     :rtype: TraceFields
     """
@@ -95,6 +98,7 @@ def trace_fields(
             f"app:{use_case.app}",
             f"use_case:{use_case.name}",
             f"env:{environment}",
+            *model_tags,
         ),
         metadata=metadata,
         thread_id=attribution.thread_id,

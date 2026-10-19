@@ -39,6 +39,7 @@ from ol_llm.models import (
     answering_model,
     attribution_model_settings,
     call_site,
+    catalog_tags,
     classify_run_failure,
     recording_answers,
     usage_limits,
@@ -197,6 +198,7 @@ def _start(
         environment=get_settings().environment,
         policy=resolve_policy(use_case),
         attribution=attribution,
+        model_tags=catalog_tags(agent.model),
     )
     return _Run(use_case, attribution, postprocess, fields, traced=enabled())
 

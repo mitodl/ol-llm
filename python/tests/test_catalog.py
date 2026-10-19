@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import opik
 import pytest
-from ol_llm import UseCase, models
+from ol_llm import UseCase, models, run_sync
 from ol_llm.catalog import (
     TOKENS_PER_MTOK,
     Catalog,
@@ -18,7 +19,13 @@ from ol_llm.catalog import (
     main,
     price_rules,
 )
-from ol_llm.models import PolicyFallbackModel, PolicyModel, build_model
+from ol_llm.models import (
+    PolicyFallbackModel,
+    PolicyModel,
+    build_agent,
+    build_model,
+    override_models,
+)
 from ol_llm.testing import policy_model
 from pydantic_ai.messages import ModelResponse
 from pydantic_ai.models.test import TestModel
@@ -94,14 +101,31 @@ def test_released_catalog_has_both_kinds() -> None:
     assert kinds == {"chat", "embedding"}
 
 
-def test_build_model_refuses_an_unlisted_model() -> None:
-    with pytest.raises(ValueError, match="not in the ol-llm model catalog"):
-        build_model(use_case("openai:gpt-3.5-turbo"))
+def test_unlisted_model_builds_and_warns(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="ol_llm.models"):
+        model = build_model(use_case("openai:gpt-3.5-turbo"))
+
+    assert isinstance(model, PolicyModel)
+    assert model.catalog_id == "openai:gpt-3.5-turbo"
+    assert model.catalog_entry is None
+    assert "openai:gpt-3.5-turbo" in caplog.text
+    assert "does not list" in caplog.text
 
 
-def test_build_model_refuses_an_unlisted_fallback() -> None:
-    with pytest.raises(ValueError, match=r"'openai:gpt-3\.5-turbo' is not in"):
-        build_model(use_case("openai:gpt-4o-mini", "openai:gpt-3.5-turbo"))
+def test_unlisted_fallback_builds() -> None:
+    model = build_model(use_case("openai:gpt-4o-mini", "openai:gpt-3.5-turbo"))
+
+    assert isinstance(model, PolicyFallbackModel)
+    assert [m.catalog_entry for m in model.models] == [  # type: ignore[attr-defined]
+        CATALOG.entries["openai:gpt-4o-mini"],
+        None,
+    ]
+
+
+@pytest.mark.parametrize("model_id", ["gpt-4o-mini", "openai:", ":gpt-4o-mini"])
+def test_build_model_refuses_a_malformed_id(model_id: str) -> None:
+    with pytest.raises(ValueError, match="not in provider:model form"):
+        build_model(use_case(model_id))
 
 
 @pytest.mark.usefixtures("test_catalog")
@@ -134,6 +158,39 @@ def test_route_that_falls_back_takes_no_fallback_models() -> None:
         build_model(use_case("openai:gpt-5", "openai:gpt-4o-mini"))
 
 
+@pytest.mark.usefixtures("test_catalog")
+def test_unlisted_primary_takes_fallback_models() -> None:
+    model = build_model(use_case("openai:gpt-5.9", "openai:gpt-4o-mini"))
+
+    assert isinstance(model, PolicyFallbackModel)
+
+
+@pytest.mark.usefixtures("test_catalog")
+@pytest.mark.parametrize(
+    ("models_named", "tags"),
+    [
+        (("openai:gpt-4o-mini",), []),
+        (("openai:gpt-4-turbo",), ["model_status:deprecated"]),
+        (("openai:gpt-4o-mini", "openai:gpt-5.9"), ["model_status:uncataloged"]),
+        (
+            ("openai:gpt-5.9", "openai:gpt-4-turbo"),
+            ["model_status:deprecated", "model_status:uncataloged"],
+        ),
+    ],
+)
+def test_a_run_tags_its_trace_with_the_catalog_status(
+    models_named: tuple[str, ...], tags: list[str]
+) -> None:
+    with override_models(TestModel(custom_output_text="ok")):
+        agent = build_agent(use_case(*models_named))
+
+    with opik.record_traces_locally() as storage:
+        run_sync(agent, "summarize")
+        [trace] = storage.trace_trees
+
+    assert [t for t in trace.tags or [] if t.startswith("model_status:")] == tags
+
+
 def test_each_chain_member_carries_its_entry() -> None:
     model = build_model(
         use_case("openai:gpt-4o-mini", "bedrock:us.anthropic.claude-sonnet-5")
@@ -157,9 +214,29 @@ def test_api_shape_providers_share_the_base_entry(model_id: str) -> None:
     assert model.catalog_entry is CATALOG.entries["openai:gpt-4o-mini"]
 
 
+@pytest.mark.usefixtures("test_catalog")
+def test_a_nested_run_tags_the_callers_trace() -> None:
+    with override_models(TestModel(custom_output_text="ok")):
+        agent = build_agent(use_case("openai:gpt-5.9"))
+
+    @opik.track(project_name="mit-learn")
+    def handler() -> None:
+        run_sync(agent, "summarize")
+
+    with opik.record_traces_locally() as storage:
+        handler()
+        [trace] = storage.trace_trees
+
+    assert "model_status:uncataloged" in (trace.tags or [])
+
+
 def test_policy_model_checks_the_catalog() -> None:
-    with pytest.raises(ValueError, match="not in the ol-llm model catalog"):
-        policy_model(use_case("openai:gpt-3.5-turbo"), TestModel())
+    assert (
+        policy_model(use_case("openai:gpt-3.5-turbo"), TestModel()).catalog_entry
+        is None
+    )
+    with pytest.raises(ValueError, match="retired"):
+        policy_model(use_case("google:gemini-3-pro-preview"), TestModel())
 
 
 @pytest.mark.parametrize(
@@ -206,6 +283,7 @@ def test_check_model_ids(test_catalog: Catalog) -> None:
             "openai:gpt-4-turbo",
             "openai:gpt-4",
             "gpt-4o-mini",
+            "openai:gpt-3.5-turbo",
             "openai:gpt-4",
         ],
         test_catalog,
@@ -214,10 +292,11 @@ def test_check_model_ids(test_catalog: Catalog) -> None:
     assert not result.ok
     assert result.errors == (
         "openai:gpt-4: retired",
-        "gpt-4o-mini: not in the model catalog",
+        "gpt-4o-mini: not in provider:model form",
     )
     assert result.warnings == (
         "openai:gpt-4-turbo: deprecated, retiring on 2027-01-01",
+        "openai:gpt-3.5-turbo: not in the model catalog, so it has no price",
     )
 
 
@@ -230,11 +309,13 @@ def test_check_command(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> No
     ids.write_text("# learn-ai\nopenai:gpt-4o-mini\n\nazure:gpt-4o  # tutor\n")
 
     assert main(["check", "--file", str(ids), "mistral:mistral-large-latest"]) == 0
-    assert main(["check", "--file", str(ids), "openai:gpt-3.5-turbo"]) == 1
+    assert main(["check", "--file", str(ids), "openai:gpt-3.5-turbo"]) == 0
     assert (
-        "error: openai:gpt-3.5-turbo: not in the model catalog"
+        "warning: openai:gpt-3.5-turbo: not in the model catalog"
         in capsys.readouterr().err
     )
+    assert main(["check", "google:gemini-3-pro-preview"]) == 1
+    assert "error: google:gemini-3-pro-preview: retired" in capsys.readouterr().err
 
 
 def test_check_command_needs_ids() -> None:

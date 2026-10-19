@@ -15,14 +15,19 @@ The contracts move into `docs/` here as they are implemented.
 
 ## Model catalog
 
-[`python/src/ol_llm/catalog.toml`](python/src/ol_llm/catalog.toml) lists every model an
-application may call, with its status, whether the id floats, the name Opik prices it under,
-and its list price. `build_model` builds only catalog chat models and refuses retired ones.
-Adding or changing an entry is a pull request here; the policy is
+[`python/src/ol_llm/catalog.toml`](python/src/ol_llm/catalog.toml) records the models
+applications call, with each one's status, whether the id floats, the name Opik prices it
+under, and its list price. It is not an allowlist, so a new model needs no release here:
+`build_model` builds an id the catalog does not list, logs a warning, and tags the run's trace
+`model_status:uncataloged`. It refuses a retired id, and tags a deprecated one
+`model_status:deprecated`. A model with no entry has no price in the spend rules, so a model
+that stays in use should get one. Adding or changing an entry is a pull request here; the
+policy is
 [`llm-usage-policies-spec.md` §2.2](https://github.com/mitodl/ol-infrastructure/blob/main/docs/plans/llm-usage-policies-spec.md).
 
 An application keeps its own model lists (database rows, settings) to the catalog in CI, so
-a release that retires a model fails the CI of any app still naming it:
+a release that retires a model fails the CI of any app still naming it. Deprecated and
+unlisted ids are warnings:
 
 ```sh
 ol-llm-catalog check openai:gpt-4o-mini azure:gpt-5-mini
