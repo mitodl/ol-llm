@@ -165,6 +165,25 @@ def test_gateway_route_replaces_the_vendor_api(family: str, model_id: str) -> No
     assert client.default_headers[USE_CASE_HEADER] == "summary"
 
 
+@pytest.mark.usefixtures("provider_env")
+def test_the_google_provider_closes_its_client_and_opens_a_new_one() -> None:
+    model = build_model(use_case("google:gemini-3.1-pro-preview"))
+    assert isinstance(model, PolicyModel)
+    provider = model.wrapped.provider  # type: ignore[attr-defined]
+
+    async def enter_and_exit() -> Any:  # noqa: ANN401
+        async with provider:
+            return provider.client._api_client._async_httpx_client  # noqa: SLF001
+
+    first = asyncio.run(enter_and_exit())
+    second = asyncio.run(enter_and_exit())
+
+    assert first.is_closed
+    assert second is not first
+    assert second.is_closed
+    assert second.timeout.read == 60
+
+
 def test_unsupported_provider_is_refused() -> None:
     with pytest.raises(ValueError, match="does not build 'groq'"):
         build_model(use_case("groq:llama-3.3-70b"))

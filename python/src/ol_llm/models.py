@@ -858,10 +858,19 @@ def _google_provider(provider: str, policy: CallPolicy) -> Provider[Any]:
         _raise_missing_extra("google", exc)
     # The SDK retries only when given a retry config, and none is passed. The
     # provider reads the request timeout from the client's read timeout.
-    http_client = httpx2.AsyncClient(timeout=policy.timeout_seconds)
-    if provider == "google-cloud":
-        return GoogleCloudProvider(http_client=http_client)
-    return GoogleProvider(http_client=http_client)
+    new_client = partial(httpx2.AsyncClient, timeout=policy.timeout_seconds)
+    http_client = new_client()
+    google: Provider[Any] = (
+        GoogleCloudProvider(http_client=http_client)
+        if provider == "google-cloud"
+        else GoogleProvider(http_client=http_client)
+    )
+    # A provider leaves a client it was given open. Give it this one as if it had
+    # made it, so exiting the provider closes it and entering again makes a new
+    # one, as without a client.
+    google._own_http_client = http_client  # noqa: SLF001
+    google._http_client_factory = new_client  # noqa: SLF001
+    return google
 
 
 def _mistral_provider() -> Provider[Any]:
