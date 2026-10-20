@@ -94,8 +94,8 @@ The next run retries a row that failed with `LLMRateLimited`, `LLMUnavailable`, 
 `LLMRejected` of the account or model, none of which is about the row. A row rejection,
 `LLMInvalidOutput`, `LLMContentFiltered`, and `LLMBudgetExceeded` would repeat under the same
 prompt and model, so the row waits for its idempotency key to change. When a run of row
-rejections opened the circuit, the batch reports those rows so the caller can clear them
-once the request is fixed, since a fixed request parameter does not change the key. The key hashes the row's input, the prompt name, the prompt's
+rejections opened the circuit, or every row the batch attempted was rejected for its input,
+the batch reports those rows so the caller can clear them once the request is fixed, since a fixed request parameter does not change the key. The key hashes the row's input, the prompt name, the prompt's
 template hash (its text and template type), and the use case's primary model; the prompt
 version is recorded beside it, not in it.
 A batch whose circuit opened, or whose every attempted row failed, raises.

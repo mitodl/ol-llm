@@ -373,6 +373,34 @@ def test_a_run_of_row_rejections_is_reported_for_clearing() -> None:
     assert "3 rejected rows to clear" in str(caught.value)
 
 
+def test_a_batch_whose_every_row_was_rejected_reports_them_for_clearing() -> None:
+    # Too few rows to reach the threshold, but as likely a rejection of the request.
+    errors = {row: row_rejected() for row in "abc"}
+    _called, call = failing_on(errors)
+
+    with pytest.raises(BatchFailed) as caught:
+        process_batch(list("abc"), call, Recorder())
+
+    report = caught.value.report
+    assert report.circuit_opened_by is None
+    assert report.request_rejections == [RowFailure(row, errors[row]) for row in "abc"]
+
+
+@pytest.mark.parametrize("other", ["success", "invalid"])
+def test_rejected_rows_beside_another_outcome_are_not_reported(other: str) -> None:
+    failures: dict[str, LLMError] = {"a": row_rejected(), "b": row_rejected()}
+    if other == "invalid":
+        failures["c"] = invalid()
+    _called, call = failing_on(failures)
+
+    try:
+        report = process_batch(list("abc"), call, Recorder())
+    except BatchFailed as exc:
+        report = exc.report
+
+    assert report.request_rejections == []
+
+
 def test_no_rows_are_reported_for_clearing_when_something_else_opened_it() -> None:
     _called, call = failing_on({"a": row_rejected(), "b": rejected()})
 

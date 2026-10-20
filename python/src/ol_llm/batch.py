@@ -287,10 +287,11 @@ class BatchReport(Generic[RowT]):
     :param failures: the failure ledger, in the order rows were processed.
     :param circuit_opened_by: the error that opened the circuit, if it opened.
     :param request_rejections: when a run of row rejections opened the circuit,
-        the failures in that run. The request was most likely wrong for every row
-        (e.g. a parameter the model no longer takes), but each was persisted as a
-        row not to retry, and fixing the request does not change the row's key.
-        Clear their skip marks once the request is fixed.
+        the failures in that run; when every row the batch attempted was rejected
+        for its input, too few to open it, all of them. The request was most likely
+        wrong for every row (e.g. a parameter the model no longer takes), but each
+        was persisted as a row not to retry, and fixing the request does not change
+        the row's key. Clear their skip marks once the request is fixed.
     """
 
     succeeded: int
@@ -427,13 +428,20 @@ def _run_chunk(
 
 
 def _request_rejections(
-    breaker: CircuitBreaker, failures: Sequence[RowFailure[RowT]]
+    breaker: CircuitBreaker, failures: Sequence[RowFailure[RowT]], succeeded: int
 ) -> list[RowFailure[RowT]]:
-    """Return the failures in the rejection run that opened the circuit, if one did."""
-    if breaker.opened_by is None or not rejects_the_row(breaker.opened_by):
-        return []
-    run = {id(error) for error in breaker.rejection_run}
-    return [failure for failure in failures if id(failure.error) in run]
+    """Return the row rejections that were more likely rejections of the request.
+
+    Those are the run that opened the circuit, if one did, or every row when the
+    batch had no other outcome. A batch shorter than the threshold cannot open the
+    circuit, but a request every row is rejected for looks the same there.
+    """
+    if breaker.opened_by is not None and rejects_the_row(breaker.opened_by):
+        run = {id(error) for error in breaker.rejection_run}
+        return [failure for failure in failures if id(failure.error) in run]
+    if not succeeded and all(rejects_the_row(failure.error) for failure in failures):
+        return list(failures)
+    return []
 
 
 def process_batch(  # noqa: PLR0913
@@ -501,7 +509,7 @@ def process_batch(  # noqa: PLR0913
         succeeded=succeeded,
         failures=failures,
         circuit_opened_by=breaker.opened_by,
-        request_rejections=_request_rejections(breaker, failures),
+        request_rejections=_request_rejections(breaker, failures, succeeded),
     )
     if report.circuit_opened_by is not None or (failures and not succeeded):
         raise BatchFailed(report.describe(), report) from report.circuit_opened_by
