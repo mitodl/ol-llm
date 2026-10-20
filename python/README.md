@@ -215,8 +215,11 @@ because the same prompt and model would fail the same way. A `CircuitBreaker` st
 batch after the chunk in which any other `LLMRejected` arrives (a 401, 403, 404, or a
 transport error: our bug or configuration, which every later row would repeat), ten rows in
 a row rejected for their input (a request every row gets rejected for), or three
-rate-limited or unavailable rows in a row. The batch then raises `BatchFailed` with sample errors, as it does when
-every attempted row failed, which would otherwise look like a run with nothing to do.
+rate-limited or unavailable rows in a row. The batch then raises `BatchFailed` with sample
+errors, as it does when every attempted row failed, which would otherwise look like a run
+with nothing to do. When rejections opened the circuit, `report.request_rejections` lists
+those rows: they were marked not to retry, but the fix (e.g. dropping a parameter the model
+no longer takes) does not change their key, so clear their skip marks.
 Anything else a call raises is a bug and stops the batch unpersisted.
 
 `ol_llm.BatchKeys(model=use_case.model, prompt=prompt)`, built from the prompt the run
@@ -285,6 +288,8 @@ def feedback_summaries(context: dg.AssetExecutionContext) -> None:
             rows, summarize, persist, max_workers=20, logger=context.log
         )
     except ol_llm.BatchFailed as exc:
+        # The request, not these rows, was wrong; retry them once it is fixed.
+        clear_skipped([failure.row["pk"] for failure in exc.report.request_rejections])
         raise dg.Failure(str(exc)) from exc
     context.add_output_metadata(
         {"summarized": report.succeeded, "failed": len(report.failures)}

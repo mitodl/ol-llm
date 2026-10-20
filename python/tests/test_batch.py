@@ -340,6 +340,29 @@ def test_a_row_rejected_for_its_input_does_not_stop_the_batch() -> None:
     assert report.circuit_opened_by is None
 
 
+def test_a_run_of_row_rejections_is_reported_for_clearing() -> None:
+    errors = {row: row_rejected() for row in "cde"}
+    _called, call = failing_on({"a": row_rejected(), **errors})
+    breaker = CircuitBreaker(max_consecutive_rejections=3)
+
+    with pytest.raises(BatchFailed) as caught:
+        process_batch(list("abcdef"), call, Recorder(), chunk_size=2, breaker=breaker)
+
+    report = caught.value.report
+    # "a" was followed by a success, so it was a rejection of its own row.
+    assert report.request_rejections == [RowFailure(row, errors[row]) for row in "cde"]
+    assert "3 rejected rows to clear" in str(caught.value)
+
+
+def test_no_rows_are_reported_for_clearing_when_something_else_opened_it() -> None:
+    _called, call = failing_on({"a": row_rejected(), "b": rejected()})
+
+    with pytest.raises(BatchFailed) as caught:
+        process_batch(list("abc"), call, Recorder())
+
+    assert caught.value.report.request_rejections == []
+
+
 def test_a_rejection_stops_the_batch_after_its_chunk() -> None:
     error = rejected()
     read: list[str] = []

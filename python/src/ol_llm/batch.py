@@ -204,7 +204,7 @@ class CircuitBreaker:
     max_consecutive_rejections: int = DEFAULT_MAX_CONSECUTIVE_REJECTIONS
     opened_by: LLMError | None = field(default=None, init=False)
     _consecutive: int = field(default=0, init=False, repr=False)
-    _rejections: int = field(default=0, init=False, repr=False)
+    _rejection_run: list[LLMError] = field(default_factory=list, init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Refuse a threshold that could never be reached or is always reached."""
@@ -218,10 +218,20 @@ class CircuitBreaker:
         """Whether the batch should stop."""
         return self.opened_by is not None
 
+    @property
+    def rejection_run(self) -> tuple[LLMError, ...]:
+        """The row rejections since the last accepted request, oldest first.
+
+        Once these open the circuit they are more likely rejections of the request
+        than of their rows, and rows that fail after the circuit opens (in flight
+        on other workers) are still added.
+        """
+        return tuple(self._rejection_run)
+
     def record_success(self) -> None:
         """Count a row that succeeded."""
         self._consecutive = 0
-        self._rejections = 0
+        self._rejection_run.clear()
 
     def record_failure(self, error: LLMError) -> None:
         """Count a row that failed, and open the circuit if it should.
@@ -234,14 +244,14 @@ class CircuitBreaker:
                 self._open(error)
         elif rejects_the_row(error):
             self._consecutive = 0
-            self._rejections += 1
-            if self._rejections >= self.max_consecutive_rejections:
+            self._rejection_run.append(error)
+            if len(self._rejection_run) >= self.max_consecutive_rejections:
                 self._open(error)
         elif isinstance(error, LLMRejected):
             self._open(error)
         else:
             self._consecutive = 0
-            self._rejections = 0
+            self._rejection_run.clear()
 
     def _open(self, error: LLMError) -> None:
         # The first error is the cause; rows still in flight may fail after it.
@@ -270,11 +280,17 @@ class BatchReport(Generic[RowT]):
     :param succeeded: rows whose call succeeded.
     :param failures: the failure ledger, in the order rows were processed.
     :param circuit_opened_by: the error that opened the circuit, if it opened.
+    :param request_rejections: when a run of row rejections opened the circuit,
+        the failures in that run. The request was most likely wrong for every row
+        (e.g. a parameter the model no longer takes), but each was persisted as a
+        row not to retry, and fixing the request does not change the row's key.
+        Clear their skip marks once the request is fixed.
     """
 
     succeeded: int
     failures: Sequence[RowFailure[RowT]]
     circuit_opened_by: LLMError | None
+    request_rejections: Sequence[RowFailure[RowT]] = ()
 
     @property
     def attempted(self) -> int:
@@ -293,6 +309,11 @@ class BatchReport(Generic[RowT]):
             summary += (
                 f"; stopped after {type(error).__name__} from {error.model} opened "
                 f"the circuit for use case {error.use_case!r}"
+            )
+        if self.request_rejections:
+            summary += (
+                f"; {len(self.request_rejections)} rejected rows to clear and retry "
+                "once the request is fixed"
             )
         samples = "; ".join(
             f"{type(failure.error).__name__}: {failure.error}"
@@ -399,6 +420,16 @@ def _run_chunk(
     )
 
 
+def _request_rejections(
+    breaker: CircuitBreaker, failures: Sequence[RowFailure[RowT]]
+) -> list[RowFailure[RowT]]:
+    """Return the failures in the rejection run that opened the circuit, if one did."""
+    if breaker.opened_by is None or not rejects_the_row(breaker.opened_by):
+        return []
+    run = {id(error) for error in breaker.rejection_run}
+    return [failure for failure in failures if id(failure.error) in run]
+
+
 def process_batch(  # noqa: PLR0913
     rows: Iterable[RowT],
     call: Callable[[RowT], ResultT],
@@ -463,7 +494,10 @@ def process_batch(  # noqa: PLR0913
                 len(failed),
             )
     report = BatchReport(
-        succeeded=succeeded, failures=failures, circuit_opened_by=breaker.opened_by
+        succeeded=succeeded,
+        failures=failures,
+        circuit_opened_by=breaker.opened_by,
+        request_rejections=_request_rejections(breaker, failures),
     )
     if report.circuit_opened_by is not None or (failures and not succeeded):
         raise BatchFailed(report.describe(), report) from report.circuit_opened_by
