@@ -34,7 +34,6 @@ from ol_llm.models import build_agent, override_models
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
-from test_complete import REAL_CLIENTS, real_client  # noqa: F401
 
 PRIMARY = "openai:gpt-4o-mini"
 FALLBACK = "bedrock:global.anthropic.claude-haiku-4-5-20251001-v1:0"
@@ -438,12 +437,16 @@ def test_rows_run_concurrently_with_workers() -> None:
     ]
 
 
-@REAL_CLIENTS
-def test_workers_share_complete_sync_through_the_real_model_cache(
-    real_client: UseCase,  # noqa: F811
+@pytest.mark.parametrize("entry_point", ["complete_sync", "run_sync"])
+def test_workers_run_real_clients_on_their_own_event_loops(
+    real_client: UseCase, entry_point: str
 ) -> None:
+    agent = build_agent(real_client)
+
     def summarize(row: str) -> str:
-        return complete_sync(real_client, row).output
+        if entry_point == "complete_sync":
+            return complete_sync(real_client, row).output
+        return run_sync(agent, row).output
 
     persist = Recorder()
 
