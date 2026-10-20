@@ -281,8 +281,11 @@ def build_embedder(
         build=build,
     )
     shorter = None if dimensions is None else EmbeddingSettings(dimensions=dimensions)
+    # False, not None: None would take Embedder.instrument_all()'s setting.
     return Embedder(
-        model, settings=shorter, instrument=instrumentation_settings(use_case)
+        model,
+        settings=shorter,
+        instrument=instrumentation_settings(use_case) or False,
     )
 
 

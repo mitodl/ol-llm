@@ -32,10 +32,12 @@ from ol_llm.embeddings import PolicyEmbeddingModel, build_embedder, shared_embed
 from ol_llm.settings import GatewayRoute
 from ol_llm.testing import override_embedding_models, tracing_disabled
 from ol_llm.tracing import PROJECT_ATTRIBUTE, TracingConfig, configure_tracing
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
-from pydantic_ai.embeddings import EmbeddingResult, EmbeddingSettings
+from pydantic_ai.embeddings import Embedder, EmbeddingResult, EmbeddingSettings
 from pydantic_ai.embeddings.result import EmbedInputType
 from pydantic_ai.embeddings.test import TestEmbeddingModel
 from pydantic_ai.exceptions import (
@@ -43,6 +45,7 @@ from pydantic_ai.exceptions import (
     ModelHTTPError,
     UnexpectedModelBehavior,
 )
+from pydantic_ai.models.instrumented import InstrumentationSettings
 
 MODEL = "openai:text-embedding-3-small"
 
@@ -286,8 +289,23 @@ def test_with_tracing_off_nothing_is_recorded(exported: InMemorySpanExporter) ->
 
     assert traces == []
     with override_embedding_models(TestEmbeddingModel()):
-        assert build_embedder(SEARCH).instrument is None
+        assert build_embedder(SEARCH).instrument is False
     assert exported.get_finished_spans() == ()
+
+
+def test_with_tracing_off_global_instrumentation_records_nothing() -> None:
+    tracing.reset()
+    configure_tracing(TracingConfig(enabled=False))
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    Embedder.instrument_all(InstrumentationSettings(tracer_provider=provider))
+    try:
+        embed_with(TestEmbeddingModel())
+    finally:
+        Embedder.instrument_all(False)  # noqa: FBT003
+
+    assert exporter.get_finished_spans() == ()
 
 
 def test_with_tracing_disabled_at_runtime_nothing_is_recorded(
