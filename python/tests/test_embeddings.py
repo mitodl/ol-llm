@@ -86,6 +86,25 @@ class Short(TestEmbeddingModel):
         return result
 
 
+class Replying(TestEmbeddingModel):
+    """Returns the given vectors in place of the ones it computed."""
+
+    def __init__(self, vectors: list[list[float]]) -> None:
+        super().__init__()
+        self.vectors = vectors
+
+    async def embed(
+        self,
+        inputs: str | Sequence[str],
+        *,
+        input_type: EmbedInputType,
+        settings: EmbeddingSettings | None = None,
+    ) -> EmbeddingResult:
+        result = await super().embed(inputs, input_type=input_type, settings=settings)
+        result.embeddings = self.vectors
+        return result
+
+
 def http_error(status: int) -> ModelHTTPError:
     return ModelHTTPError(status, "text-embedding-3-small", body="provider said no")
 
@@ -407,6 +426,20 @@ def test_a_filtered_response_raises_content_filtered(failure: Exception) -> None
     assert model.calls == 1
     assert caught.value.__cause__ is not None
     assert caught.value.__cause__.__cause__ is failure
+
+
+@pytest.mark.parametrize(
+    "vectors",
+    [[[]], [[0.1, 0.2], [0.3]]],
+    ids=["empty", "ragged"],
+)
+def test_vectors_of_no_or_unequal_length_raise_invalid_output(
+    vectors: list[list[float]],
+) -> None:
+    texts = ["text"] * len(vectors)
+
+    with pytest.raises(LLMInvalidOutput, match="vectors of length"):
+        embed_with(Replying(vectors), texts)
 
 
 @pytest.mark.parametrize("entry", ENTRIES)

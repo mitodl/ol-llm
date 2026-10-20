@@ -89,9 +89,10 @@ class PolicyEmbeddingModel(WrapperEmbeddingModel):
     per text, and one failed text sends them all again.
 
     A response the provider model cannot read, alone or in Titan's group of
-    per-text failures, or one with a vector count that does not match the inputs,
-    raises ``UnexpectedModelBehavior`` and is not retried. A content filter's
-    refusal, alone or in a group, raises ``ContentFilterError`` instead.
+    per-text failures, or one with a vector count that does not match the inputs or
+    vectors of no or unequal length, raises ``UnexpectedModelBehavior`` and is not
+    retried. A content filter's refusal, alone or in a group, raises
+    ``ContentFilterError`` instead.
 
     Calls go to a provider model built for the running event loop, as for
     ``PolicyModel`` (see ``LoopLocal``); ``wrapped`` answers for the model's name
@@ -174,6 +175,13 @@ class PolicyEmbeddingModel(WrapperEmbeddingModel):
                 msg = (
                     f"{self.catalog_id} returned {len(result.embeddings)} vectors "
                     f"for {expected} texts"
+                )
+                raise UnexpectedModelBehavior(msg)
+            lengths = {len(vector) for vector in result.embeddings}
+            if 0 in lengths or len(lengths) > 1:
+                msg = (
+                    f"{self.catalog_id} returned vectors of length "
+                    f"{', '.join(map(str, sorted(lengths)))}"
                 )
                 raise UnexpectedModelBehavior(msg)
             return result
