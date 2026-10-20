@@ -17,6 +17,8 @@ from ol_llm import (
 from ol_llm.models import build_agent, override_models
 from ol_llm.testing import tracing_disabled
 from ol_llm.tracing import PROJECT_ATTRIBUTE, TracingConfig, configure_tracing
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
@@ -26,6 +28,7 @@ from pydantic_ai.capabilities import Instrumentation
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_ai.models.test import TestModel
 
 PRIMARY = "openai:gpt-4o-mini"
@@ -287,6 +290,21 @@ def test_with_tracing_off_agents_are_not_instrumented() -> None:
         c for c in agent.root_capability.capabilities if isinstance(c, Instrumentation)
     ]
     assert run_sync(agent, "hi").output == "ok"
+
+
+def test_with_tracing_off_global_instrumentation_records_nothing() -> None:
+    tracing.reset()
+    configure_tracing(TracingConfig(enabled=False))
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    Agent.instrument_all(InstrumentationSettings(tracer_provider=provider))
+    try:
+        run_sync(agent_for(SUMMARY, replying("ok")), "hi")
+    finally:
+        Agent.instrument_all(False)  # noqa: FBT003
+
+    assert exporter.get_finished_spans() == ()
 
 
 def test_a_run_with_tracing_disabled_records_nothing(

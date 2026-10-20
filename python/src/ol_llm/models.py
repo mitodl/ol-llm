@@ -985,7 +985,7 @@ def agent_over(  # noqa: PLR0913
     """
     use_case = call_site(model)
     _check_output_mode(output_type, model)
-    return Agent(
+    agent: Agent[Any, Any] = Agent(
         model,
         output_type=output_type,
         instructions=instructions,
@@ -1000,6 +1000,10 @@ def agent_over(  # noqa: PLR0913
             *(capabilities or ()),
         ],
     )
+    # None would take Agent.instrument_all()'s setting when tracing is off. With
+    # tracing on, the Instrumentation capability takes precedence over this.
+    agent.instrument = False
+    return agent
 
 
 def shared_model(use_case: UseCase, loop: asyncio.AbstractEventLoop) -> Model:
