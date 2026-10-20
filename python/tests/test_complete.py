@@ -271,7 +271,7 @@ def test_complete_sync_works_from_several_threads(real_client: UseCase) -> None:
     assert outputs == ["ok", "ok"]
 
 
-def test_a_finished_threads_loop_and_model_are_released(real_client: UseCase) -> None:
+def test_a_finished_threads_loop_is_released(real_client: UseCase) -> None:
     loops: list[weakref.ref[asyncio.AbstractEventLoop]] = []
 
     def call() -> None:

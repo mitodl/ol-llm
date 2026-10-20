@@ -7,6 +7,7 @@ from dataclasses import replace
 
 import opik
 import pytest
+from conftest import GEMINI
 from ol_llm import (
     Attribution,
     LLMInvalidOutput,
@@ -460,3 +461,34 @@ def test_a_finished_threads_loop_is_released_by_the_agent(
     gc.collect()
 
     assert loops[0]() is None
+
+
+def test_a_dropped_loops_clients_log_no_errors_on_a_later_loop(
+    real_client: UseCase, caplog: pytest.LogCaptureFixture
+) -> None:
+    agent = build_agent(real_client)
+
+    async def call() -> None:
+        await run(agent, "hi")
+        # Collect the earlier loops' clients while this loop runs, which is when
+        # an SDK client's __del__ schedules its close on the wrong loop.
+        gc.collect()
+
+    for _ in range(5):
+        asyncio.run(call())
+
+    assert [r.getMessage() for r in caplog.records if r.name == "asyncio"] == []
+
+
+@pytest.mark.parametrize("real_client", [(GEMINI,)], indirect=True, ids=["google"])
+def test_run_stream_works_under_successive_event_loops(real_client: UseCase) -> None:
+    agent = build_agent(real_client)
+
+    async def stream() -> str:
+        async with agent.run_stream("hi") as result:
+            output: str = await result.get_output()
+            return output
+
+    outputs = [asyncio.run(stream()) for _ in range(2)]
+
+    assert outputs == ["ok", "ok"]

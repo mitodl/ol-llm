@@ -160,16 +160,27 @@ GEMINI = "google:gemini-3.1-pro-preview"
 
 
 class KeepAliveProvider(BaseHTTPRequestHandler):
-    """Answers OpenAI Responses and Gemini requests over persistent connections."""
+    """Answers OpenAI Responses and Gemini requests over persistent connections.
+
+    Paths under ``/unavailable`` answer 503, so a chain falls back. Gemini's
+    streaming endpoint answers with one server-sent event.
+    """
 
     protocol_version = "HTTP/1.1"
 
     def do_POST(self) -> None:
         self.rfile.read(int(self.headers.get("content-length", 0)))
-        reply = GEMINI_REPLY if "generateContent" in self.path else RESPONSES_REPLY
-        body = json.dumps(reply).encode()
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
+        status, content_type = 200, "application/json"
+        if self.path.startswith("/unavailable"):
+            status, body = 503, b"{}"
+        elif "streamGenerateContent" in self.path:
+            content_type = "text/event-stream"
+            body = f"data: {json.dumps(GEMINI_REPLY)}\r\n\r\n".encode()
+        else:
+            reply = GEMINI_REPLY if "generateContent" in self.path else RESPONSES_REPLY
+            body = json.dumps(reply).encode()
+        self.send_response(status)
+        self.send_header("content-type", content_type)
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -200,9 +211,11 @@ def real_client(
     )
     catalog = Catalog({**load_catalog().entries, GEMINI: gemini})
     monkeypatch.setattr(models, "load_catalog", lambda: catalog)
-    route = GatewayRoute(base_url=f"{url}/v1", api_key="app-key")
-    configure(Settings(environment="ci", gateway_routes={"openai": route}))
     model, *fallbacks = request.param
+    # A chain's primary is unavailable, so every call is answered by a fallback.
+    prefix = "/unavailable" if fallbacks else ""
+    route = GatewayRoute(base_url=f"{url}{prefix}/v1", api_key="app-key")
+    configure(Settings(environment="ci", gateway_routes={"openai": route}))
     yield UseCase(
         app="mit-learn",
         name="summary",

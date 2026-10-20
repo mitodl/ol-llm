@@ -679,12 +679,13 @@ def _raise_missing_extra(extra: str, exc: ImportError) -> NoReturn:
 
 def _openai_provider(route: GatewayRoute | None, use_case: UseCase) -> Provider[Any]:
     try:
-        from openai import AsyncOpenAI  # noqa: PLC0415
+        from openai import AsyncOpenAI, DefaultAsyncHttpxClient  # noqa: PLC0415
         from pydantic_ai.providers.openai import OpenAIProvider  # noqa: PLC0415
     except ImportError as exc:
         _raise_missing_extra("openai", exc)
     client = AsyncOpenAI(
         max_retries=0,
+        http_client=DefaultAsyncHttpxClient(),
         base_url=route.base_url if route else None,
         api_key=route.api_key if route else None,
         default_headers=_gateway_headers(route, use_case),
@@ -694,26 +695,29 @@ def _openai_provider(route: GatewayRoute | None, use_case: UseCase) -> Provider[
 
 def _azure_provider(settings: Settings) -> Provider[Any]:
     try:
-        from openai import AsyncAzureOpenAI  # noqa: PLC0415
+        from openai import AsyncAzureOpenAI, DefaultAsyncHttpxClient  # noqa: PLC0415
         from pydantic_ai.providers.azure import AzureProvider  # noqa: PLC0415
     except ImportError as exc:
         _raise_missing_extra("openai", exc)
     # Endpoint, API version, and key come from AZURE_OPENAI_ENDPOINT,
     # OPENAI_API_VERSION, and AZURE_OPENAI_API_KEY unless a token provider is set.
     client = AsyncAzureOpenAI(
-        max_retries=0, azure_ad_token_provider=settings.azure_ad_token_provider
+        max_retries=0,
+        http_client=DefaultAsyncHttpxClient(),
+        azure_ad_token_provider=settings.azure_ad_token_provider,
     )
     return AzureProvider(openai_client=client)
 
 
 def _anthropic_provider(route: GatewayRoute | None, use_case: UseCase) -> Provider[Any]:
     try:
-        from anthropic import AsyncAnthropic  # noqa: PLC0415
+        from anthropic import AsyncAnthropic, DefaultAsyncHttpxClient  # noqa: PLC0415
         from pydantic_ai.providers.anthropic import AnthropicProvider  # noqa: PLC0415
     except ImportError as exc:
         _raise_missing_extra("anthropic", exc)
     client = AsyncAnthropic(
         max_retries=0,
+        http_client=DefaultAsyncHttpxClient(),
         base_url=route.base_url if route else None,
         api_key=route.api_key if route else None,
         default_headers=_gateway_headers(route, use_case),
@@ -770,13 +774,14 @@ def _mistral_provider() -> Provider[Any]:
 
 def _together_provider() -> Provider[Any]:
     try:
-        from openai import AsyncOpenAI  # noqa: PLC0415
+        from openai import AsyncOpenAI, DefaultAsyncHttpxClient  # noqa: PLC0415
         from pydantic_ai.providers.together import TogetherProvider  # noqa: PLC0415
     except ImportError as exc:
         _raise_missing_extra("openai", exc)
     # AsyncOpenAI reads OPENAI_API_KEY by default; Together's key has its own name.
     client = AsyncOpenAI(
         max_retries=0,
+        http_client=DefaultAsyncHttpxClient(),
         base_url=_TOGETHER_BASE_URL,
         api_key=os.environ["TOGETHER_API_KEY"],
     )
