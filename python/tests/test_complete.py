@@ -1,8 +1,10 @@
 import asyncio
 import gc
 import threading
+import time
 import weakref
 from collections.abc import Callable
+from typing import Any
 
 import opik
 import pytest
@@ -16,6 +18,7 @@ from ol_llm import (
     complete,
     complete_sync,
     configure,
+    models,
     run_sync,
     tracing,
 )
@@ -241,6 +244,38 @@ def test_the_model_is_built_once_per_use_case_and_settings() -> None:
     assert shared_model(SUMMARY) is first
     configure(Settings(environment="qa"))
     assert shared_model(SUMMARY) is not first
+
+
+@pytest.mark.usefixtures("provider_env")
+def test_first_calls_on_several_threads_build_the_model_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: list[object] = []
+    build = models.build_model
+
+    def slow_build(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+        # Long enough that every thread misses an empty cache without the lock.
+        time.sleep(0.05)
+        model = build(*args, **kwargs)
+        built.append(model)
+        return model
+
+    monkeypatch.setattr(models, "build_model", slow_build)
+    start = threading.Barrier(4)
+    found: list[object] = []
+
+    def first_call() -> None:
+        start.wait()
+        found.append(shared_model(SUMMARY))
+
+    threads = [threading.Thread(target=first_call) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    assert len(built) == 1
+    assert found == built * 4
 
 
 def test_an_override_never_reaches_the_shared_model() -> None:

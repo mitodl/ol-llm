@@ -156,7 +156,10 @@ class _LoopModels(threading.local):
 
 
 # The models complete runs on, by use case, with the settings each was built with.
+# The lock keeps two threads' first calls from building a use case twice, which for
+# Bedrock would also create boto3 clients concurrently from the default session.
 _shared_models: dict[UseCase, tuple[Settings, Model]] = {}
+_shared_models_lock = threading.Lock()
 
 # Patched in tests so retries do not wait.
 _sleep: Callable[[float], Any] = asyncio.sleep
@@ -1149,10 +1152,11 @@ def shared_model(use_case: UseCase) -> Model:
     if _model_override.get() is not None:
         return build_model(use_case)
     settings = get_settings()
-    cached = _shared_models.get(use_case)
-    if cached is None or cached[0] is not settings:
-        cached = (settings, build_model(use_case, settings=settings))
-        _shared_models[use_case] = cached
+    with _shared_models_lock:
+        cached = _shared_models.get(use_case)
+        if cached is None or cached[0] is not settings:
+            cached = (settings, build_model(use_case, settings=settings))
+            _shared_models[use_case] = cached
     return cached[1]
 
 
