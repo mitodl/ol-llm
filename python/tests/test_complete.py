@@ -1,6 +1,8 @@
 import asyncio
+import gc
 import json
 import threading
+import weakref
 from collections.abc import Callable, Generator
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -369,6 +371,22 @@ def test_complete_sync_works_from_several_threads(real_client: UseCase) -> None:
 
     assert errors == []
     assert outputs == ["ok", "ok"]
+
+
+@REAL_CLIENTS
+def test_a_finished_threads_loop_and_model_are_released(real_client: UseCase) -> None:
+    loops: list[weakref.ref[asyncio.AbstractEventLoop]] = []
+
+    def call() -> None:
+        complete_sync(real_client, "hi")
+        loops.append(weakref.ref(asyncio.get_event_loop()))
+
+    thread = threading.Thread(target=call)
+    thread.start()
+    thread.join()
+    gc.collect()
+
+    assert loops[0]() is None
 
 
 @REAL_CLIENTS
