@@ -583,11 +583,15 @@ class PolicyFallbackModel(FallbackModel):
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> bool | None:
-        """Exit every member for the running loop, last entered first."""
-        async with AsyncExitStack() as stack:
-            for model in self.models:
-                stack.push_async_exit(model)
-        return None
+        """Exit every member for the running loop, last entered first.
+
+        Each member gets the exception the run is exiting with, and the result says
+        whether a member suppressed it.
+        """
+        stack = AsyncExitStack()
+        for model in self.models:
+            stack.push_async_exit(model)
+        return await stack.__aexit__(exc_type, exc_val, exc_tb)
 
     def _starting_at(self, messages: list[ModelMessage]) -> FallbackModel:
         """Return the chain a request runs on, read from the run's own history."""

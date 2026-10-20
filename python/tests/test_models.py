@@ -1,7 +1,7 @@
 import asyncio
 import pickle
 import threading
-from collections.abc import AsyncIterable, AsyncIterator, Callable
+from collections.abc import AsyncIterable, AsyncIterator, Callable, Coroutine
 from typing import Any, Self
 
 import httpx
@@ -610,18 +610,45 @@ def test_error_copy_keeps_fields() -> None:
 
 
 class RecordingModel(TestModel):
-    """Records the event loop each enter and exit runs on."""
+    """Records the event loop each enter and exit runs on, and what it exits with."""
 
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[tuple[str, asyncio.AbstractEventLoop]] = []
+        self.exited_with: list[BaseException | None] = []
 
     async def __aenter__(self) -> Self:
         self.calls.append(("enter", asyncio.get_running_loop()))
         return self
 
-    async def __aexit__(self, *_args: object) -> None:
+    async def __aexit__(
+        self, _type: object, exc: BaseException | None, _tb: object
+    ) -> None:
         self.calls.append(("exit", asyncio.get_running_loop()))
+        self.exited_with.append(exc)
+
+
+def waited(event: threading.Event) -> None:
+    """Wait for another thread's step, failing rather than hanging if it never comes."""
+    if not event.wait(10):
+        msg = "the other thread never reached its step"
+        raise TimeoutError(msg)
+
+
+def test_the_fallback_members_exit_with_the_runs_exception() -> None:
+    recording = RecordingModel()
+    with override_models(recording):
+        model = build_model(SUMMARY_WITH_FALLBACK)
+    error = RuntimeError("the run failed")
+
+    async def run_failing() -> bool | None:
+        await model.__aenter__()
+        return await model.__aexit__(RuntimeError, error, None)
+
+    suppressed = asyncio.run(run_failing())
+
+    assert recording.exited_with == [error, error]
+    assert not suppressed
 
 
 def test_runs_on_two_threads_each_exit_the_fallback_members_they_entered() -> None:
@@ -633,25 +660,37 @@ def test_runs_on_two_threads_each_exit_the_fallback_members_they_entered() -> No
     async def first() -> None:
         await model.__aenter__()
         first_entered.set()
-        second_entered.wait()
+        waited(second_entered)
         await model.__aexit__(None, None, None)
         first_exited.set()
 
     async def second() -> None:
-        first_entered.wait()
+        waited(first_entered)
         await model.__aenter__()
         second_entered.set()
-        first_exited.wait()
+        waited(first_exited)
         await model.__aexit__(None, None, None)
 
+    errors: list[BaseException] = []
+
+    def target(run: Callable[[], Coroutine[Any, Any, None]]) -> None:
+        try:
+            asyncio.run(run())
+        except BaseException as exc:
+            errors.append(exc)
+            raise
+
     threads = [
-        threading.Thread(target=asyncio.run, args=(run(),)) for run in (first, second)
+        threading.Thread(target=target, args=(run,), daemon=True)
+        for run in (first, second)
     ]
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join(10)
+        thread.join(30)
 
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
     loops = {loop for _, loop in recording.calls}
     assert len(loops) == 2
     for loop in loops:
