@@ -319,3 +319,27 @@ def test_bedrock_stream_gives_up_after_its_retries(
     with pytest.raises(LLMUnavailable):
         asyncio.run(consume(agent))
     assert len(opened) == 3
+
+
+@pytest.mark.usefixtures("provider_env")
+@pytest.mark.parametrize(
+    ("model_id", "shares_client"),
+    [
+        ("openai:gpt-4o-mini", False),
+        ("google:gemini-3.1-pro-preview", False),
+        ("bedrock:us.anthropic.claude-sonnet-5", True),
+    ],
+)
+def test_each_event_loop_gets_its_own_provider(
+    model_id: str, *, shares_client: bool
+) -> None:
+    model = build_model(use_case(model_id))
+    assert isinstance(model, PolicyModel)
+
+    async def loop_model() -> Any:  # noqa: ANN401
+        return model._loop_model()  # noqa: SLF001
+
+    first, second = (asyncio.run(loop_model()) for _ in range(2))
+
+    assert first.provider is not second.provider
+    assert (first.provider.client is second.provider.client) is shares_client

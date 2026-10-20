@@ -1,10 +1,13 @@
+import json
 import os
 import threading
 from collections.abc import Generator
+from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
-from ol_llm import models, tracing
+from ol_llm import GatewayRoute, UseCase, models, tracing
+from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.settings import Settings, configure
 from ol_llm.tracing import TracingConfig, configure_tracing
 from opentelemetry.sdk.trace.export import SpanExporter
@@ -116,3 +119,96 @@ def exported(monkeypatch: pytest.MonkeyPatch) -> Generator[InMemorySpanExporter]
     # Send what the test queued, so a later test's recording does not see it.
     tracing.flush()
     tracing.reset()
+
+
+# A real provider client against a local server that keeps connections alive, so
+# a second call reuses the first call's pooled connection.
+
+RESPONSES_REPLY = {
+    "id": "resp_1",
+    "object": "response",
+    "created_at": 0,
+    "status": "completed",
+    "model": "gpt-4o-mini",
+    "output": [
+        {
+            "type": "message",
+            "id": "msg_1",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "ok", "annotations": []}],
+        }
+    ],
+    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+}
+GEMINI_REPLY = {
+    "candidates": [
+        {
+            "content": {"role": "model", "parts": [{"text": "ok"}]},
+            "finishReason": "STOP",
+        }
+    ],
+    "usageMetadata": {
+        "promptTokenCount": 1,
+        "candidatesTokenCount": 1,
+        "totalTokenCount": 2,
+    },
+}
+PRIMARY = "openai:gpt-4o-mini"
+# Not in the released catalog; the fixture adds it.
+GEMINI = "google:gemini-3.1-pro-preview"
+
+
+class KeepAliveProvider(BaseHTTPRequestHandler):
+    """Answers OpenAI Responses and Gemini requests over persistent connections."""
+
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("content-length", 0)))
+        reply = GEMINI_REPLY if "generateContent" in self.path else RESPONSES_REPLY
+        body = json.dumps(reply).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args: object) -> None:
+        pass
+
+
+@pytest.fixture(
+    params=[(PRIMARY,), (GEMINI,), (PRIMARY, GEMINI)],
+    ids=["openai", "google", "openai-then-google"],
+)
+def real_client(
+    provider_env: None,  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> Generator[UseCase]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), KeepAliveProvider)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", url)
+    gemini = CatalogEntry(
+        id=GEMINI,
+        kind="chat",
+        input_usd_per_mtok=Decimal(1),
+        output_usd_per_mtok=Decimal(1),
+    )
+    catalog = Catalog({**load_catalog().entries, GEMINI: gemini})
+    monkeypatch.setattr(models, "load_catalog", lambda: catalog)
+    route = GatewayRoute(base_url=f"{url}/v1", api_key="app-key")
+    configure(Settings(environment="ci", gateway_routes={"openai": route}))
+    model, *fallbacks = request.param
+    yield UseCase(
+        app="mit-learn",
+        name="summary",
+        profile="request",
+        model=model,
+        fallback_models=tuple(fallbacks),
+    )
+    server.shutdown()
+    server.server_close()

@@ -1,17 +1,13 @@
 import asyncio
 import gc
-import json
 import threading
 import weakref
-from collections.abc import Callable, Generator
-from decimal import Decimal
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections.abc import Callable
 
 import opik
 import pytest
 from ol_llm import (
     Attribution,
-    GatewayRoute,
     LLMInvalidOutput,
     LLMRateLimited,
     PostProcessed,
@@ -20,11 +16,9 @@ from ol_llm import (
     complete,
     complete_sync,
     configure,
-    models,
     run_sync,
     tracing,
 )
-from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.models import build_agent, override_models, shared_model
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
@@ -241,119 +235,23 @@ def test_invalid_structured_output_raises_llm_invalid_output() -> None:
 
 
 @pytest.mark.usefixtures("provider_env")
-def test_the_model_is_built_once_per_loop_use_case_and_settings() -> None:
-    loop, other = asyncio.new_event_loop(), asyncio.new_event_loop()
-    first = shared_model(SUMMARY, loop)
+def test_the_model_is_built_once_per_use_case_and_settings() -> None:
+    first = shared_model(SUMMARY)
 
-    assert shared_model(SUMMARY, loop) is first
-    assert shared_model(SUMMARY, other) is not first
+    assert shared_model(SUMMARY) is first
     configure(Settings(environment="qa"))
-    assert shared_model(SUMMARY, loop) is not first
-    loop.close()
-    other.close()
+    assert shared_model(SUMMARY) is not first
 
 
 def test_an_override_never_reaches_the_shared_model() -> None:
-    loop = asyncio.new_event_loop()
     with override_models(replying("one")):
-        first = shared_model(SUMMARY, loop)
+        first = shared_model(SUMMARY)
     with override_models(replying("two")):
-        second = shared_model(SUMMARY, loop)
-    loop.close()
+        second = shared_model(SUMMARY)
 
     assert first is not second
 
 
-# A real provider client against a local server that keeps connections alive, so
-# a second call reuses the first call's pooled connection.
-
-RESPONSES_REPLY = {
-    "id": "resp_1",
-    "object": "response",
-    "created_at": 0,
-    "status": "completed",
-    "model": "gpt-4o-mini",
-    "output": [
-        {
-            "type": "message",
-            "id": "msg_1",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": "ok", "annotations": []}],
-        }
-    ],
-    "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-}
-GEMINI_REPLY = {
-    "candidates": [
-        {
-            "content": {"role": "model", "parts": [{"text": "ok"}]},
-            "finishReason": "STOP",
-        }
-    ],
-    "usageMetadata": {
-        "promptTokenCount": 1,
-        "candidatesTokenCount": 1,
-        "totalTokenCount": 2,
-    },
-}
-# Not in the released catalog; the fixture adds it.
-GEMINI = "google:gemini-3.1-pro-preview"
-
-
-class KeepAliveProvider(BaseHTTPRequestHandler):
-    """Answers OpenAI Responses and Gemini requests over persistent connections."""
-
-    protocol_version = "HTTP/1.1"
-
-    def do_POST(self) -> None:
-        self.rfile.read(int(self.headers.get("content-length", 0)))
-        reply = GEMINI_REPLY if "generateContent" in self.path else RESPONSES_REPLY
-        body = json.dumps(reply).encode()
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *_args: object) -> None:
-        pass
-
-
-@pytest.fixture
-def real_client(
-    provider_env: None,  # noqa: ARG001
-    monkeypatch: pytest.MonkeyPatch,
-    request: pytest.FixtureRequest,
-) -> Generator[UseCase]:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), KeepAliveProvider)
-    server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    url = f"http://127.0.0.1:{server.server_address[1]}"
-    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", url)
-    gemini = CatalogEntry(
-        id=GEMINI,
-        kind="chat",
-        input_usd_per_mtok=Decimal(1),
-        output_usd_per_mtok=Decimal(1),
-    )
-    catalog = Catalog({**load_catalog().entries, GEMINI: gemini})
-    monkeypatch.setattr(models, "load_catalog", lambda: catalog)
-    route = GatewayRoute(base_url=f"{url}/v1", api_key="app-key")
-    configure(Settings(environment="ci", gateway_routes={"openai": route}))
-    yield UseCase(
-        app="mit-learn", name="summary", profile="request", model=request.param
-    )
-    server.shutdown()
-    server.server_close()
-
-
-REAL_CLIENTS = pytest.mark.parametrize(
-    "real_client", [PRIMARY, GEMINI], indirect=True, ids=["openai", "google"]
-)
-
-
-@REAL_CLIENTS
 def test_complete_sync_works_from_several_threads(real_client: UseCase) -> None:
     outputs: list[str] = []
     errors: list[BaseException] = []
@@ -373,7 +271,6 @@ def test_complete_sync_works_from_several_threads(real_client: UseCase) -> None:
     assert outputs == ["ok", "ok"]
 
 
-@REAL_CLIENTS
 def test_a_finished_threads_loop_and_model_are_released(real_client: UseCase) -> None:
     loops: list[weakref.ref[asyncio.AbstractEventLoop]] = []
 
@@ -389,7 +286,6 @@ def test_a_finished_threads_loop_and_model_are_released(real_client: UseCase) ->
     assert loops[0]() is None
 
 
-@REAL_CLIENTS
 def test_complete_works_under_successive_event_loops(real_client: UseCase) -> None:
     outputs = [asyncio.run(complete(real_client, "hi")).output for _ in range(2)]
 

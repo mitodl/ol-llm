@@ -1,7 +1,8 @@
 import asyncio
 import pickle
+import threading
 from collections.abc import AsyncIterable, AsyncIterator, Callable
-from typing import Any
+from typing import Any, Self
 
 import httpx
 import httpx2
@@ -606,3 +607,53 @@ def test_error_copy_keeps_fields() -> None:
         2.0,
         ("m",),
     )
+
+
+class RecordingModel(TestModel):
+    """Records the event loop each enter and exit runs on."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[str, asyncio.AbstractEventLoop]] = []
+
+    async def __aenter__(self) -> Self:
+        self.calls.append(("enter", asyncio.get_running_loop()))
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        self.calls.append(("exit", asyncio.get_running_loop()))
+
+
+def test_runs_on_two_threads_each_exit_the_fallback_members_they_entered() -> None:
+    recording = RecordingModel()
+    with override_models(recording):
+        model = build_model(SUMMARY_WITH_FALLBACK)
+    first_entered, second_entered, first_exited = (threading.Event() for _ in "123")
+
+    async def first() -> None:
+        await model.__aenter__()
+        first_entered.set()
+        second_entered.wait()
+        await model.__aexit__(None, None, None)
+        first_exited.set()
+
+    async def second() -> None:
+        first_entered.wait()
+        await model.__aenter__()
+        second_entered.set()
+        first_exited.wait()
+        await model.__aexit__(None, None, None)
+
+    threads = [
+        threading.Thread(target=asyncio.run, args=(run(),)) for run in (first, second)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    loops = {loop for _, loop in recording.calls}
+    assert len(loops) == 2
+    for loop in loops:
+        kinds = [kind for kind, on in recording.calls if on is loop]
+        assert kinds == ["enter", "enter", "exit", "exit"]
