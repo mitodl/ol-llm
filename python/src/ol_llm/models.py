@@ -17,7 +17,6 @@ from collections.abc import (
     Awaitable,
     Callable,
     Generator,
-    Hashable,
     Iterable,
     Iterator,
     Mapping,
@@ -92,7 +91,6 @@ log = logging.getLogger(__name__)
 
 OutputT = TypeVar("OutputT")
 _T = TypeVar("_T")
-_K = TypeVar("_K", bound=Hashable)
 _V = TypeVar("_V")
 _NO_DEPS: type[None] = type(None)
 DepsT = TypeVar("DepsT")
@@ -149,58 +147,39 @@ _model_override: ContextVar[Model | Mapping[str, Model] | None] = ContextVar(
 _answers: ContextVar[list[str] | None] = ContextVar("ol_llm_answers", default=None)
 
 
-class PerLoopCache(threading.local, Generic[_K, _V]):
-    """Values built once per event loop and key, kept by the loop's thread.
+class LoopLocal(threading.local, Generic[_V]):
+    """A value built once for each event loop that uses it, kept by the loop's thread.
 
-    For what holds provider clients: those bind to the loop they first run on (see
-    ``shared_model``). A loop runs on one thread, so keeping the values per thread
-    loses nothing, and a worker thread's loop, which ``run_sync`` never closes, is
-    released with the thread instead of living as long as the process.
+    For what holds provider clients, which bind to the loop they first run on: a
+    pooled ``httpx`` connection belongs to that loop's transport, and SDK clients
+    keep asyncio locks and events (a provider's own enter lock among them). Shared
+    across loops, they fail with "bound to a different event loop", or "Event loop
+    is closed" once the first loop is gone, which is what ``run_sync`` from a
+    thread pool and ``asyncio.run`` per task do. A loop runs on one thread, so
+    keeping the values per thread loses nothing, and a worker thread's loop, which
+    ``run_sync`` never closes, is released with the thread.
+
+    :param build: builds the value; called again for each new loop.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, build: Callable[[], _V]) -> None:
         """Start empty; ``threading.local`` runs this again in each new thread."""
-        self._entries: dict[
-            tuple[asyncio.AbstractEventLoop, _K], tuple[Settings, _V]
-        ] = {}
+        self._build = build
+        self._values: dict[asyncio.AbstractEventLoop, _V] = {}
 
-    def get(
-        self,
-        loop: asyncio.AbstractEventLoop,
-        key: _K,
-        settings: Settings,
-        build: Callable[[], _V],
-    ) -> _V:
-        """Return the value for a loop and key, building it on first use.
+    def get(self) -> _V:
+        """Return the running loop's value, dropping the values of closed loops.
 
-        Drops the values of closed loops, and rebuilds a value built under other
-        settings.
-
-        :param loop: the event loop the value will be used on.
-        :param key: what else the value depends on.
-        :param settings: the settings in force.
-        :param build: builds the value under those settings.
         :returns: the value.
         :rtype: _V
+        :raises RuntimeError: if no event loop is running.
         """
-        for stale in [entry for entry in self._entries if entry[0].is_closed()]:
-            del self._entries[stale]
-        cached = self._entries.get((loop, key))
-        if cached is None or cached[0] is not settings:
-            cached = self._entries[loop, key] = (settings, build())
-        return cached[1]
-
-
-class _LoopModels(threading.local):
-    """One ``PolicyModel``'s provider models in one thread, by event loop.
-
-    A loop runs on one thread, so keeping them per thread loses nothing, and a
-    worker thread's loop, which ``run_sync`` never closes, is released with the
-    thread instead of living as long as the model.
-    """
-
-    def __init__(self) -> None:
-        self.models: dict[asyncio.AbstractEventLoop, Model] = {}
+        loop = asyncio.get_running_loop()
+        for closed in [other for other in self._values if other.is_closed()]:
+            del self._values[closed]
+        if (value := self._values.get(loop)) is None:
+            value = self._values[loop] = self._build()
+        return value
 
 
 # The models complete runs on, by use case, with the settings each was built with.
@@ -495,14 +474,9 @@ class PolicyModel(WrapperModel):
     with the provider's exception as ``__cause__``. A stream is retried while it
     opens; a failure after that reaches the caller.
 
-    Requests go to a provider model built for the running event loop. Provider
-    clients bind to the loop they first run on: a pooled ``httpx`` connection
-    belongs to that loop's transport, and SDK clients keep asyncio locks and events
-    (the provider's own enter lock among them). Shared across loops, they fail with
-    "bound to a different event loop", or "Event loop is closed" once the first
-    loop is gone, which is what ``run_sync`` from a thread pool and
-    ``asyncio.run`` per task do. ``wrapped`` answers for the model's name, profile,
-    and settings and never makes a request.
+    Requests go to a provider model built for the running event loop (see
+    ``LoopLocal``). ``wrapped`` answers for the model's name, profile, and settings
+    and never makes a request.
     """
 
     use_case: str
@@ -540,20 +514,13 @@ class PolicyModel(WrapperModel):
         self.catalog_entry = catalog_entry
         self.profile_name = use_case.profile
         self.policy = policy
-        self._build = build
-        self._loop_models = _LoopModels()
+        self._loop_models = None if build is None else LoopLocal(build)
 
     def _loop_model(self) -> Model:
         """Return the provider model for the running event loop."""
-        if self._build is None:
+        if self._loop_models is None:
             return self.wrapped
-        loop = asyncio.get_running_loop()
-        models = self._loop_models.models
-        for closed in [other for other in models if other.is_closed()]:
-            del models[closed]
-        if (model := models.get(loop)) is None:
-            model = models[loop] = self._build()
-        return model
+        return self._loop_models.get()
 
     async def __aenter__(self) -> Self:
         """Enter the running loop's provider model, for its HTTP client lifecycle."""

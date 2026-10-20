@@ -138,50 +138,45 @@ def test_requested_dimensions_reach_the_model() -> None:
     assert model.last_settings == {"dimensions": 256}
 
 
-@pytest.fixture
-def loops() -> Generator[tuple[asyncio.AbstractEventLoop, asyncio.AbstractEventLoop]]:
-    loop, other = asyncio.new_event_loop(), asyncio.new_event_loop()
-    yield loop, other
-    loop.close()
-    other.close()
+@pytest.mark.usefixtures("provider_env")
+def test_the_embedder_is_built_once_per_use_case_and_dimensions() -> None:
+    first = shared_embedder(SEARCH)
+
+    assert shared_embedder(SEARCH) is first
+    assert shared_embedder(SEARCH, 256) is not first
+    assert shared_embedder(SEARCH, 256) is shared_embedder(SEARCH, 256)
 
 
 @pytest.mark.usefixtures("provider_env")
-def test_the_embedder_is_built_once_per_loop_use_case_and_dimensions(
-    loops: tuple[asyncio.AbstractEventLoop, asyncio.AbstractEventLoop],
-) -> None:
-    loop, other = loops
-    first = shared_embedder(SEARCH, loop)
-
-    assert shared_embedder(SEARCH, loop) is first
-    assert shared_embedder(SEARCH, other) is not first
-    assert shared_embedder(SEARCH, loop, 256) is not first
-    assert shared_embedder(SEARCH, loop, 256) is shared_embedder(SEARCH, loop, 256)
-
-
-@pytest.mark.usefixtures("provider_env")
-def test_the_embedder_is_rebuilt_when_the_settings_change(
-    loops: tuple[asyncio.AbstractEventLoop, asyncio.AbstractEventLoop],
-) -> None:
-    loop, _ = loops
-    first = shared_embedder(SEARCH, loop)
+def test_the_embedder_is_rebuilt_when_the_settings_change() -> None:
+    first = shared_embedder(SEARCH)
     configure(Settings(environment="qa"))
 
-    assert shared_embedder(SEARCH, loop) is not first
+    assert shared_embedder(SEARCH) is not first
 
 
 @pytest.mark.usefixtures("provider_env")
-def test_an_override_bypasses_the_cache(
-    loops: tuple[asyncio.AbstractEventLoop, asyncio.AbstractEventLoop],
-) -> None:
-    loop, _ = loops
-    cached = shared_embedder(SEARCH, loop)
+def test_an_override_bypasses_the_cache() -> None:
+    cached = shared_embedder(SEARCH)
 
     with override_embedding_models(TestEmbeddingModel()):
-        inside = shared_embedder(SEARCH, loop)
-        assert shared_embedder(SEARCH, loop) is not inside
+        inside = shared_embedder(SEARCH)
+        assert shared_embedder(SEARCH) is not inside
     assert inside is not cached
-    assert shared_embedder(SEARCH, loop) is cached
+    assert shared_embedder(SEARCH) is cached
+
+
+@pytest.mark.usefixtures("provider_env")
+def test_each_event_loop_gets_its_own_provider_embedding_model() -> None:
+    model = build_embedder(SEARCH).model
+    assert isinstance(model, PolicyEmbeddingModel)
+
+    async def loop_model() -> object:
+        return model._loop_model()  # noqa: SLF001
+
+    first, second = (asyncio.run(loop_model()) for _ in range(2))
+
+    assert first is not second
 
 
 @pytest.mark.parametrize("entry", ENTRIES)
@@ -554,7 +549,7 @@ def test_embed_sync_works_from_several_threads() -> None:
 
 
 @pytest.mark.usefixtures("real_client")
-def test_a_finished_threads_loop_and_embedder_are_released() -> None:
+def test_a_finished_threads_loop_is_released() -> None:
     loops: list[weakref.ref[asyncio.AbstractEventLoop]] = []
 
     def call() -> None:

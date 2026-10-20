@@ -14,12 +14,12 @@ application. Store each vector with ``EmbedResult.model`` and
 another size, are not comparable, so changing either means re-embedding.
 """
 
-import asyncio
 import json
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import partial
 from typing import cast
 
 from pydantic_ai.embeddings import (
@@ -37,7 +37,7 @@ from pydantic_ai.usage import RequestUsage
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution
 from ol_llm.catalog import CatalogEntry
 from ol_llm.models import (
-    PerLoopCache,
+    LoopLocal,
     catalog_entries,
     classify_failure,
     classify_run_failure,
@@ -61,9 +61,9 @@ _model_override: ContextVar[EmbeddingModel | None] = ContextVar(
     "ol_llm_embedding_model_override", default=None
 )
 
-# The embedders embed runs on, by use case and vector length: each build creates
-# provider clients, and calls should reuse them.
-_shared_embedders: PerLoopCache[tuple[UseCase, int | None], Embedder] = PerLoopCache()
+# The embedders embed runs on, by use case and vector length, with the settings each
+# was built with: each build creates provider clients, and calls should reuse them.
+_shared_embedders: dict[tuple[UseCase, int | None], tuple[Settings, Embedder]] = {}
 
 # What a provider embedding model raises on a response it cannot read. Bedrock's
 # Cohere and Nova handlers raise UnexpectedModelBehavior, Titan's indexes the body
@@ -91,6 +91,10 @@ class PolicyEmbeddingModel(WrapperEmbeddingModel):
     A response the provider model cannot read, alone or in Titan's group of
     per-text failures, or one with a vector count that does not match the inputs,
     raises ``UnexpectedModelBehavior`` and is not retried.
+
+    Calls go to a provider model built for the running event loop, as for
+    ``PolicyModel`` (see ``LoopLocal``); ``wrapped`` answers for the model's name
+    and never makes a call.
     """
 
     call_site: UseCase
@@ -98,7 +102,7 @@ class PolicyEmbeddingModel(WrapperEmbeddingModel):
     catalog_entry: CatalogEntry | None
     policy: CallPolicy
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         wrapped: EmbeddingModel,
         *,
@@ -106,6 +110,7 @@ class PolicyEmbeddingModel(WrapperEmbeddingModel):
         model_id: str,
         catalog_entry: CatalogEntry | None,
         policy: CallPolicy,
+        build: Callable[[], EmbeddingModel] | None = None,
     ) -> None:
         """Wrap a provider embedding model.
 
@@ -115,12 +120,29 @@ class PolicyEmbeddingModel(WrapperEmbeddingModel):
         :param catalog_entry: the model's catalog entry, or ``None`` when the
             catalog does not list it.
         :param policy: the resolved policy.
+        :param build: builds the same provider model again, once for each event
+            loop calls run on; ``None`` sends every call to ``wrapped``.
         """
         super().__init__(wrapped)
         self.call_site = use_case
         self.catalog_id = model_id
         self.catalog_entry = catalog_entry
         self.policy = policy
+        self._loop_models = None if build is None else LoopLocal(build)
+
+    def _loop_model(self) -> EmbeddingModel:
+        """Return the provider model for the running event loop."""
+        if self._loop_models is None:
+            return self.wrapped
+        return self._loop_models.get()
+
+    async def max_input_tokens(self) -> int | None:
+        """Ask the running loop's provider model for its input limit."""
+        return await self._loop_model().max_input_tokens()
+
+    async def count_tokens(self, text: str) -> int:
+        """Count tokens with the running loop's provider model."""
+        return await self._loop_model().count_tokens(text)
 
     async def embed(
         self,
@@ -131,10 +153,11 @@ class PolicyEmbeddingModel(WrapperEmbeddingModel):
     ) -> EmbeddingResult:
         """Embed the inputs, retrying transient failures under the policy."""
         expected = 1 if isinstance(inputs, str) else len(inputs)
+        provider = self._loop_model()
 
         async def attempt() -> EmbeddingResult:
             try:
-                result = await self.wrapped.embed(
+                result = await provider.embed(
                     inputs, input_type=input_type, settings=settings
                 )
             except Exception as exc:
@@ -217,15 +240,19 @@ def build_embedder(
         )
         raise ValueError(msg)
     policy = resolve_policy(use_case)
+    # An override's model is the test's own and is not rebuilt per loop.
+    build: Callable[[], EmbeddingModel] | None = None
     if (wrapped := _model_override.get()) is None:
         factory = provider_factory(use_case, policy, settings or get_settings())
-        wrapped = infer_embedding_model(use_case.model, provider_factory=factory)
+        build = partial(infer_embedding_model, use_case.model, provider_factory=factory)
+        wrapped = build()
     model = PolicyEmbeddingModel(
         wrapped,
         use_case=use_case,
         model_id=use_case.model,
         catalog_entry=entry,
         policy=policy,
+        build=build,
     )
     shorter = None if dimensions is None else EmbeddingSettings(dimensions=dimensions)
     return Embedder(
@@ -260,40 +287,16 @@ def _trace_output(result: EmbedResult) -> Mapping[str, object]:
     }
 
 
-def _sync_loop() -> asyncio.AbstractEventLoop:
-    """Return the event loop ``embed_sync`` will use in this thread.
+def shared_embedder(use_case: UseCase, dimensions: int | None = None) -> Embedder:
+    """Return the embedder ``embed`` runs a use case on.
 
-    PydanticAI's sync entry points run on the thread's current loop, and set a new
-    one when there is none or it is closed
-    (``pydantic_graph._utils.get_event_loop``). This does the same first, so the
-    loop it returns is the one the call runs on.
-    """
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = None
-    if loop is None or loop.is_closed():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    return loop
-
-
-def shared_embedder(
-    use_case: UseCase,
-    loop: asyncio.AbstractEventLoop,
-    dimensions: int | None = None,
-) -> Embedder:
-    """Return the embedder ``embed`` runs a use case on in one event loop.
-
-    Provider clients bind to the loop they first run on, as for ``shared_model``,
-    so each loop gets its own embedder, kept by the thread the loop runs on; a
-    closed loop's embedders are dropped, and a thread's go with it.
-    An embedder is rebuilt after ``configure`` replaces the settings. Under
+    Built on the first call for a use case and vector length and reused on every
+    thread and event loop, since ``PolicyEmbeddingModel`` keeps a provider model
+    per loop. An embedder is rebuilt after ``configure`` replaces the settings. Under
     ``override_embedding_models`` every call builds a new one, so an override never
     outlives its block.
 
     :param use_case: the call site.
-    :param loop: the event loop the call will run on.
     :param dimensions: the vector length to ask for, as for ``build_embedder``.
     :returns: the embedder.
     :rtype: Embedder
@@ -302,12 +305,11 @@ def shared_embedder(
     if _model_override.get() is not None:
         return build_embedder(use_case, dimensions=dimensions)
     settings = get_settings()
-    return _shared_embedders.get(
-        loop,
-        (use_case, dimensions),
-        settings,
-        lambda: build_embedder(use_case, dimensions=dimensions, settings=settings),
-    )
+    cached = _shared_embedders.get((use_case, dimensions))
+    if cached is None or cached[0] is not settings:
+        embedder = build_embedder(use_case, dimensions=dimensions, settings=settings)
+        cached = _shared_embedders[use_case, dimensions] = (settings, embedder)
+    return cached[1]
 
 
 def _start(
@@ -315,13 +317,12 @@ def _start(
     texts: str | Sequence[str],
     dimensions: int | None,
     attribution: Attribution,
-    loop: asyncio.AbstractEventLoop,
 ) -> tuple[Embedder, TracedCall, list[str]]:
     listed = [texts] if isinstance(texts, str) else list(texts)
     if not listed:
         msg = "embed needs at least one text"
         raise ValueError(msg)
-    embedder = shared_embedder(use_case, loop, dimensions)
+    embedder = shared_embedder(use_case, dimensions)
     model = cast("PolicyEmbeddingModel", embedder.model)
     call = TracedCall(
         use_case=use_case,
@@ -377,8 +378,7 @@ async def embed(
 ) -> EmbedResult:
     """Embed texts under a traced root.
 
-    The use case's embedder is built on the first call in each event loop and
-    reused after that.
+    The use case's embedder is built on the first call and reused after that.
 
     :param use_case: the call site. Its model may not be retired or listed as a
         chat model, and it may declare no ``fallback_models``.
@@ -400,9 +400,7 @@ async def embed(
     :raises ValueError: if there are no texts, or ``build_embedder`` rejects the
         use case.
     """
-    embedder, call, listed = _start(
-        use_case, texts, dimensions, attribution, asyncio.get_running_loop()
-    )
+    embedder, call, listed = _start(use_case, texts, dimensions, attribution)
     results: list[EmbedResult] = []
 
     async def traced(texts: list[str]) -> Mapping[str, object]:
@@ -438,10 +436,7 @@ def embed_sync(
     :returns: the result.
     :rtype: EmbedResult
     """
-    # The loop PydanticAI's embed_sync will run on, as complete_sync resolves it.
-    embedder, call, listed = _start(
-        use_case, texts, dimensions, attribution, _sync_loop()
-    )
+    embedder, call, listed = _start(use_case, texts, dimensions, attribution)
     results: list[EmbedResult] = []
 
     def traced(texts: list[str]) -> Mapping[str, object]:
