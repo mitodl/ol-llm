@@ -453,12 +453,10 @@ def process_batch(  # noqa: PLR0913
         ``ol_llm.complete_sync``.
     :param persist: writes one chunk, e.g. an upsert keyed on the row.
     :param chunk_size: rows per chunk, so per ``persist`` call.
-    :param max_workers: rows of a chunk called at once, on threads. Use
-        ``complete_sync`` from threads: an agent built once and passed to
-        ``run_sync`` needs ``max_workers=1`` until agents work across event loops.
-        Threads do not inherit the caller's Opik context, so with more than one
-        each row's run is its own root trace rather than a span of the caller's
-        trace.
+    :param max_workers: rows of a chunk called at once, on threads, with
+        ``complete_sync`` or ``run_sync``. Threads do not inherit the caller's
+        Opik context, so with more than one each row's run is its own root trace
+        rather than a span of the caller's trace.
     :param breaker: the circuit breaker; a new ``CircuitBreaker`` when omitted.
     :param logger: where to log chunk progress and row failures, e.g. Dagster's
         ``context.log``; this module's logger when omitted.

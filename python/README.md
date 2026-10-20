@@ -351,11 +351,10 @@ The breaker lives in one task, so each task of a group has its own. A task time 
 policy (3,300 s per model on the batch profile's defaults), or it kills a call that is still
 retrying.
 
-With `max_workers` above 1, rows run on threads, as in the Dagster example, which goes
-through `complete_sync` for that reason. An agent built once and passed to `run_sync` fails
-on a second thread's event loop, so it needs `max_workers=1` until agents work across event
-loops. Threads do not inherit the caller's Opik context, so each row's run is its own root
-trace.
+With `max_workers` above 1, rows run on threads, as in the Dagster example. `complete_sync`
+and `run_sync` over an agent built once both work there, since each thread's event loop gets
+its own provider clients. Threads do not inherit the caller's Opik context, so each row's run
+is its own root trace.
 
 ### Tracing
 
