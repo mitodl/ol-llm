@@ -17,6 +17,7 @@ from collections.abc import (
     Awaitable,
     Callable,
     Generator,
+    Hashable,
     Iterable,
     Iterator,
     Mapping,
@@ -32,7 +33,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial
 from types import TracebackType
-from typing import Any, NoReturn, Self, TypeVar, cast, overload
+from typing import Any, Generic, NoReturn, Self, TypeVar, cast, overload
 
 import anyio
 import httpx
@@ -91,6 +92,8 @@ log = logging.getLogger(__name__)
 
 OutputT = TypeVar("OutputT")
 _T = TypeVar("_T")
+_K = TypeVar("_K", bound=Hashable)
+_V = TypeVar("_V")
 _NO_DEPS: type[None] = type(None)
 DepsT = TypeVar("DepsT")
 
@@ -144,6 +147,48 @@ _model_override: ContextVar[Model | Mapping[str, Model] | None] = ContextVar(
 # Where recording_answers collects model ids. A list, not a value: the run's
 # tasks get a copy of the context, and an append is what reaches the caller.
 _answers: ContextVar[list[str] | None] = ContextVar("ol_llm_answers", default=None)
+
+
+class PerLoopCache(threading.local, Generic[_K, _V]):
+    """Values built once per event loop and key, kept by the loop's thread.
+
+    For what holds provider clients: those bind to the loop they first run on (see
+    ``shared_model``). A loop runs on one thread, so keeping the values per thread
+    loses nothing, and a worker thread's loop, which ``run_sync`` never closes, is
+    released with the thread instead of living as long as the process.
+    """
+
+    def __init__(self) -> None:
+        """Start empty; ``threading.local`` runs this again in each new thread."""
+        self._entries: dict[
+            tuple[asyncio.AbstractEventLoop, _K], tuple[Settings, _V]
+        ] = {}
+
+    def get(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        key: _K,
+        settings: Settings,
+        build: Callable[[], _V],
+    ) -> _V:
+        """Return the value for a loop and key, building it on first use.
+
+        Drops the values of closed loops, and rebuilds a value built under other
+        settings.
+
+        :param loop: the event loop the value will be used on.
+        :param key: what else the value depends on.
+        :param settings: the settings in force.
+        :param build: builds the value under those settings.
+        :returns: the value.
+        :rtype: _V
+        """
+        for stale in [entry for entry in self._entries if entry[0].is_closed()]:
+            del self._entries[stale]
+        cached = self._entries.get((loop, key))
+        if cached is None or cached[0] is not settings:
+            cached = self._entries[loop, key] = (settings, build())
+        return cached[1]
 
 
 class _LoopModels(threading.local):

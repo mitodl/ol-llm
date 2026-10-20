@@ -1,6 +1,8 @@
 import asyncio
+import gc
 import json
 import threading
+import weakref
 from collections.abc import Callable, Generator, Sequence
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -549,6 +551,22 @@ def test_embed_sync_works_from_several_threads() -> None:
 
     assert errors == []
     assert dimensions == [3, 3]
+
+
+@pytest.mark.usefixtures("real_client")
+def test_a_finished_threads_loop_and_embedder_are_released() -> None:
+    loops: list[weakref.ref[asyncio.AbstractEventLoop]] = []
+
+    def call() -> None:
+        embed_sync(SEARCH, ["hi"], input_type="query")
+        loops.append(weakref.ref(asyncio.get_event_loop()))
+
+    thread = threading.Thread(target=call)
+    thread.start()
+    thread.join()
+    gc.collect()
+
+    assert loops[0]() is None
 
 
 @pytest.mark.usefixtures("real_client")

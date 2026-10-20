@@ -16,7 +16,6 @@ another size, are not comparable, so changing either means re-embedding.
 
 import asyncio
 import json
-import threading
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -38,6 +37,7 @@ from pydantic_ai.usage import RequestUsage
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution
 from ol_llm.catalog import CatalogEntry
 from ol_llm.models import (
+    PerLoopCache,
     catalog_entries,
     classify_failure,
     classify_run_failure,
@@ -61,12 +61,9 @@ _model_override: ContextVar[EmbeddingModel | None] = ContextVar(
     "ol_llm_embedding_model_override", default=None
 )
 
-# The embedders embed runs on, one per event loop, use case, and vector length:
-# each build creates provider clients, and calls should reuse them.
-_shared_lock = threading.Lock()
-_shared_embedders: dict[
-    tuple[asyncio.AbstractEventLoop, UseCase, int | None], tuple[Settings, Embedder]
-] = {}
+# The embedders embed runs on, by use case and vector length: each build creates
+# provider clients, and calls should reuse them.
+_shared_embedders: PerLoopCache[tuple[UseCase, int | None], Embedder] = PerLoopCache()
 
 # What a provider embedding model raises on a response it cannot read. Bedrock's
 # Cohere and Nova handlers raise UnexpectedModelBehavior, Titan's indexes the body
@@ -289,7 +286,8 @@ def shared_embedder(
     """Return the embedder ``embed`` runs a use case on in one event loop.
 
     Provider clients bind to the loop they first run on, as for ``shared_model``,
-    so each loop gets its own embedder, and a closed loop's embedders are dropped.
+    so each loop gets its own embedder, kept by the thread the loop runs on; a
+    closed loop's embedders are dropped, and a thread's go with it.
     An embedder is rebuilt after ``configure`` replaces the settings. Under
     ``override_embedding_models`` every call builds a new one, so an override never
     outlives its block.
@@ -304,17 +302,12 @@ def shared_embedder(
     if _model_override.get() is not None:
         return build_embedder(use_case, dimensions=dimensions)
     settings = get_settings()
-    key = (loop, use_case, dimensions)
-    with _shared_lock:
-        for stale in [k for k in _shared_embedders if k[0].is_closed()]:
-            del _shared_embedders[stale]
-        cached = _shared_embedders.get(key)
-        if cached is None or cached[0] is not settings:
-            embedder = build_embedder(
-                use_case, dimensions=dimensions, settings=settings
-            )
-            cached = _shared_embedders[key] = (settings, embedder)
-        return cached[1]
+    return _shared_embedders.get(
+        loop,
+        (use_case, dimensions),
+        settings,
+        lambda: build_embedder(use_case, dimensions=dimensions, settings=settings),
+    )
 
 
 def _start(
