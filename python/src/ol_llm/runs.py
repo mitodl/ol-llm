@@ -473,8 +473,11 @@ async def run_stream(  # noqa: PLR0913
     For the request profile. Takes the same arguments as ``run``. The root trace
     stays current until the ``async with`` block ends, so the model spans land in
     it. A failure before the first chunk is retried and falls back as in ``run``
-    and raises on entry; a failure after it reaches the caller. When the block
-    ends with the stream read, the result is built if ``result`` was not called.
+    and raises on entry; a failure after it reaches the caller. Invalid output is
+    not retried: PydanticAI's ``run_stream`` keeps the first output that matches
+    the output type, so the use case's ``output_retries`` do not apply and the
+    caller gets ``LLMInvalidOutput``. When the block ends with the stream read, the
+    result is built if ``result`` was not called.
 
     :returns: the stream.
     :rtype: AbstractAsyncContextManager[LLMStream]

@@ -61,7 +61,9 @@ reaches the caller as `LLMUnavailable`.
 
 Invalid output is retried on the model that produced it, `output_retries` times (default 1).
 The retry falls back only if that model is rate limited or unavailable, and then only to the
-models after it in the chain.
+models after it in the chain. A streamed run (`run_stream`) is the exception: it keeps the
+first output that matches the output type, so invalid output raises `LLMInvalidOutput` with
+no retry, after the caller may already have read part of it.
 
 ## Fallback
 

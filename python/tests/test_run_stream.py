@@ -6,6 +6,7 @@ import opik
 import pytest
 from ol_llm import (
     Attribution,
+    LLMInvalidOutput,
     LLMRejected,
     LLMResult,
     LLMUnavailable,
@@ -166,6 +167,36 @@ def test_stream_output_yields_the_structured_output() -> None:
 
     assert outputs[-1] == Summary(text="short")
     assert result.output == Summary(text="short")
+
+
+def test_invalid_output_is_not_retried_and_raises_invalid_output() -> None:
+    # PydanticAI's run_stream keeps the first output that matches the output type,
+    # so the use case's output_retries do not apply (spec §6.6).
+    calls = 0
+
+    async def stream(
+        _m: list[ModelMessage], info: AgentInfo
+    ) -> AsyncIterator[dict[int, DeltaToolCall]]:
+        nonlocal calls
+        calls += 1
+        name = info.output_tools[0].name
+        yield {0: DeltaToolCall(name=name, json_args='{"title": "no text"}')}
+
+    agent = agent_for(
+        SUMMARY, FunctionModel(stream_function=stream), output_type=Summary
+    )
+
+    async def consume() -> None:
+        async with run_stream(agent, "summarize") as llm_stream:
+            await llm_stream.result()
+
+    assert SUMMARY.output_retries == 1
+    with pytest.raises(LLMInvalidOutput) as caught:
+        asyncio.run(consume())
+
+    assert calls == 1
+    assert caught.value.model == PRIMARY
+    assert isinstance(caught.value.__cause__, UnexpectedModelBehavior)
 
 
 def test_the_root_trace_matches_runs(exported: InMemorySpanExporter) -> None:
