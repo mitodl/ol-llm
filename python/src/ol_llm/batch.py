@@ -231,7 +231,7 @@ class CircuitBreaker:
     def record_success(self) -> None:
         """Count a row that succeeded."""
         self._consecutive = 0
-        self._rejection_run.clear()
+        self._end_rejection_run()
 
     def record_failure(self, error: LLMError) -> None:
         """Count a row that failed, and open the circuit if it should.
@@ -251,6 +251,12 @@ class CircuitBreaker:
             self._open(error)
         else:
             self._consecutive = 0
+            self._end_rejection_run()
+
+    def _end_rejection_run(self) -> None:
+        # Once the circuit is open, a row still in flight on another worker that
+        # then succeeds does not make the run's rejections the rows' fault.
+        if not self.is_open:
             self._rejection_run.clear()
 
     def _open(self, error: LLMError) -> None:

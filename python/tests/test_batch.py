@@ -264,6 +264,26 @@ def test_a_row_rejection_resets_the_transient_failure_count() -> None:
     assert not breaker.is_open
 
 
+@pytest.mark.parametrize("trailing", ["success", "invalid"])
+def test_rows_finishing_after_rejections_open_the_circuit_keep_their_run(
+    trailing: str,
+) -> None:
+    # Rows still in flight on other workers finish after the circuit opens.
+    breaker = CircuitBreaker(max_consecutive_rejections=2)
+    run = [row_rejected(), row_rejected()]
+    for error in run:
+        breaker.record_failure(error)
+
+    if trailing == "success":
+        breaker.record_success()
+    else:
+        breaker.record_failure(invalid())
+    late = row_rejected()
+    breaker.record_failure(late)
+
+    assert breaker.rejection_run == (*run, late)
+
+
 def test_transient_failures_open_the_circuit_at_the_threshold() -> None:
     breaker = CircuitBreaker(max_consecutive_failures=2)
     first = unavailable()
