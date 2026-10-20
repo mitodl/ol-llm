@@ -209,11 +209,13 @@ and `qa` once per instance before promoting to them.
 `chunk_size` rows to `persist` as soon as they finish, so a crash loses one chunk at most.
 A row whose call raises an `LLMError` goes in the failure ledger (`chunk.failed`) instead of
 failing its chunk. Each `RowFailure` says whether the next run should try the row again:
-rate limits, outages, and rejections yes; invalid output, a content filter, or an exceeded
-usage limit no, because the same prompt and model would fail the same way. A
-`CircuitBreaker` stops the batch after the chunk in which an `LLMRejected` arrives (our bug
-or configuration, which every later row would repeat) or three rate-limited or unavailable
-rows in a row. The batch then raises `BatchFailed` with sample errors, as it does when
+rate limits, outages, and rejections of the account or model yes; invalid output, a content
+filter, an exceeded usage limit, or a rejection of the row's input (a 400, 413, or 422) no,
+because the same prompt and model would fail the same way. A `CircuitBreaker` stops the
+batch after the chunk in which any other `LLMRejected` arrives (a 401, 403, 404, or a
+transport error: our bug or configuration, which every later row would repeat), ten rows in
+a row rejected for their input (a request every row gets rejected for), or three
+rate-limited or unavailable rows in a row. The batch then raises `BatchFailed` with sample errors, as it does when
 every attempted row failed, which would otherwise look like a run with nothing to do.
 Anything else a call raises is a bug and stops the batch unpersisted.
 

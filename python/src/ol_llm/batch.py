@@ -41,10 +41,15 @@ DEFAULT_CHUNK_SIZE = 200
 # Each of these failures has already spent the batch profile's retries, up to
 # 3,300 s at the defaults, so a short run of them is an outage, not bad luck.
 DEFAULT_MAX_CONSECUTIVE_FAILURES = 3
+# A row rejection costs one attempt and no tokens, so the threshold can be loose;
+# it is there for a request every row would get rejected for.
+DEFAULT_MAX_CONSECUTIVE_REJECTIONS = 10
 SAMPLE_ERROR_COUNT = 3
 
-# Failures that say nothing about the row, so the same key may succeed next run.
-_NOT_THE_ROW = (LLMRateLimited, LLMUnavailable, LLMRejected)
+# Statuses that reject one row's input (too long, malformed, filtered on the way in)
+# rather than the account, the model, or the request every row makes.
+ROW_REJECTION_STATUSES = frozenset({400, 413, 422})
+
 _COUNTED = (LLMRateLimited, LLMUnavailable)
 
 _logger = logging.getLogger(__name__)
@@ -130,6 +135,19 @@ class BatchKeys:
         )
 
 
+def rejects_the_row(error: LLMError) -> bool:
+    """Whether a rejection is about one row's input rather than the whole batch.
+
+    :param error: what the row's call raised.
+    :returns: ``True`` for an ``LLMRejected`` with a status in
+        ``ROW_REJECTION_STATUSES``.
+    :rtype: bool
+    """
+    return (
+        isinstance(error, LLMRejected) and error.status_code in ROW_REJECTION_STATUSES
+    )
+
+
 @dataclass(frozen=True)
 class RowFailure(Generic[RowT]):
     """One entry in the failure ledger.
@@ -145,39 +163,55 @@ class RowFailure(Generic[RowT]):
     def retry_next_run(self) -> bool:
         """Whether the next run should try the row again under the same key.
 
-        A rate limit, an outage, or a rejection says nothing about the row: the
-        next run, or the one after the configuration is fixed, can succeed. Invalid
-        output, a content filter, or an exceeded usage limit comes from the row's
-        input under this prompt and model, so the same key would fail the same way;
-        a prompt or model change makes a new key.
+        A rate limit, an outage, or a rejection of the account or the model says
+        nothing about the row: the next run, or the one after the configuration is
+        fixed, can succeed. Invalid output, a content filter, an exceeded usage
+        limit, or a rejection of the row's input (``rejects_the_row``) comes from
+        the input under this prompt and model, so the same key would fail the same
+        way; a prompt or model change makes a new key.
         """
-        return isinstance(self.error, _NOT_THE_ROW)
+        if isinstance(self.error, LLMRejected):
+            return not rejects_the_row(self.error)
+        return isinstance(self.error, _COUNTED)
 
 
 @dataclass
 class CircuitBreaker:
     """Stops a batch on failures the remaining rows would repeat (spec §6.7).
 
-    ``LLMRejected`` opens it at once, because a rejection is our bug or our
-    configuration and every later row would spend budget on it too.
-    ``LLMRateLimited`` and ``LLMUnavailable`` open it after
-    ``max_consecutive_failures`` in a row. Any other failure belongs to its row, and
-    like a success it shows the provider is answering, so it resets the count.
+    An ``LLMRejected`` of the account or the model (a 401, 403, 404, or a transport
+    error) opens it at once, because it is our bug or our configuration and every
+    later row would hit it too. A rejection of one row's input (a 400, 413, or 422;
+    see ``rejects_the_row``) fails that row only, unless
+    ``max_consecutive_rejections`` come in a row, which means the request itself is
+    wrong (e.g. a parameter the model no longer takes). ``LLMRateLimited`` and
+    ``LLMUnavailable`` open it after ``max_consecutive_failures`` in a row.
+
+    A success resets both counts. A row's own failure (invalid output, a content
+    filter, an exceeded usage limit) shows the provider is answering and accepted
+    the request, so it resets both too. A rate limit or an outage says nothing about
+    whether the request is valid and leaves the rejection count alone; a row
+    rejection is an answer and resets the failure count.
 
     :param max_consecutive_failures: rate-limited or unavailable rows in a row that
         open the circuit.
-    :raises ValueError: if ``max_consecutive_failures`` is less than 1.
+    :param max_consecutive_rejections: rows rejected for their input in a row that
+        open the circuit.
+    :raises ValueError: if either threshold is less than 1.
     """
 
     max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES
+    max_consecutive_rejections: int = DEFAULT_MAX_CONSECUTIVE_REJECTIONS
     opened_by: LLMError | None = field(default=None, init=False)
     _consecutive: int = field(default=0, init=False, repr=False)
+    _rejections: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         """Refuse a threshold that could never be reached or is always reached."""
-        if self.max_consecutive_failures < 1:
-            msg = "CircuitBreaker.max_consecutive_failures must be at least 1"
-            raise ValueError(msg)
+        for name in ("max_consecutive_failures", "max_consecutive_rejections"):
+            if getattr(self, name) < 1:
+                msg = f"CircuitBreaker.{name} must be at least 1"
+                raise ValueError(msg)
 
     @property
     def is_open(self) -> bool:
@@ -187,6 +221,7 @@ class CircuitBreaker:
     def record_success(self) -> None:
         """Count a row that succeeded."""
         self._consecutive = 0
+        self._rejections = 0
 
     def record_failure(self, error: LLMError) -> None:
         """Count a row that failed, and open the circuit if it should.
@@ -197,10 +232,16 @@ class CircuitBreaker:
             self._consecutive += 1
             if self._consecutive >= self.max_consecutive_failures:
                 self._open(error)
+        elif rejects_the_row(error):
+            self._consecutive = 0
+            self._rejections += 1
+            if self._rejections >= self.max_consecutive_rejections:
+                self._open(error)
         elif isinstance(error, LLMRejected):
             self._open(error)
         else:
             self._consecutive = 0
+            self._rejections = 0
 
     def _open(self, error: LLMError) -> None:
         # The first error is the cause; rows still in flight may fail after it.

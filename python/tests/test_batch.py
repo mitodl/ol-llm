@@ -50,8 +50,12 @@ PROMPT = ManagedPrompt(name="feedback-summary", template=TEMPLATE, source="opik"
 KEYS = BatchKeys(model=PRIMARY, prompt=PROMPT)
 
 
-def rejected() -> LLMRejected:
-    return LLMRejected("bad key", use_case="s", model=PRIMARY, status_code=401)
+def rejected(status_code: int | None = 401) -> LLMRejected:
+    return LLMRejected("bad key", use_case="s", model=PRIMARY, status_code=status_code)
+
+
+def row_rejected() -> LLMRejected:
+    return rejected(400)
 
 
 def unavailable() -> LLMUnavailable:
@@ -190,6 +194,11 @@ def test_provenance_names_the_model_that_answered(
         (LLMRateLimited("429", use_case="s", model=PRIMARY, retry_after=None), True),
         (unavailable(), True),
         (rejected(), True),
+        (rejected(None), True),
+        (rejected(404), True),
+        (rejected(400), False),
+        (rejected(413), False),
+        (rejected(422), False),
         (invalid(), False),
         (LLMContentFiltered("filtered", use_case="s", model=PRIMARY), False),
         (LLMBudgetExceeded("limit", use_case="s", model=PRIMARY), False),
@@ -202,12 +211,58 @@ def test_failures_about_the_row_are_not_retried_next_run(
     assert RowFailure("row", error).retry_next_run is retry
 
 
-def test_a_rejection_opens_the_circuit_at_once() -> None:
+@pytest.mark.parametrize("status_code", [401, 403, 404, 501, None])
+def test_a_rejection_of_the_account_or_model_opens_the_circuit_at_once(
+    status_code: int | None,
+) -> None:
     breaker = CircuitBreaker()
 
-    breaker.record_failure(rejected())
+    breaker.record_failure(rejected(status_code))
 
     assert breaker.is_open
+
+
+def test_row_rejections_open_the_circuit_only_at_their_threshold() -> None:
+    breaker = CircuitBreaker(max_consecutive_rejections=3)
+
+    breaker.record_failure(row_rejected())
+    breaker.record_failure(row_rejected())
+    assert not breaker.is_open
+    breaker.record_failure(row_rejected())
+
+    assert breaker.is_open
+
+
+def test_an_accepted_request_resets_the_rejection_count() -> None:
+    breaker = CircuitBreaker(max_consecutive_rejections=2)
+
+    breaker.record_failure(row_rejected())
+    breaker.record_success()
+    breaker.record_failure(row_rejected())
+    breaker.record_failure(invalid())
+    breaker.record_failure(row_rejected())
+
+    assert not breaker.is_open
+
+
+def test_an_outage_between_row_rejections_does_not_reset_their_count() -> None:
+    breaker = CircuitBreaker(max_consecutive_rejections=2)
+
+    breaker.record_failure(row_rejected())
+    breaker.record_failure(unavailable())
+    breaker.record_failure(row_rejected())
+
+    assert breaker.is_open
+
+
+def test_a_row_rejection_resets_the_transient_failure_count() -> None:
+    breaker = CircuitBreaker(max_consecutive_failures=2)
+
+    breaker.record_failure(unavailable())
+    breaker.record_failure(row_rejected())
+    breaker.record_failure(unavailable())
+
+    assert not breaker.is_open
 
 
 def test_transient_failures_open_the_circuit_at_the_threshold() -> None:
@@ -243,9 +298,12 @@ def test_the_first_error_to_open_the_circuit_is_kept() -> None:
     assert breaker.opened_by is first
 
 
-def test_a_threshold_below_one_is_refused() -> None:
-    with pytest.raises(ValueError, match="at least 1"):
-        CircuitBreaker(max_consecutive_failures=0)
+@pytest.mark.parametrize(
+    "threshold", ["max_consecutive_failures", "max_consecutive_rejections"]
+)
+def test_a_threshold_below_one_is_refused(threshold: str) -> None:
+    with pytest.raises(ValueError, match=f"{threshold} must be at least 1"):
+        CircuitBreaker(**{threshold: 0})
 
 
 def test_each_chunk_is_persisted_with_its_failures() -> None:
@@ -265,6 +323,20 @@ def test_each_chunk_is_persisted_with_its_failures() -> None:
     assert report.succeeded == 4
     assert report.failures == [RowFailure("c", error)]
     assert report.attempted == 5
+    assert report.circuit_opened_by is None
+
+
+def test_a_row_rejected_for_its_input_does_not_stop_the_batch() -> None:
+    error = row_rejected()
+    called, call = failing_on({"b": error})
+    persist = Recorder()
+
+    report = process_batch(list("abcd"), call, persist, chunk_size=2)
+
+    assert called == list("abcd")
+    assert report.succeeded == 3
+    assert report.failures == [RowFailure("b", error)]
+    assert not report.failures[0].retry_next_run
     assert report.circuit_opened_by is None
 
 
