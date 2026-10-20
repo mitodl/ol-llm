@@ -550,6 +550,41 @@ def test_an_embedded_prompt_marks_the_result_and_the_trace() -> None:
     assert "opik_prompts" not in trace.metadata
 
 
+@pytest.mark.parametrize("source", ["opik", "embedded"])
+def test_a_nested_run_names_its_prompt_on_the_callers_trace(
+    prompt_library: PromptLibrary, source: str
+) -> None:
+    prompt_library.add("summary", "Summarize.", environments=("production",))
+    prompt = (
+        get_prompt(
+            "summary",
+            project_name="mit-learn",
+            default=TextTemplate(template="Summarize."),
+            environment="production",
+        )
+        if source == "opik"
+        else ManagedPrompt(
+            name="summary",
+            template=TextTemplate(template="Summarize.", version="v1"),
+            source="embedded",
+        )
+    )
+    agent = agent_for(SUMMARY, replying("ok"), instructions=prompt.format())
+
+    @opik.track(project_name="mit-learn")
+    def handler() -> None:
+        run_sync(agent, "hi", prompt=prompt)
+
+    with opik.record_traces_locally() as storage:
+        handler()
+        [trace] = storage.trace_trees
+
+    assert trace.name == "handler"
+    assert trace.metadata is not None
+    assert trace.metadata["prompt_name"] == "summary"
+    assert trace.metadata["prompt_version"] == "v1"
+
+
 def test_without_a_prompt_the_result_names_none() -> None:
     result = run_sync(agent_for(SUMMARY, replying("ok")), "hi")
 

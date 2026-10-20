@@ -168,13 +168,18 @@ class _Run(Generic[OutputT]):
     def agent_arguments(self) -> dict[str, Any]:
         """Return what every run passes the agent, and mark the trace.
 
-        For a run the library opened the tags are already on the trace; for one
-        inside a caller's trace this adds them there. A caller's trace that already
-        has a thread keeps it.
+        For a run the library opened the tags and prompt are already on the trace;
+        for one inside a caller's trace, whose own metadata lands on its span, this
+        adds them there. A caller's trace that already has a thread keeps it.
         """
         if (trace := self._current_trace()) is not None:
             opik_context.update_current_trace(
                 tags=list(self.fields.tags),
+                metadata={
+                    key: self.fields.metadata[key]
+                    for key in ("prompt_name", "prompt_version")
+                    if key in self.fields.metadata
+                },
                 thread_id=None if trace.thread_id else self.attribution.thread_id,
             )
             if self.prompt is not None:
