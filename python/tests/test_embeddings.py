@@ -2,6 +2,7 @@ import asyncio
 import gc
 import json
 import threading
+import time
 import weakref
 from collections.abc import Callable, Generator, Sequence
 from decimal import Decimal
@@ -24,6 +25,7 @@ from ol_llm import (
     configure,
     embed,
     embed_sync,
+    embeddings,
     models,
     tracing,
 )
@@ -172,6 +174,38 @@ def test_the_embedder_is_built_once_per_use_case_and_dimensions() -> None:
     assert shared_embedder(SEARCH) is first
     assert shared_embedder(SEARCH, 256) is not first
     assert shared_embedder(SEARCH, 256) is shared_embedder(SEARCH, 256)
+
+
+@pytest.mark.usefixtures("provider_env")
+def test_first_calls_on_several_threads_build_the_embedder_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: list[object] = []
+    build = embeddings.build_embedder
+
+    def slow_build(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+        # Long enough that every thread misses an empty cache without the lock.
+        time.sleep(0.05)
+        embedder = build(*args, **kwargs)
+        built.append(embedder)
+        return embedder
+
+    monkeypatch.setattr(embeddings, "build_embedder", slow_build)
+    start = threading.Barrier(4)
+    found: list[object] = []
+
+    def first_call() -> None:
+        start.wait()
+        found.append(shared_embedder(SEARCH))
+
+    threads = [threading.Thread(target=first_call) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    assert len(built) == 1
+    assert found == built * 4
 
 
 @pytest.mark.usefixtures("provider_env")

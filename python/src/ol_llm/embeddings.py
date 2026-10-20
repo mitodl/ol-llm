@@ -15,6 +15,7 @@ another size, are not comparable, so changing either means re-embedding.
 """
 
 import json
+import threading
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -63,7 +64,10 @@ _model_override: ContextVar[EmbeddingModel | None] = ContextVar(
 
 # The embedders embed runs on, by use case and vector length, with the settings each
 # was built with: each build creates provider clients, and calls should reuse them.
+# The lock keeps two threads' first calls from building one twice, as for
+# ol_llm.models.shared_model.
 _shared_embedders: dict[tuple[UseCase, int | None], tuple[Settings, Embedder]] = {}
+_shared_embedders_lock = threading.Lock()
 
 # What a provider embedding model raises on a response it cannot read. Bedrock's
 # Cohere and Nova handlers raise UnexpectedModelBehavior, Titan's indexes the body
@@ -334,10 +338,13 @@ def shared_embedder(use_case: UseCase, dimensions: int | None = None) -> Embedde
     if _model_override.get() is not None:
         return build_embedder(use_case, dimensions=dimensions)
     settings = get_settings()
-    cached = _shared_embedders.get((use_case, dimensions))
-    if cached is None or cached[0] is not settings:
-        embedder = build_embedder(use_case, dimensions=dimensions, settings=settings)
-        cached = _shared_embedders[use_case, dimensions] = (settings, embedder)
+    with _shared_embedders_lock:
+        cached = _shared_embedders.get((use_case, dimensions))
+        if cached is None or cached[0] is not settings:
+            embedder = build_embedder(
+                use_case, dimensions=dimensions, settings=settings
+            )
+            cached = _shared_embedders[use_case, dimensions] = (settings, embedder)
     return cached[1]
 
 
