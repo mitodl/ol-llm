@@ -516,6 +516,25 @@ def test_build_embedder_refuses_fallback_models() -> None:
         build_embedder(with_fallback)
 
 
+def test_build_embedder_refuses_a_route_that_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    routed = CatalogEntry(
+        id="openai:text-embedding-3-large",
+        kind="embedding",
+        dimensions=3072,
+        route="gateway",
+        route_falls_back=True,
+        input_usd_per_mtok=Decimal("0.13"),
+        output_usd_per_mtok=Decimal(0),
+    )
+    catalog = Catalog({**load_catalog().entries, routed.id: routed})
+    monkeypatch.setattr(models, "load_catalog", lambda: catalog)
+
+    with pytest.raises(ValueError, match="route falls back"):
+        build_embedder(UseCase(app="a", name="b", profile="batch", model=routed.id))
+
+
 def test_build_embedder_refuses_a_provider_it_does_not_build(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

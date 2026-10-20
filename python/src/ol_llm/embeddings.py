@@ -241,9 +241,10 @@ def build_embedder(
     :param settings: overrides the configured settings, mainly for tests.
     :returns: the embedder.
     :rtype: Embedder
-    :raises ValueError: if the use case declares fallbacks, its model is retired
-        or listed as a chat model, the library does not build
-        embeddings for its provider, or an environment policy value does not parse.
+    :raises ValueError: if the use case declares fallbacks, its model is retired,
+        listed as a chat model, or on a gateway route that falls back, the library
+        does not build embeddings for its provider, or an environment policy value
+        does not parse.
     """
     if use_case.fallback_models:
         msg = (
@@ -252,6 +253,12 @@ def build_embedder(
         )
         raise ValueError(msg)
     [entry] = catalog_entries(use_case, kind="embedding")
+    if entry is not None and entry.route_falls_back:
+        msg = (
+            f"{use_case.model}'s gateway route falls back on its own; an embedding "
+            "use case cannot take another model's vectors, which are not comparable"
+        )
+        raise ValueError(msg)
     if (provider := use_case.model.partition(":")[0]) not in EMBEDDING_PROVIDERS:
         msg = (
             f"ol-llm does not build {provider!r} embedding models; "
