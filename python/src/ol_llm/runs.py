@@ -485,11 +485,11 @@ async def run_stream(  # noqa: PLR0913
     state = _start(agent, attribution, postprocess)
     with state.trace_scope(user_prompt) as outcome, recording_answers() as answers:
         arguments = state.agent_arguments()
-        # What the caller's block raised. LLMStream already converts failures
-        # reading the stream; anything else is the caller's and passes through
-        # unchanged, including past PolicyModel, which would classify a provider
-        # error the caller's own code raised.
-        raised_in_block: Exception | None = None
+        # What the caller's block or postprocess raised. LLMStream already
+        # converts failures reading the stream; anything else is the caller's and
+        # passes through unchanged, including past PolicyModel, which would
+        # classify a provider error the caller's own code raised.
+        callers: Exception | None = None
         try:
             async with agent.run_stream(
                 user_prompt, deps=deps, message_history=message_history, **arguments
@@ -497,18 +497,18 @@ async def run_stream(  # noqa: PLR0913
                 stream = LLMStream(streamed, state, answers)
                 try:
                     yield stream
+                    if streamed.is_complete:
+                        outcome.value = (await stream.result()).output
                 except Exception as exc:
-                    raised_in_block = exc
+                    callers = exc
                     raise
-                if streamed.is_complete:
-                    outcome.value = (await stream.result()).output
         except Exception as exc:
-            if raised_in_block is None:
+            if callers is None:
                 if (error := state.replacement(exc, answers)) is None:
                     raise
                 raise error from exc
-        if raised_in_block is not None:
-            raise raised_in_block
+        if callers is not None:
+            raise callers
 
 
 def _completion(

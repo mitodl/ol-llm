@@ -329,6 +329,30 @@ def test_a_read_stream_is_finished_without_a_result_call() -> None:
     assert trace.metadata["degraded_reason"] == "fallback_model"
 
 
+@pytest.mark.parametrize("call_result", [True, False])
+def test_an_exception_from_postprocess_reaches_the_caller_unchanged(
+    call_result: bool,  # noqa: FBT001
+) -> None:
+    error = UnexpectedModelBehavior("the caller's own check")
+
+    def broken(_output: str) -> PostProcessed[str]:
+        raise error
+
+    _, model = scripted()
+    agent = agent_for(SUMMARY, model)
+
+    async def consume() -> None:
+        async with run_stream(agent, "summarize", postprocess=broken) as stream:
+            await read_text(stream)
+            if call_result:
+                await stream.result()
+
+    with pytest.raises(UnexpectedModelBehavior) as caught:
+        asyncio.run(consume())
+
+    assert caught.value is error
+
+
 def test_a_stream_inside_a_tracked_function_is_a_span_of_its_trace(
     exported: InMemorySpanExporter,
 ) -> None:
