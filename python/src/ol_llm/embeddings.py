@@ -31,7 +31,7 @@ from pydantic_ai.embeddings import (
     infer_embedding_model,
 )
 from pydantic_ai.embeddings.result import EmbedInputType
-from pydantic_ai.exceptions import UnexpectedModelBehavior
+from pydantic_ai.exceptions import ContentFilterError, UnexpectedModelBehavior
 from pydantic_ai.usage import RequestUsage
 
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution
@@ -90,7 +90,8 @@ class PolicyEmbeddingModel(WrapperEmbeddingModel):
 
     A response the provider model cannot read, alone or in Titan's group of
     per-text failures, or one with a vector count that does not match the inputs,
-    raises ``UnexpectedModelBehavior`` and is not retried.
+    raises ``UnexpectedModelBehavior`` and is not retried. A content filter's
+    refusal, alone or in a group, raises ``ContentFilterError`` instead.
 
     Calls go to a provider model built for the running event loop, as for
     ``PolicyModel`` (see ``LoopLocal``); ``wrapped`` answers for the model's name
@@ -162,6 +163,9 @@ class PolicyEmbeddingModel(WrapperEmbeddingModel):
                 )
             except Exception as exc:
                 if self._malformed(exc):
+                    if _filtered(exc):
+                        msg = f"{self.catalog_id} filtered a text"
+                        raise ContentFilterError(msg) from exc
                     msg = f"{self.catalog_id} sent a response that could not be read"
                     raise UnexpectedModelBehavior(msg) from exc
                 raise
@@ -200,6 +204,13 @@ class PolicyEmbeddingModel(WrapperEmbeddingModel):
             is not None
             for member in members
         )
+
+
+def _filtered(exc: BaseException) -> bool:
+    """Whether ``exc`` is a content filter's refusal, or a group holding one."""
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_filtered(member) for member in exc.exceptions)
+    return isinstance(exc, ContentFilterError)
 
 
 def build_embedder(

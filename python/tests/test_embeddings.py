@@ -14,6 +14,7 @@ from botocore.exceptions import ReadTimeoutError
 from ol_llm import (
     Attribution,
     EmbedResult,
+    LLMContentFiltered,
     LLMInvalidOutput,
     LLMRateLimited,
     LLMRejected,
@@ -37,7 +38,11 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 from pydantic_ai.embeddings import EmbeddingResult, EmbeddingSettings
 from pydantic_ai.embeddings.result import EmbedInputType
 from pydantic_ai.embeddings.test import TestEmbeddingModel
-from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
+from pydantic_ai.exceptions import (
+    ContentFilterError,
+    ModelHTTPError,
+    UnexpectedModelBehavior,
+)
 
 MODEL = "openai:text-embedding-3-small"
 
@@ -382,6 +387,25 @@ def test_a_malformed_response_raises_invalid_output(failure: Exception) -> None:
     assert model.calls == 1
     assert caught.value.model == MODEL
     assert isinstance(caught.value.__cause__, UnexpectedModelBehavior)
+    assert caught.value.__cause__.__cause__ is failure
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ContentFilterError("blocked"),
+        ExceptionGroup("titan", [http_error(429), ContentFilterError("blocked")]),
+    ],
+    ids=["direct", "grouped"],
+)
+def test_a_filtered_response_raises_content_filtered(failure: Exception) -> None:
+    model = Scripted(failure)
+
+    with pytest.raises(LLMContentFiltered) as caught:
+        embed_with(model, ["one", "two"])
+
+    assert model.calls == 1
+    assert caught.value.__cause__ is not None
     assert caught.value.__cause__.__cause__ is failure
 
 
