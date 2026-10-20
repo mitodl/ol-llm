@@ -42,6 +42,7 @@ from opik.api_objects.prompt import (
     PromptType,
     mask_context,
 )
+from opik.api_objects.prompt.types import SupportedModalities
 from opik.rest_api.core import ApiError
 from opik.rest_api.types import PromptVersionDetail
 
@@ -54,6 +55,9 @@ logger = logging.getLogger(__name__)
 COLD_FETCH_DEADLINE_SECONDS = 2.0
 """How long ``get_prompt`` waits for Opik before using the embedded default. The
 SDK took 11 s to give up on an unreachable Opik (spec §3 item 4)."""
+
+SUPPORTED_MODALITIES: SupportedModalities = {"vision": True, "video": True}
+"""Keep image and video parts as media when a chat template is rendered."""
 
 TemplateType = Literal["mustache", "jinja2"]
 """Mustache unless the prompt needs conditionals or loops (spec §3 item 9)."""
@@ -143,11 +147,13 @@ class ChatTemplate(_Template):
         :raises opik.exceptions.PromptPlaceholdersDontMatchFormatArguments: for a
             mustache template, if the variables are not exactly its placeholders.
         """
+        # ChatPromptTemplate.format turns media into text placeholders unless
+        # told the model takes it; ChatPrompt.format passes these same flags.
         rendered = ChatPromptTemplate(
             self._content(),
             template_type=PromptType(self.type),
             validate_placeholders=True,
-        ).format(variables)
+        ).format(variables, supported_modalities=SUPPORTED_MODALITIES)
         return cast("list[dict[str, Any]]", rendered)
 
 

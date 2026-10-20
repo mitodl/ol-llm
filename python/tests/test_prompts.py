@@ -135,6 +135,26 @@ def test_a_jinja2_prompt_renders_the_same_fetched_or_embedded(
     assert embedded.format(items=["a", "b"]) == "- a\n- b\n"
 
 
+def test_a_chat_template_keeps_its_media() -> None:
+    image = {
+        "type": "image_url",
+        "image_url": {"url": "https://example.com/{{name}}.png"},
+    }
+    video = {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}
+    template = ChatTemplate(
+        messages=[
+            {"role": "user", "content": [{"type": "text", "text": "Hi"}, image, video]}
+        ]
+    )
+
+    [message] = template.format(name="cat")
+
+    assert message["content"][1:] == [
+        {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
+        video,
+    ]
+
+
 @pytest.mark.parametrize(
     "template",
     [TextTemplate(template="Hi {{name}}."), ChatTemplate(messages=CHAT)],
