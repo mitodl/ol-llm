@@ -13,6 +13,7 @@ import ol_llm.catalog as catalog_module
 import opik
 import pytest
 from botocore.exceptions import ReadTimeoutError
+from conftest import assert_error_kept_without_content
 from ol_llm import (
     Attribution,
     EmbedResult,
@@ -53,6 +54,8 @@ MODEL = "openai:text-embedding-3-small"
 
 SEARCH = UseCase(app="mit-learn", name="search-query", profile="request", model=MODEL)
 ATTRIBUTION = Attribution(user_id="user-1", thread_id="thread-1", run_id="run-1")
+# A provider error body that quotes the request.
+ECHO = "echoed: the learner's query"
 
 
 class Scripted(TestEmbeddingModel):
@@ -110,8 +113,8 @@ class Replying(TestEmbeddingModel):
         return result
 
 
-def http_error(status: int) -> ModelHTTPError:
-    return ModelHTTPError(status, "text-embedding-3-small", body="provider said no")
+def http_error(status: int, body: str = "provider said no") -> ModelHTTPError:
+    return ModelHTTPError(status, "text-embedding-3-small", body=body)
 
 
 def embed_async(*args: Any, **kwargs: Any) -> EmbedResult:  # noqa: ANN401
@@ -387,6 +390,24 @@ def test_a_rejected_request_is_not_retried() -> None:
         embed_with(model, entry=embed_async)
 
     assert model.calls == 1
+
+
+@pytest.mark.parametrize("entry", ENTRIES)
+def test_without_content_a_failure_keeps_only_its_type_and_frames(
+    entry: Callable[..., EmbedResult], exported: InMemorySpanExporter
+) -> None:
+    tracing.reset()
+    configure_tracing(TracingConfig(include_content=False))
+
+    with opik.record_traces_locally() as storage:
+        with pytest.raises(LLMRejected):
+            embed_with(Scripted(http_error(400, ECHO)), entry=entry)
+        [trace] = storage.trace_trees
+    tracing.flush()
+
+    assert trace.error_info is not None
+    assert trace.error_info["exception_type"] == "LLMRejected"
+    assert_error_kept_without_content(trace, exported.get_finished_spans(), ECHO)
 
 
 def test_a_raw_botocore_timeout_is_unavailable() -> None:

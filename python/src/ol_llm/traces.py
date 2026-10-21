@@ -15,7 +15,7 @@ Needs no extra.
 
 import json
 import traceback
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Awaitable, Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
@@ -96,20 +96,29 @@ class TracedCall:
         )
 
     def track(self, func: Callable[..., _T]) -> Callable[..., _T]:
-        """Wrap ``func`` in the call's root trace, unless tracing is off."""
-        if not self.traced:
-            return func
-        content = include_content()
-        tracked: Callable[..., _T] = opik.track(
-            name=self.use_case.name,
-            project_name=self.fields.project_name,
-            tags=list(self.fields.tags),
-            metadata=dict(self.fields.metadata),
-            environment=self.fields.environment,
-            capture_input=content,
-            capture_output=content,
-        )(func)
-        return tracked
+        """Wrap ``func`` in the call's root trace, as ``trace_scope`` opens it.
+
+        The trace's input is ``func``'s arguments and its output what it returns.
+        """
+
+        def traced(*args: object) -> _T:
+            with self.trace_scope(func, *args) as outcome:
+                result = outcome.value = func(*args)
+            return result
+
+        return traced
+
+    def track_async(
+        self, func: Callable[..., Awaitable[_T]]
+    ) -> Callable[..., Awaitable[_T]]:
+        """Wrap the coroutine function ``func`` in the call's root trace."""
+
+        async def traced(*args: object) -> _T:
+            with self.trace_scope(func, *args) as outcome:
+                result = outcome.value = await func(*args)
+            return result
+
+        return traced
 
     def _current_trace(self) -> TraceData | None:
         """Return the trace this run marks, or ``None`` when it is not traced.
@@ -142,16 +151,17 @@ class TracedCall:
 
     @contextmanager
     def trace_scope(
-        self, stand_in: Callable[..., None], *args: object
+        self, stand_in: Callable[..., object], *args: object
     ) -> Generator[TraceOutput]:
         """Hold the call's root trace current for the block, unless tracing is off.
 
-        The trace opened here matches the one ``track`` opens. It records the
-        block's exception, or else the output set on what this yields. Without
-        content the exception's type and frames are recorded, not its message.
+        Every entry point's root trace is opened here, rather than by ``opik.track``,
+        whose wrapper records the exception's message and source lines whatever
+        ``include_content`` says. The trace records the block's exception, or else
+        the output set on what this yields. Without content the exception's type and
+        frames are recorded, not its message.
 
-        :param stand_in: a function whose parameters name the trace's input, as
-            the function ``track`` wraps would.
+        :param stand_in: a function whose parameters name the trace's input.
         :param args: the input, in the order of ``stand_in``'s parameters.
         """
         outcome = TraceOutput()

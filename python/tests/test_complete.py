@@ -8,11 +8,12 @@ from typing import Any
 
 import opik
 import pytest
-from conftest import PromptLibrary
+from conftest import PromptLibrary, assert_error_kept_without_content
 from ol_llm import (
     Attribution,
     LLMInvalidOutput,
     LLMRateLimited,
+    LLMRejected,
     ManagedPrompt,
     PostProcessed,
     Settings,
@@ -27,6 +28,7 @@ from ol_llm import (
     tracing,
 )
 from ol_llm.models import build_agent, override_models, shared_model
+from ol_llm.tracing import TracingConfig, configure_tracing
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
@@ -54,6 +56,8 @@ SUMMARY_WITH_FALLBACK = UseCase(
     fallback_models=(FALLBACK,),
 )
 ATTRIBUTION = Attribution(user_id="user-1", thread_id="thread-1", run_id="run-1")
+# A provider error body that quotes the request.
+ECHO = "echoed: the learner's essay"
 
 
 class Summary(BaseModel):
@@ -78,9 +82,9 @@ def calling_output_tool(text: str, seen: list[AgentInfo]) -> FunctionModel:
     return FunctionModel(reply)
 
 
-def failing(status: int) -> FunctionModel:
+def failing(status: int, body: str = "provider said no") -> FunctionModel:
     def fail(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
-        raise ModelHTTPError(status, "gpt-4o-mini", body="provider said no")
+        raise ModelHTTPError(status, "gpt-4o-mini", body=body)
 
     return FunctionModel(fail)
 
@@ -229,6 +233,24 @@ def test_a_provider_failure_reaches_the_caller_as_the_library_error(
         entry(SUMMARY, "hi")
 
     assert isinstance(caught.value.__cause__, ModelHTTPError)
+
+
+@ENTRIES
+def test_without_content_a_failure_keeps_only_its_type_and_frames(
+    entry: Callable[..., object], exported: InMemorySpanExporter
+) -> None:
+    tracing.reset()
+    configure_tracing(TracingConfig(include_content=False))
+
+    with opik.record_traces_locally() as storage:
+        with override_models(failing(400, ECHO)), pytest.raises(LLMRejected):
+            entry(SUMMARY, "hi")
+        [trace] = storage.trace_trees
+    tracing.flush()
+
+    assert trace.error_info is not None
+    assert trace.error_info["exception_type"] == "LLMRejected"
+    assert_error_kept_without_content(trace, exported.get_finished_spans(), ECHO)
 
 
 def test_invalid_structured_output_raises_llm_invalid_output() -> None:

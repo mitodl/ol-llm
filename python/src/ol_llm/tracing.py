@@ -1,10 +1,11 @@
 """Opik tracing wiring: SDK authentication and the OTel pipeline for model spans.
 
-Every run has two halves (spec §2.2). The root trace comes from the Opik SDK
-(``@opik.track``), which sends over the SDK's own ``httpx`` client. The model spans
-come from PydanticAI's OpenTelemetry instrumentation, which this module exports over
-OTLP/HTTP to Opik's ``/v1/private/otel`` endpoint. ``OpikSpanProcessor`` stamps
-those spans with the surrounding root trace's ids so they land inside it.
+Every run has two halves (spec §2.2). The root trace comes from the Opik SDK's
+tracker (``ol_llm.traces``), which sends over the SDK's own ``httpx`` client. The
+model spans come from PydanticAI's OpenTelemetry instrumentation, which this module
+exports over OTLP/HTTP to Opik's ``/v1/private/otel`` endpoint.
+``OpikSpanProcessor`` stamps those spans with the surrounding root trace's ids so
+they land inside it.
 
 Configuration is the environment the SDK already reads, so the SDK and the
 exporter always agree on the instance: ``OPIK_URL_OVERRIDE``, ``OPIK_WORKSPACE``,
@@ -14,7 +15,7 @@ a client-credentials JWT on every ``/api`` request; ``OPIK_KEYCLOAK_TOKEN_URL``,
 ``OPIK_KEYCLOAK_SCOPE`` turn that on for both halves from one token cache.
 
 ``OPIK_TRACK_DISABLE=true`` is the no-op mode for tests and local development: the
-SDK skips ``@track`` and the library builds no exporter.
+library opens no root traces and builds no exporter.
 
 Spans are filed under the Opik project of the trace they belong to. That is the
 app's project for a run the library opened, and the caller's project for a run
@@ -318,9 +319,10 @@ class RequestsBearerAuth(AuthBase):
 class OpikActiveSampler(Sampler):
     """Records spans only while Opik tracing is active.
 
-    The SDK skips ``@track`` when tracing is off at runtime
-    (``opik.set_tracing_active(False)``); this keeps model spans from being exported
-    on their own as unattached traces in the meantime.
+    ``TracedCall.trace_scope`` opens no root trace while tracing is off at runtime
+    (``opik.set_tracing_active(False)``), and the SDK skips a caller's ``@track``;
+    this keeps model spans from being exported on their own as unattached traces in
+    the meantime.
     """
 
     def should_sample(  # noqa: PLR0913, PLR0917
