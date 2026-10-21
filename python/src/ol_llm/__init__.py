@@ -51,10 +51,12 @@ if TYPE_CHECKING:
     from ol_llm.models import build_agent, build_model, usage_limits
     from ol_llm.runs import (
         LLMResult,
+        LLMStream,
         PostProcessed,
         complete,
         complete_sync,
         run,
+        run_stream,
         run_sync,
     )
 
@@ -66,10 +68,12 @@ _PYDANTIC_AI_EXPORTS = {
     "build_model": "ol_llm.models",
     "usage_limits": "ol_llm.models",
     "LLMResult": "ol_llm.runs",
+    "LLMStream": "ol_llm.runs",
     "PostProcessed": "ol_llm.runs",
     "complete": "ol_llm.runs",
     "complete_sync": "ol_llm.runs",
     "run": "ol_llm.runs",
+    "run_stream": "ol_llm.runs",
     "run_sync": "ol_llm.runs",
 }
 # What the pydantic-ai extra installs that ol_llm.models imports directly.
@@ -89,6 +93,7 @@ __all__ = [
     "LLMRateLimited",
     "LLMRejected",
     "LLMResult",
+    "LLMStream",
     "LLMUnavailable",
     "PostProcessed",
     "Profile",
@@ -108,6 +113,7 @@ __all__ = [
     "load_catalog",
     "resolve_policy",
     "run",
+    "run_stream",
     "run_sync",
     "trace_fields",
     "usage_limits",

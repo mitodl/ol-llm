@@ -5,9 +5,9 @@ overrides drop. Exits non-zero on any failure.
 
 What it proves, in an environment shaped like a consumer's runtime image:
 - ol_llm and opik import with litellm, openai, pytest, and tree-sitter absent;
-- ol_llm.run_sync over an agent from ol_llm.build_agent, and ol_llm.complete_sync,
-  send the SDK root trace and the OTLP model spans to Opik, and the spans carry
-  the root trace's id;
+- ol_llm.run_sync over an agent from ol_llm.build_agent, ol_llm.complete_sync, and
+  ol_llm.run_stream send the SDK root trace and the OTLP model spans to Opik, and
+  the spans carry the root trace's id (for a stream, while the caller reads it);
 - both halves authenticate with a Keycloak client-credentials token, and the span
   exporter fetches a new token after a 401;
 - the spans are filed under the app's project, or under the caller's project for
@@ -18,6 +18,7 @@ Opik and Keycloak are one fake server in this process, which records what it is
 sent. The first OTLP request gets a 401, as an expired token would.
 """
 
+import asyncio
 import gzip
 import json
 import os
@@ -124,6 +125,17 @@ SMOKE = ol_llm.UseCase(
 SMOKE_COMPLETE = ol_llm.UseCase(
     app=APP, name="smoke-complete", profile="request", model="openai:gpt-4o-mini"
 )
+SMOKE_STREAM = ol_llm.UseCase(
+    app=APP, name="smoke-stream", profile="request", model="openai:gpt-4o-mini"
+)
+
+
+async def stream(agent: Any) -> str:  # noqa: ANN401
+    """Read a streamed run the way a request handler would."""
+    async with ol_llm.run_stream(agent, "ping") as llm_stream:
+        text = "".join([chunk async for chunk in llm_stream.stream_text()])
+        result = await llm_stream.result()
+    return text if text == result.output else f"{text!r} != {result.output!r}"
 
 
 def ended_traces(name: str) -> list[dict[str, Any]]:
@@ -152,7 +164,9 @@ def check() -> list[str]:  # noqa: C901
     # capabilities, and the import graph are the library's own.
     with override_models(TestModel(custom_output_text="pong")):
         agent = ol_llm.build_agent(SMOKE)
+        stream_agent = ol_llm.build_agent(SMOKE_STREAM)
         completed = ol_llm.complete_sync(SMOKE_COMPLETE, "ping")
+    streamed = asyncio.run(stream(stream_agent))
     result = ol_llm.run_sync(
         agent, "ping", attribution=ol_llm.Attribution(thread_id="smoke-thread")
     )
@@ -166,12 +180,14 @@ def check() -> list[str]:  # noqa: C901
         return ["the span exporter did not finish"]
 
     failures = []
-    if (result.output, completed.output) != ("pong", "pong"):
-        failures.append(f"outputs were {result.output!r}, {completed.output!r}")
-    roots = {name: ended_traces(name) for name in ("smoke", "smoke-complete", "caller")}
+    outputs = (result.output, completed.output, streamed)
+    if outputs != ("pong", "pong", "pong"):
+        failures.append(f"outputs were {outputs}")
+    names = ("smoke", "smoke-complete", "smoke-stream", "caller")
+    roots = {name: ended_traces(name) for name in names}
     if wrong := {name: ts for name, ts in roots.items() if len(ts) != 1}:
         return [*failures, f"expected one ended trace for each name, got {wrong}"]
-    [trace], [complete_trace], callers = roots.values()
+    [trace], [complete_trace], [stream_trace], callers = roots.values()
     expected = {
         "project_name": APP,
         "environment": "ci",
@@ -196,7 +212,7 @@ def check() -> list[str]:  # noqa: C901
         ids = {span.get("opik.trace_id", "") for span in _spans(request)}
         trace_ids.setdefault(project, set()).update(ids)
     expected_ids = {
-        APP: {trace["id"], complete_trace["id"]},
+        APP: {trace["id"], complete_trace["id"], stream_trace["id"]},
         CALLER: {callers[0]["id"]},
     }
     if trace_ids != expected_ids:
