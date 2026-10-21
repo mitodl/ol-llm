@@ -14,6 +14,7 @@ Needs no extra.
 """
 
 import json
+import traceback
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from opik.api_objects.trace import TraceData
 from opik.decorator import error_info_collector
 from opik.decorator.arguments_helpers import TrackOptions
 from opik.decorator.tracker import OpikTrackDecorator
+from opik.types import ErrorInfoDict
 
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution, TraceFields, trace_fields
 from ol_llm.catalog import embedding_entry, status_tags
@@ -145,7 +147,8 @@ class TracedCall:
         """Hold the call's root trace current for the block, unless tracing is off.
 
         The trace opened here matches the one ``track`` opens. It records the
-        block's exception, or else the output set on what this yields.
+        block's exception, or else the output set on what this yields. Without
+        content the exception's type and frames are recorded, not its message.
 
         :param stand_in: a function whose parameters name the trace's input, as
             the function ``track`` wraps would.
@@ -183,7 +186,7 @@ class TracedCall:
             # left as it was.
             _TRACKER._after_call(  # noqa: SLF001
                 output=None,
-                error_info=error_info_collector.collect(exc)
+                error_info=_error_info(exc, content=content)
                 if isinstance(exc, Exception)
                 else None,
                 capture_output=content,
@@ -205,6 +208,22 @@ def _model_tags(use_case: UseCase) -> tuple[str, ...]:
     A rejected use case raises every time; an unlisted or deprecated one warns once.
     """
     return status_tags([embedding_entry(use_case)])
+
+
+def _error_info(error: Exception, *, content: bool) -> ErrorInfoDict:
+    """Return what the root trace records about an error.
+
+    Without content the message is left out, and the traceback keeps only where
+    each frame is: the formatted one ends with the message, repeats those of
+    chained exceptions, and quotes source lines.
+    """
+    if content:
+        return error_info_collector.collect(error)
+    frames = "".join(
+        f'  File "{frame.filename}", line {frame.lineno}, in {frame.name}\n'
+        for frame in traceback.extract_tb(error.__traceback__)
+    )
+    return {"exception_type": type(error).__name__, "traceback": frames}
 
 
 def _embedding_input(texts: list[str]) -> None:
@@ -267,8 +286,8 @@ def traced_embedding(
     Wrap each provider request, not a call that hedges or caches around several, so
     the trace counts every request that was billed. The client must call the use
     case's model: the span names it. The block's exception passes through
-    unchanged. The span records its message only when ``include_content`` is on;
-    the root trace records it either way, as for ``embed``. The texts are recorded
+    unchanged; the span and the root trace record its message only when
+    ``include_content`` is on, and its type either way. The texts are recorded
     only when ``include_content`` is on, and the vectors never are.
 
     The trace is the current Opik trace's child, or a new root trace. A worker

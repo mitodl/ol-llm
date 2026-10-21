@@ -318,10 +318,17 @@ def test_without_content_an_error_keeps_only_its_type(
     tracing.reset()
     configure_tracing(TracingConfig(include_content=False))
 
-    with pytest.raises(RuntimeError), traced_embedding(SEARCH, ["a"]):
-        raise RuntimeError("the provider echoed: secret text")  # noqa: EM101, TRY003
+    with opik.record_traces_locally() as storage:
+        with pytest.raises(RuntimeError), traced_embedding(SEARCH, ["a"]):
+            raise RuntimeError("the provider echoed: secret text")  # noqa: EM101, TRY003
+        [trace] = storage.trace_trees
     tracing.flush()
 
+    assert trace.error_info is not None
+    assert trace.error_info["exception_type"] == "RuntimeError"
+    assert trace.error_info.get("message") is None
+    assert "secret text" not in trace.error_info["traceback"]
+    assert "test_traced_embedding.py" in trace.error_info["traceback"]
     [span] = exported.get_finished_spans()
     assert span.status.status_code is StatusCode.ERROR
     assert span.status.description is None

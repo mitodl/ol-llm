@@ -264,7 +264,7 @@ before `to_dict()`, which drops `_hidden_params`. Wrap each request rather than 
 hedges around several, so every billed request is counted; a request made on a worker
 thread is its own root trace unless it is submitted with `contextvars.copy_context().run`.
 The client must call the use case's model. Retries, timeouts (from `resolve_policy`), and
-errors stay with the client: the block's exception passes through unchanged, and the span
+errors stay with the client: the block's exception passes through unchanged, and the trace
 records its message only when `OL_LLM_TRACE_CONTENT` is on. A block that ends without
 `record` raises `ValueError`.
 
