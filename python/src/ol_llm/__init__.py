@@ -2,8 +2,11 @@
 
 The Opik SDK starts its own Sentry client on import, reporting to Comet's DSN, and
 that replaces whatever Sentry client the host application already configured.
-Setting OPIK_SENTRY_ENABLE before anything imports opik stops it. This module
-does that first, so every consumer gets it by importing ol_llm before opik.
+Setting OPIK_SENTRY_ENABLE before anything imports opik stops it. The SDK also
+reports which of its features get used to Comet's stats collector, which
+OPIK_ANALYTICS_ENABLE=false stops. This module sets both first, so every consumer
+gets them by importing ol_llm before opik. An explicit value in the environment
+wins over either default.
 
 The model factory, the agent builder, and the run and embedding entry points
 need the ``pydantic-ai`` extra. They are imported on first use, so the base
@@ -16,6 +19,7 @@ from importlib.metadata import version
 from typing import TYPE_CHECKING, Any
 
 os.environ.setdefault("OPIK_SENTRY_ENABLE", "false")
+os.environ.setdefault("OPIK_ANALYTICS_ENABLE", "false")
 
 from ol_llm.attribution import (
     Attribution,
