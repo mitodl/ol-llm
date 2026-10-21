@@ -3,6 +3,8 @@
 ``override_models`` makes ``build_model`` return PydanticAI's ``TestModel`` or
 ``FunctionModel`` (or any model) under the library's own policy wrapper, so a test
 exercises the same timeouts, retries, error classes, and fallback as production.
+``override_embedding_models`` does the same for ``embed`` and ``embed_sync``, e.g.
+with PydanticAI's ``TestEmbeddingModel``.
 For an agent built at import time, use PydanticAI's own ``agent.override(model=...)``
 with ``policy_model`` to keep the wrapper.
 
@@ -22,10 +24,16 @@ import opik
 from pydantic_ai.models import Model
 
 from ol_llm.catalog import load_catalog
+from ol_llm.embeddings import override_embedding_models
 from ol_llm.models import PolicyModel, override_models
 from ol_llm.policy import UseCase, resolve_policy
 
-__all__ = ["override_models", "policy_model", "tracing_disabled"]
+__all__ = [
+    "override_embedding_models",
+    "override_models",
+    "policy_model",
+    "tracing_disabled",
+]
 
 
 def policy_model(use_case: UseCase, model: Model) -> PolicyModel:

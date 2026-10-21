@@ -5,9 +5,9 @@ that replaces whatever Sentry client the host application already configured.
 Setting OPIK_SENTRY_ENABLE before anything imports opik stops it. This module
 does that first, so every consumer gets it by importing ol_llm before opik.
 
-The model factory, the agent builder, and the run entry points need the
-``pydantic-ai`` extra. They are imported on first use, so the base package imports
-without it.
+The model factory, the agent builder, and the run and embedding entry points
+need the ``pydantic-ai`` extra. They are imported on first use, so the base
+package imports without it.
 """
 
 import os
@@ -75,6 +75,7 @@ from ol_llm.tracing import (
 )
 
 if TYPE_CHECKING:
+    from ol_llm.embeddings import EmbedResult, embed, embed_sync
     from ol_llm.models import build_agent, build_model, usage_limits
     from ol_llm.runs import (
         LLMResult,
@@ -91,6 +92,9 @@ if TYPE_CHECKING:
 __version__ = version("ol-llm")
 
 _PYDANTIC_AI_EXPORTS = {
+    "EmbedResult": "ol_llm.embeddings",
+    "embed": "ol_llm.embeddings",
+    "embed_sync": "ol_llm.embeddings",
     "build_agent": "ol_llm.models",
     "build_model": "ol_llm.models",
     "usage_limits": "ol_llm.models",
@@ -117,6 +121,7 @@ __all__ = [
     "Chunk",
     "CircuitBreaker",
     "DegradedReason",
+    "EmbedResult",
     "GatewayRoute",
     "KeycloakClient",
     "LLMBudgetExceeded",
@@ -150,6 +155,8 @@ __all__ = [
     "create_prompt",
     "dagster_pool",
     "degraded_metadata",
+    "embed",
+    "embed_sync",
     "get_prompt",
     "get_settings",
     "load_catalog",

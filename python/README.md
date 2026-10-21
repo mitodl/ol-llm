@@ -203,6 +203,48 @@ environment="production", project_name=...)`, which moves one label and leaves t
 other labels in place. Opik seeds only `development`, `staging`, and `production`; create `ci`
 and `qa` once per instance before promoting to them.
 
+### Embeddings
+
+An embedding call site is a use case too, naming an embedding model from the catalog. Like
+`complete`, `ol_llm.embed` (or `ol_llm.embed_sync`) takes the use case and the texts:
+
+```python
+SEARCH_QUERY = ol_llm.UseCase(
+    app="mit-learn",
+    name="search-query",
+    profile="request",
+    model="openai:text-embedding-3-large",
+)
+
+result = ol_llm.embed_sync(SEARCH_QUERY, [query], input_type="query")
+result.embeddings  # one vector per text
+result.model, result.dimensions  # store these with the vectors
+```
+
+The embedding model has the same timeout, retries, and `LLMError` classes as an agent's
+model. It is built on the first call for a use case and reused after that. Each call is one
+Opik trace with the embedding span and its token usage inside it. `input_type` is `query` or
+`document` and has no default, because Google and Cohere models embed the two differently.
+`dimensions=1024` asks a model that can shorten its vectors (the OpenAI `text-embedding-3`
+models, Titan v2) for that length. A response that cannot be read, or that has fewer vectors
+than texts, raises `LLMInvalidOutput`. The attribution's user id reaches OpenAI and Azure as
+the request's `user` field; Bedrock and Google have no such field, so for them it is on the
+trace only. An embedding use case takes no `fallback_models`, since
+another model's vectors are not comparable with the primary's.
+
+Hedging, caching, batching texts to the provider's limits, and the vector store stay in the
+application. Bedrock's Titan models take one text per request, so the library sends one
+request per text, and a retry sends the whole call again: keep batches small enough that
+repeating one is cheap.
+
+Changing an embedding model is a catalog lifecycle event with a re-embedding plan, not a
+settings change. Vectors are stored with the model id and dimension that produced them
+(`EmbedResult.model` and `EmbedResult.dimensions`), as ol-data-platform's feedback embeddings
+already are, so a new model or size adds vectors beside the old ones, and the application
+switches its queries over once everything is re-embedded. The catalog entry records each
+embedding model's default length, e.g. `ol_llm.load_catalog().get(model_id).dimensions` to
+size a collection without an embedding call.
+
 ### Batch
 
 `ol_llm.process_batch(rows, call, persist)` runs `call` on each row and hands every
@@ -370,7 +412,8 @@ to the same instance:
 | `OPIK_TRACK_DISABLE` | `true` turns tracing off, for local development without an Opik |
 | `OL_LLM_TRACE_CONTENT` | `false` keeps prompts, completions, and tool arguments out of traces. On by default until the data-handling policy decides |
 
-Without a call, tracing reads these the first time an agent is built or a run starts. A host
+Without a call, tracing reads these the first time an agent or embedder is built or a run
+starts. A host
 that configures in code calls `ol_llm.configure_tracing(ol_llm.TracingConfig(...))` at
 startup, before anything else touches the Opik SDK (the SDK reads the Keycloak hook when it
 first builds its HTTP client) and before building agents (an agent keeps the instrumentation
@@ -386,7 +429,8 @@ it was built with). Once tracing has been used, a different configuration raises
 error handling. Set `OPIK_TRACK_DISABLE=true` for a test suite that should send nothing, or
 use `ol_llm.testing.tracing_disabled` around one test. `opik.record_traces_locally()`
 captures the root traces a test produces. Script responses and failures with
-`FunctionModel`; do not commit recorded provider responses.
+`FunctionModel`; do not commit recorded provider responses. `override_embedding_models` does
+the same for `embed` and `embed_sync`, e.g. with PydanticAI's `TestEmbeddingModel`.
 
 ## Extras
 

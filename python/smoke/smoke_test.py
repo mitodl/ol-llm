@@ -8,6 +8,7 @@ What it proves, in an environment shaped like a consumer's runtime image:
 - ol_llm.run_sync over an agent from ol_llm.build_agent, ol_llm.complete_sync, and
   ol_llm.run_stream send the SDK root trace and the OTLP model spans to Opik, and
   the spans carry the root trace's id (for a stream, while the caller reads it);
+- ol_llm.embed_sync does the same for its embedding span;
 - both halves authenticate with a Keycloak client-credentials token, and the span
   exporter fetches a new token after a 401;
 - the spans are filed under the app's project, or under the caller's project for
@@ -130,9 +131,11 @@ import ol_llm  # noqa: E402
 import opik  # noqa: E402
 import sentry_sdk  # noqa: E402
 from ol_llm.models import override_models  # noqa: E402
+from ol_llm.testing import override_embedding_models  # noqa: E402
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (  # noqa: E402
     ExportTraceServiceRequest,
 )
+from pydantic_ai.embeddings import TestEmbeddingModel  # noqa: E402
 from pydantic_ai.models.test import TestModel  # noqa: E402
 
 SMOKE = ol_llm.UseCase(
@@ -143,6 +146,12 @@ SMOKE_COMPLETE = ol_llm.UseCase(
 )
 SMOKE_STREAM = ol_llm.UseCase(
     app=APP, name="smoke-stream", profile="request", model="openai:gpt-4o-mini"
+)
+SMOKE_EMBED = ol_llm.UseCase(
+    app=APP,
+    name="smoke-embed",
+    profile="request",
+    model="openai:text-embedding-3-small",
 )
 
 
@@ -195,6 +204,8 @@ def check() -> list[str]:  # noqa: C901
         attribution=ol_llm.Attribution(thread_id="smoke-thread"),
         prompt=prompt,
     )
+    with override_embedding_models(TestEmbeddingModel(dimensions=8)):
+        embedded = ol_llm.embed_sync(SMOKE_EMBED, ["ping"], input_type="query")
 
     @opik.track(name="caller", project_name=CALLER)
     def caller() -> str:
@@ -208,11 +219,13 @@ def check() -> list[str]:  # noqa: C901
     outputs = (result.output, completed.output, streamed)
     if outputs != ("pong", "pong", "pong"):
         failures.append(f"outputs were {outputs}")
-    names = ("smoke", "smoke-complete", "smoke-stream", "caller")
+    if embedded.dimensions != 8:  # noqa: PLR2004
+        failures.append(f"embedding dimensions were {embedded.dimensions}")
+    names = ("smoke", "smoke-complete", "smoke-stream", "smoke-embed", "caller")
     roots = {name: ended_traces(name) for name in names}
     if wrong := {name: ts for name, ts in roots.items() if len(ts) != 1}:
         return [*failures, f"expected one ended trace for each name, got {wrong}"]
-    [trace], [complete_trace], [stream_trace], callers = roots.values()
+    [trace], [complete_trace], [stream_trace], [embed_trace], callers = roots.values()
     expected = {
         "project_name": APP,
         "environment": "ci",
@@ -242,7 +255,12 @@ def check() -> list[str]:  # noqa: C901
         ids = {span.get("opik.trace_id", "") for span in _spans(request)}
         trace_ids.setdefault(project, set()).update(ids)
     expected_ids = {
-        APP: {trace["id"], complete_trace["id"], stream_trace["id"]},
+        APP: {
+            trace["id"],
+            complete_trace["id"],
+            stream_trace["id"],
+            embed_trace["id"],
+        },
         CALLER: {callers[0]["id"]},
     }
     if trace_ids != expected_ids:

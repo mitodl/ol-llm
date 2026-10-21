@@ -20,6 +20,7 @@ from botocore.exceptions import EventStreamError
 from ol_llm import LLMRejected, LLMUnavailable, UseCase, models
 from ol_llm.attribution import USE_CASE_HEADER
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
+from ol_llm.embeddings import PolicyEmbeddingModel, build_embedder
 from ol_llm.models import PolicyModel, build_agent, build_model
 from ol_llm.settings import GatewayRoute, Settings, configure
 from pydantic_ai.providers import mistral
@@ -36,6 +37,8 @@ UNLISTED_MODELS = (
     "google:gemini-3.1-pro-preview",
     "groq:llama-3.3-70b",
 )
+# An embedding model for a provider no consumer embeds with yet.
+UNLISTED_EMBEDDING_MODEL = "google:gemini-embedding-001"
 
 
 @pytest.fixture(autouse=True)
@@ -50,6 +53,13 @@ def provider_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
         )
         for model_id in UNLISTED_MODELS
     }
+    unlisted[UNLISTED_EMBEDDING_MODEL] = CatalogEntry(
+        id=UNLISTED_EMBEDDING_MODEL,
+        kind="embedding",
+        dimensions=3072,
+        input_usd_per_mtok=Decimal("0.15"),
+        output_usd_per_mtok=Decimal(0),
+    )
     catalog = Catalog({**released.entries, **unlisted})
     monkeypatch.setattr(models, "load_catalog", lambda: catalog)
 
@@ -62,6 +72,12 @@ def provider_client(model_id: str) -> Any:  # noqa: ANN401
     model = build_model(use_case(model_id))
     assert isinstance(model, PolicyModel)
     return model.wrapped.provider.client  # type: ignore[union-attr]
+
+
+def embedding_client(model_id: str) -> Any:  # noqa: ANN401
+    model = build_embedder(use_case(model_id)).model
+    assert isinstance(model, PolicyEmbeddingModel)
+    return model.wrapped._provider.client  # type: ignore[attr-defined]  # noqa: SLF001
 
 
 @pytest.mark.usefixtures("provider_env")
@@ -77,6 +93,35 @@ def provider_client(model_id: str) -> Any:  # noqa: ANN401
 )
 def test_sdk_retries_are_off(model_id: str) -> None:
     assert provider_client(model_id).max_retries == 0
+
+
+@pytest.mark.usefixtures("provider_env")
+@pytest.mark.parametrize(
+    "model_id", ["openai:text-embedding-3-large", "azure:text-embedding-3-large"]
+)
+def test_embedding_clients_have_no_sdk_retries_and_the_timeout(model_id: str) -> None:
+    # Embedding requests take no per-request timeout, so it is on the client.
+    client = embedding_client(model_id)
+
+    assert client.max_retries == 0
+    assert client.timeout == 60
+
+
+@pytest.mark.usefixtures("provider_env")
+def test_bedrock_embedding_client_carries_the_timeout_and_no_retries() -> None:
+    config = embedding_client("bedrock:amazon.titan-embed-text-v2:0")._client_config  # noqa: SLF001
+
+    assert config.retries["total_max_attempts"] == 1
+    assert config.read_timeout == 60
+
+
+@pytest.mark.usefixtures("provider_env")
+def test_google_client_carries_the_timeout() -> None:
+    client = embedding_client(UNLISTED_EMBEDDING_MODEL)
+    http_options = client._api_client._http_options  # noqa: SLF001
+
+    assert http_options.timeout == 60_000
+    assert http_options.retry_options is None
 
 
 @pytest.mark.usefixtures("provider_env")
@@ -118,6 +163,25 @@ def test_gateway_route_replaces_the_vendor_api(family: str, model_id: str) -> No
     assert str(client.base_url) == "https://gateway.example/llm/"
     assert client.api_key == "app-key"
     assert client.default_headers[USE_CASE_HEADER] == "summary"
+
+
+@pytest.mark.usefixtures("provider_env")
+def test_the_google_provider_closes_its_client_and_opens_a_new_one() -> None:
+    model = build_model(use_case("google:gemini-3.1-pro-preview"))
+    assert isinstance(model, PolicyModel)
+    provider = model.wrapped.provider  # type: ignore[attr-defined]
+
+    async def enter_and_exit() -> Any:  # noqa: ANN401
+        async with provider:
+            return provider.client._api_client._async_httpx_client  # noqa: SLF001
+
+    first = asyncio.run(enter_and_exit())
+    second = asyncio.run(enter_and_exit())
+
+    assert first.is_closed
+    assert second is not first
+    assert second.is_closed
+    assert second.timeout.read == 60
 
 
 def test_unsupported_provider_is_refused() -> None:
@@ -223,6 +287,41 @@ def test_one_retry_layer_per_provider(  # noqa: PLR0913, PLR0917
 
     with pytest.raises(error):
         build_agent(use_case(model_id)).run_sync("hi")
+
+    assert len(mock_provider.requests) == attempts
+
+
+MOCKED_EMBEDDING_MODELS = [
+    "openai:text-embedding-3-large",
+    "bedrock:amazon.titan-embed-text-v2:0",
+    UNLISTED_EMBEDDING_MODEL,
+]
+
+
+@pytest.mark.usefixtures("provider_env")
+@pytest.mark.parametrize("model_id", MOCKED_EMBEDDING_MODELS)
+@pytest.mark.parametrize(
+    ("mode", "attempts", "error"),
+    [
+        ("unavailable", 3, LLMUnavailable),
+        ("hang", 3, LLMUnavailable),
+        ("rejected", 1, LLMRejected),
+    ],
+)
+def test_one_retry_layer_per_embedding_provider(  # noqa: PLR0913, PLR0917
+    mock_provider: MockProvider,
+    monkeypatch: pytest.MonkeyPatch,
+    model_id: str,
+    mode: str,
+    attempts: int,
+    error: type[Exception],
+) -> None:
+    monkeypatch.setenv("OL_LLM_SUMMARY_TIMEOUT_SECONDS", TEST_TIMEOUT_SECONDS)
+    point_at(mock_provider, model_id, monkeypatch)
+    mock_provider.mode = mode
+
+    with pytest.raises(error):
+        build_embedder(use_case(model_id)).embed_sync(["hi"], input_type="query")
 
     assert len(mock_provider.requests) == attempts
 

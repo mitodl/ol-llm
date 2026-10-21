@@ -14,8 +14,10 @@ import sys
 import threading
 from collections.abc import (
     AsyncGenerator,
+    Awaitable,
     Callable,
     Generator,
+    Iterable,
     Iterator,
     Mapping,
     Sequence,
@@ -30,7 +32,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial
 from types import TracebackType
-from typing import Any, NoReturn, Self, TypeVar, cast, overload
+from typing import Any, Generic, NoReturn, Self, TypeVar, cast, overload
 
 import anyio
 import httpx
@@ -71,7 +73,7 @@ from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.usage import RequestUsage, UsageLimits
 
 from ol_llm.attribution import USE_CASE_HEADER, Attribution
-from ol_llm.catalog import CatalogEntry, load_catalog
+from ol_llm.catalog import CatalogEntry, ModelKind, load_catalog
 from ol_llm.errors import (
     LLMBudgetExceeded,
     LLMContentFiltered,
@@ -88,6 +90,8 @@ from ol_llm.tracing import include_content, tracer_provider
 log = logging.getLogger(__name__)
 
 OutputT = TypeVar("OutputT")
+_T = TypeVar("_T")
+_V = TypeVar("_V")
 _NO_DEPS: type[None] = type(None)
 DepsT = TypeVar("DepsT")
 
@@ -143,16 +147,39 @@ _model_override: ContextVar[Model | Mapping[str, Model] | None] = ContextVar(
 _answers: ContextVar[list[str] | None] = ContextVar("ol_llm_answers", default=None)
 
 
-class _LoopModels(threading.local):
-    """One ``PolicyModel``'s provider models in one thread, by event loop.
+class LoopLocal(threading.local, Generic[_V]):
+    """A value built once for each event loop that uses it, kept by the loop's thread.
 
-    A loop runs on one thread, so keeping them per thread loses nothing, and a
-    worker thread's loop, which ``run_sync`` never closes, is released with the
-    thread instead of living as long as the model.
+    For what holds provider clients, which bind to the loop they first run on: a
+    pooled ``httpx`` connection belongs to that loop's transport, and SDK clients
+    keep asyncio locks and events (a provider's own enter lock among them). Shared
+    across loops, they fail with "bound to a different event loop", or "Event loop
+    is closed" once the first loop is gone, which is what ``run_sync`` from a
+    thread pool and ``asyncio.run`` per task do. A loop runs on one thread, so
+    keeping the values per thread loses nothing, and a worker thread's loop, which
+    ``run_sync`` never closes, is released with the thread.
+
+    :param build: builds the value; called again for each new loop.
     """
 
-    def __init__(self) -> None:
-        self.models: dict[asyncio.AbstractEventLoop, Model] = {}
+    def __init__(self, build: Callable[[], _V]) -> None:
+        """Start empty; ``threading.local`` runs this again in each new thread."""
+        self._build = build
+        self._values: dict[asyncio.AbstractEventLoop, _V] = {}
+
+    def get(self) -> _V:
+        """Return the running loop's value, dropping the values of closed loops.
+
+        :returns: the value.
+        :rtype: _V
+        :raises RuntimeError: if no event loop is running.
+        """
+        loop = asyncio.get_running_loop()
+        for closed in [other for other in self._values if other.is_closed()]:
+            del self._values[closed]
+        if (value := self._values.get(loop)) is None:
+            value = self._values[loop] = self._build()
+        return value
 
 
 # The models complete runs on, by use case, with the settings each was built with.
@@ -165,13 +192,16 @@ _shared_models_lock = threading.Lock()
 _sleep: Callable[[float], Any] = asyncio.sleep
 
 
-def classify_failure(
+def classify_failure(  # noqa: PLR0911
     exc: BaseException, *, use_case: str, model: str
 ) -> LLMError | None:
     """Map a failed model request to the library error for its class.
 
-    The table is closed: every ``ModelAPIError`` and every ``httpx`` or ``httpx2``
-    transport error maps to a class, so nothing a provider raises is unclassified.
+    The table is closed: every ``ModelAPIError``, every ``httpx`` or ``httpx2``
+    transport error, and every botocore transport error maps to a class, so
+    nothing a provider raises is unclassified. An exception group, which
+    Bedrock's Titan embedding model raises for its concurrent per-text requests,
+    maps to its first error that is not retryable, else its first error.
 
     :param exc: what the request raised.
     :param use_case: the use case name, for the error.
@@ -180,6 +210,8 @@ def classify_failure(
         failure and should propagate unchanged.
     :rtype: LLMError | None
     """
+    if isinstance(exc, BaseExceptionGroup):
+        return _classify_group(exc, use_case=use_case, model=model)
     message = str(exc)
     if isinstance(exc, ModelHTTPError):
         if exc.status_code == RATE_LIMITED_STATUS:
@@ -191,11 +223,41 @@ def classify_failure(
         return LLMRejected(
             message, use_case=use_case, model=model, status_code=exc.status_code
         )
-    if isinstance(exc, (ModelAPIError, *_UNAVAILABLE_TRANSPORT_ERRORS)):
+    unavailable: tuple[type[Exception], ...] = (
+        ModelAPIError,
+        *_UNAVAILABLE_TRANSPORT_ERRORS,
+        *_botocore_transport_errors(),
+    )
+    if isinstance(exc, unavailable):
         return LLMUnavailable(message, use_case=use_case, model=model)
     if isinstance(exc, _TRANSPORT_ERRORS):
         return LLMRejected(message, use_case=use_case, model=model, status_code=None)
     return None
+
+
+def _classify_group(
+    group: BaseExceptionGroup[BaseException], *, use_case: str, model: str
+) -> LLMError | None:
+    errors = [
+        classify_failure(exc, use_case=use_case, model=model)
+        for exc in group.exceptions
+    ]
+    classified = [error for error in errors if error is not None]
+    if len(classified) < len(errors):
+        return None
+    return next((e for e in classified if not e.retryable), classified[0])
+
+
+def _botocore_transport_errors() -> tuple[type[Exception], ...]:
+    """Return the botocore errors that mean no answer came back.
+
+    PydanticAI's Bedrock chat model wraps these in ``ModelAPIError``; its embedding
+    model catches only ``ClientError`` and lets them through raw. Without botocore
+    imported, none can have been raised.
+    """
+    if (botocore := sys.modules.get("botocore.exceptions")) is None:
+        return ()
+    return (botocore.HTTPClientError, botocore.ConnectionError)
 
 
 def classify_run_failure(
@@ -253,6 +315,51 @@ class _RetryBudget:
         self.retries += 1
         self.waited += delay
         return delay
+
+
+async def retrying(
+    attempt: Callable[[], Awaitable[_T]],
+    *,
+    policy: CallPolicy,
+    profile: Profile,
+    use_case: str,
+    model: str,
+) -> _T:
+    """Make one call under the retry policy.
+
+    :param attempt: makes one attempt.
+    :param policy: the resolved policy.
+    :param profile: the use case's profile, which decides how backoff is capped.
+    :param use_case: the use case name, for the error.
+    :param model: the model id, for the error.
+    :returns: what the first successful attempt returned.
+    :rtype: _T
+    :raises LLMError: once a failure is not retryable or the retries are spent,
+        with the provider's exception as ``__cause__``. Anything that is not a
+        model request failure is re-raised unchanged.
+    """
+    budget = _RetryBudget(policy, profile)
+    while True:
+        try:
+            return await attempt()
+        except Exception as exc:  # noqa: BLE001
+            delay = _retry_delay(exc, budget, use_case=use_case, model=model)
+        await _sleep(delay)
+
+
+def _retry_delay(
+    exc: Exception, budget: _RetryBudget, *, use_case: str, model: str
+) -> float:
+    """Return the wait before the next attempt, or raise what the caller sees.
+
+    Callers catch ``Exception`` and hand it here; anything not classified is
+    re-raised unchanged.
+    """
+    if (error := classify_failure(exc, use_case=use_case, model=model)) is None:
+        raise exc
+    if (delay := budget.next_delay(error)) is None:
+        raise error from exc
+    return delay
 
 
 _METADATA_KEY = "ol_llm"
@@ -367,14 +474,9 @@ class PolicyModel(WrapperModel):
     with the provider's exception as ``__cause__``. A stream is retried while it
     opens; a failure after that reaches the caller.
 
-    Requests go to a provider model built for the running event loop. Provider
-    clients bind to the loop they first run on: a pooled ``httpx`` connection
-    belongs to that loop's transport, and SDK clients keep asyncio locks and events
-    (the provider's own enter lock among them). Shared across loops, they fail with
-    "bound to a different event loop", or "Event loop is closed" once the first
-    loop is gone, which is what ``run_sync`` from a thread pool and
-    ``asyncio.run`` per task do. ``wrapped`` answers for the model's name, profile,
-    and settings and never makes a request.
+    Requests go to a provider model built for the running event loop (see
+    ``LoopLocal``). ``wrapped`` answers for the model's name, profile, and settings
+    and never makes a request.
     """
 
     use_case: str
@@ -412,20 +514,13 @@ class PolicyModel(WrapperModel):
         self.catalog_entry = catalog_entry
         self.profile_name = use_case.profile
         self.policy = policy
-        self._build = build
-        self._loop_models = _LoopModels()
+        self._loop_models = None if build is None else LoopLocal(build)
 
     def _loop_model(self) -> Model:
         """Return the provider model for the running event loop."""
-        if self._build is None:
+        if self._loop_models is None:
             return self.wrapped
-        loop = asyncio.get_running_loop()
-        models = self._loop_models.models
-        for closed in [other for other in models if other.is_closed()]:
-            del models[closed]
-        if (model := models.get(loop)) is None:
-            model = models[loop] = self._build()
-        return model
+        return self._loop_models.get()
 
     async def __aenter__(self) -> Self:
         """Enter the running loop's provider model, for its HTTP client lifecycle."""
@@ -475,16 +570,7 @@ class PolicyModel(WrapperModel):
         return classify_failure(exc, use_case=self.use_case, model=self.catalog_id)
 
     def _retry_delay(self, exc: Exception, budget: _RetryBudget) -> float:
-        """Return the wait before the next attempt, or raise what the caller sees.
-
-        Callers catch ``Exception`` and hand it here; anything not classified is
-        re-raised unchanged.
-        """
-        if (error := self._classify(exc)) is None:
-            raise exc
-        if (delay := budget.next_delay(error)) is None:
-            raise error from exc
-        return delay
+        return _retry_delay(exc, budget, use_case=self.use_case, model=self.catalog_id)
 
     async def request(
         self,
@@ -494,19 +580,16 @@ class PolicyModel(WrapperModel):
     ) -> ModelResponse:
         """Make the request, retrying transient failures under the policy."""
         settings = self._with_timeout(model_settings)
-        budget = _RetryBudget(self.policy, self.profile_name)
         provider = self._loop_model()
-        while True:
-            try:
-                response = await provider.request(
-                    messages, settings, model_request_parameters
-                )
-            except Exception as exc:  # noqa: BLE001
-                delay = self._retry_delay(exc, budget)
-            else:
-                _stamp_answered_by(response, self.catalog_id)
-                return response
-            await _sleep(delay)
+        response = await retrying(
+            lambda: provider.request(messages, settings, model_request_parameters),
+            policy=self.policy,
+            profile=self.profile_name,
+            use_case=self.use_case,
+            model=self.catalog_id,
+        )
+        _stamp_answered_by(response, self.catalog_id)
+        return response
 
     @asynccontextmanager
     async def request_stream(
@@ -684,7 +767,14 @@ def _raise_missing_extra(extra: str, exc: ImportError) -> NoReturn:
     raise ImportError(msg) from exc
 
 
-def _openai_provider(route: GatewayRoute | None, use_case: UseCase) -> Provider[Any]:
+# The clients of providers with embedding models carry the policy timeout too.
+# Embedding requests have no per-request timeout to set; chat requests override
+# the client's with ModelSettings.timeout.
+
+
+def _openai_provider(
+    route: GatewayRoute | None, use_case: UseCase, policy: CallPolicy
+) -> Provider[Any]:
     try:
         from openai import AsyncOpenAI, DefaultAsyncHttpxClient  # noqa: PLC0415
         from pydantic_ai.providers.openai import OpenAIProvider  # noqa: PLC0415
@@ -693,6 +783,7 @@ def _openai_provider(route: GatewayRoute | None, use_case: UseCase) -> Provider[
     client = AsyncOpenAI(
         max_retries=0,
         http_client=DefaultAsyncHttpxClient(),
+        timeout=policy.timeout_seconds,
         base_url=route.base_url if route else None,
         api_key=route.api_key if route else None,
         default_headers=_gateway_headers(route, use_case),
@@ -700,7 +791,7 @@ def _openai_provider(route: GatewayRoute | None, use_case: UseCase) -> Provider[
     return OpenAIProvider(openai_client=client)
 
 
-def _azure_provider(settings: Settings) -> Provider[Any]:
+def _azure_provider(settings: Settings, policy: CallPolicy) -> Provider[Any]:
     try:
         from openai import AsyncAzureOpenAI, DefaultAsyncHttpxClient  # noqa: PLC0415
         from pydantic_ai.providers.azure import AzureProvider  # noqa: PLC0415
@@ -711,6 +802,7 @@ def _azure_provider(settings: Settings) -> Provider[Any]:
     client = AsyncAzureOpenAI(
         max_retries=0,
         http_client=DefaultAsyncHttpxClient(),
+        timeout=policy.timeout_seconds,
         azure_ad_token_provider=settings.azure_ad_token_provider,
     )
     return AzureProvider(openai_client=client)
@@ -756,7 +848,7 @@ def _bedrock_provider(client: Any) -> Provider[Any]:  # noqa: ANN401
     return BedrockProvider(bedrock_client=client)
 
 
-def _google_provider(provider: str) -> Provider[Any]:
+def _google_provider(provider: str, policy: CallPolicy) -> Provider[Any]:
     try:
         from pydantic_ai.providers.google import GoogleProvider  # noqa: PLC0415
         from pydantic_ai.providers.google_cloud import (  # noqa: PLC0415
@@ -764,10 +856,21 @@ def _google_provider(provider: str) -> Provider[Any]:
         )
     except ImportError as exc:
         _raise_missing_extra("google", exc)
-    # The SDK retries only when given a retry config, and none is passed.
-    if provider == "google-cloud":
-        return GoogleCloudProvider()
-    return GoogleProvider()
+    # The SDK retries only when given a retry config, and none is passed. The
+    # provider reads the request timeout from the client's read timeout.
+    new_client = partial(httpx2.AsyncClient, timeout=policy.timeout_seconds)
+    http_client = new_client()
+    google: Provider[Any] = (
+        GoogleCloudProvider(http_client=http_client)
+        if provider == "google-cloud"
+        else GoogleProvider(http_client=http_client)
+    )
+    # A provider leaves a client it was given open. Give it this one as if it had
+    # made it, so exiting the provider closes it and entering again makes a new
+    # one, as without a client.
+    google._own_http_client = http_client  # noqa: SLF001
+    google._http_client_factory = new_client  # noqa: SLF001
+    return google
 
 
 def _mistral_provider() -> Provider[Any]:
@@ -795,10 +898,16 @@ def _together_provider() -> Provider[Any]:
     return TogetherProvider(openai_client=client)
 
 
-def _provider_factory(
+def provider_factory(
     use_case: UseCase, policy: CallPolicy, settings: Settings
 ) -> Callable[[str], Provider[Any]]:
-    """Return the provider factory for one ``build_model`` call.
+    """Return the factory that builds each provider with its SDK's retries off.
+
+    :param use_case: the call site, for the gateway header.
+    :param policy: the resolved policy, for the client timeouts.
+    :param settings: the gateway routes and Azure credentials.
+    :returns: a factory from a provider name to the provider.
+    :rtype: Callable[[str], Provider[Any]]
 
     It runs again for each event loop a model's requests run on (see
     ``PolicyModel``). The boto3 client is synchronous, so every loop shares the
@@ -809,9 +918,11 @@ def _provider_factory(
 
     def factory(provider: str) -> Provider[Any]:  # noqa: PLR0911
         if provider in _OPENAI_PROVIDERS:
-            return _openai_provider(settings.gateway_routes.get("openai"), use_case)
+            return _openai_provider(
+                settings.gateway_routes.get("openai"), use_case, policy
+            )
         if provider in _AZURE_PROVIDERS:
-            return _azure_provider(settings)
+            return _azure_provider(settings, policy)
         if provider == "anthropic":
             return _anthropic_provider(
                 settings.gateway_routes.get("anthropic"), use_case
@@ -821,7 +932,7 @@ def _provider_factory(
                 bedrock_clients.append(_bedrock_client(policy))
             return _bedrock_provider(bedrock_clients[0])
         if provider in {"google", "google-cloud"}:
-            return _google_provider(provider)
+            return _google_provider(provider, policy)
         if provider == "mistral":
             return _mistral_provider()
         if provider == "together":
@@ -847,11 +958,24 @@ def _provider_model(
     return infer_model(model_id, provider_factory=factory)
 
 
-def _catalog_entries(use_case: UseCase) -> list[CatalogEntry | None]:
-    """Look up every model the use case names; retired and embedding models raise."""
+def catalog_entries(use_case: UseCase, *, kind: ModelKind) -> list[CatalogEntry | None]:
+    """Look up every model the use case names; retired models and other kinds raise.
+
+    The catalog is not an allowlist: an id it does not list builds, with a warning
+    and no entry, and a deprecated one builds with a warning.
+
+    :param use_case: the call site.
+    :param kind: the kind of model the caller builds.
+    :returns: the entries, in the order of ``use_case.model_ids``, with ``None``
+        for an id the catalog does not list.
+    :rtype: list[CatalogEntry | None]
+    :raises ValueError: on a model id not in ``provider:model`` form, that is
+        retired, or that the catalog lists as another kind, or fallbacks behind a
+        route that falls back on its own.
+    """
     catalog = load_catalog()
     entries = [
-        catalog.buildable(model_id, kind="chat") for model_id in use_case.model_ids
+        catalog.buildable(model_id, kind=kind) for model_id in use_case.model_ids
     ]
     primary = entries[0]
     if use_case.fallback_models and primary is not None and primary.route_falls_back:
@@ -893,13 +1017,13 @@ def build_model(use_case: UseCase, *, settings: Settings | None = None) -> Model
         route that falls back on its own, a provider the library does not build,
         or an environment policy value that does not parse.
     """
-    entries = _catalog_entries(use_case)
+    entries = catalog_entries(use_case, kind="chat")
     policy = resolve_policy(use_case)
     override = _model_override.get()
     factory = (
         None
         if override is not None
-        else _provider_factory(use_case, policy, settings or get_settings())
+        else provider_factory(use_case, policy, settings or get_settings())
     )
     models = [
         PolicyModel(
@@ -953,16 +1077,46 @@ def catalog_tags(model: Model) -> tuple[str, ...]:
     :rtype: tuple[str, ...]
     :raises TypeError: if a member of the chain did not come from ``build_model``.
     """
-    statuses = set()
+    entries = []
     for member in _chain(model):
         if not isinstance(member, PolicyModel):
             msg = f"{model!r} was not built by ol_llm.build_model"
             raise TypeError(msg)
-        if (entry := member.catalog_entry) is None:
+        entries.append(member.catalog_entry)
+    return status_tags(entries)
+
+
+def status_tags(entries: Iterable[CatalogEntry | None]) -> tuple[str, ...]:
+    """Return the ``model_status`` trace tags for a chain's catalog entries.
+
+    :param entries: one per model, ``None`` for a model the catalog does not list.
+    :returns: the tags, in a stable order.
+    :rtype: tuple[str, ...]
+    """
+    statuses = set()
+    for entry in entries:
+        if entry is None:
             statuses.add("uncataloged")
         elif entry.status == "deprecated":
             statuses.add("deprecated")
     return tuple(f"model_status:{status}" for status in sorted(statuses))
+
+
+def instrumentation_settings(use_case: UseCase) -> InstrumentationSettings | None:
+    """Return the settings that send a use case's model spans to Opik.
+
+    :param use_case: the call site; its app is the Opik project.
+    :returns: the settings, or ``None`` when tracing is off.
+    :rtype: InstrumentationSettings | None
+    """
+    if (provider := tracer_provider(use_case.app)) is None:
+        return None
+    content = include_content()
+    return InstrumentationSettings(
+        tracer_provider=provider,
+        include_content=content,
+        include_binary_content=content,
+    )
 
 
 def instrumentation(use_case: UseCase) -> list[AbstractCapability[Any]]:
@@ -972,14 +1126,8 @@ def instrumentation(use_case: UseCase) -> list[AbstractCapability[Any]]:
     :returns: the ``Instrumentation`` capability, or nothing when tracing is off.
     :rtype: list[AbstractCapability[Any]]
     """
-    if (provider := tracer_provider(use_case.app)) is None:
+    if (settings := instrumentation_settings(use_case)) is None:
         return []
-    content = include_content()
-    settings = InstrumentationSettings(
-        tracer_provider=provider,
-        include_content=content,
-        include_binary_content=content,
-    )
     return [Instrumentation(settings=settings)]
 
 
