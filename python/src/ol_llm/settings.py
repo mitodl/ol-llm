@@ -10,9 +10,10 @@ Provider credentials are not read here. Each provider SDK reads its own variable
 Vertex use the default credential chain, which covers IRSA and workload identity.
 """
 
+import inspect
 import os
 import threading
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 _ENV_PREFIX = "OL_LLM"
@@ -48,19 +49,27 @@ class Settings:
     :param azure_ad_token_provider: a callable returning an Entra ID token for
         Azure OpenAI, for federated credentials in place of an API key. Only
         settable in code, e.g. from ``azure.identity.get_bearer_token_provider``.
+        It must be synchronous: every event loop's Azure client shares it, and an
+        ``azure.identity.aio`` credential binds its session and locks to the first
+        loop that awaits it.
     """
 
     environment: str
     gateway_routes: Mapping[str, GatewayRoute] = field(default_factory=dict)
-    azure_ad_token_provider: Callable[[], str | Awaitable[str]] | None = field(
-        default=None, repr=False
-    )
+    azure_ad_token_provider: Callable[[], str] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Reject an empty environment and routes for unknown families.
 
-        :raises ValueError: if either is invalid.
+        :raises ValueError: if either is invalid, or the Azure token provider is
+            asynchronous.
         """
+        if inspect.iscoroutinefunction(self.azure_ad_token_provider):
+            msg = (
+                "Settings.azure_ad_token_provider must be synchronous; use "
+                "azure.identity.get_bearer_token_provider, not azure.identity.aio"
+            )
+            raise ValueError(msg)
         if not self.environment:
             msg = "Settings.environment must not be empty"
             raise ValueError(msg)

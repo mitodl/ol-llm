@@ -115,3 +115,11 @@ def test_degraded_metadata() -> None:
         "degraded": True,
         "degraded_reason": "fallback_model,partial_output",
     }
+
+
+def test_an_async_azure_token_provider_is_refused() -> None:
+    async def token() -> str:
+        return "token"
+
+    with pytest.raises(ValueError, match="must be synchronous"):
+        Settings(environment="ci", azure_ad_token_provider=token)  # type: ignore[arg-type]

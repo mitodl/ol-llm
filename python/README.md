@@ -41,7 +41,9 @@ The agent's model has a timeout on every request, retries rate limits and outage
 nothing else, falls back once the primary has spent its retries, and raises `LLMError`
 subclasses (`LLMRateLimited`, `LLMUnavailable`, `LLMRejected`, ...) with the provider's
 exception as the cause. Build agents once, not per request: each build creates new provider
-clients.
+clients. An agent built once can run on any thread or event loop (`run_sync` from a thread pool,
+`asyncio.run` per task); its model keeps one set of provider clients per event loop, released
+with the thread that ran the loop.
 
 Set `OL_LLM_ENVIRONMENT`, or call `ol_llm.configure(ol_llm.Settings(environment=...))` at
 startup. Provider credentials are each SDK's own (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, the AWS

@@ -1,9 +1,13 @@
 import asyncio
+import gc
+import threading
+import weakref
 from collections.abc import Callable
 from dataclasses import replace
 
 import opik
 import pytest
+from conftest import GEMINI
 from ol_llm import (
     Attribution,
     LLMInvalidOutput,
@@ -382,3 +386,109 @@ def test_an_agent_not_from_build_agent_is_refused(
 ) -> None:
     with pytest.raises(TypeError, match="build_model"):
         entry(Agent(TestModel()), "hi")
+
+
+# One agent built once and run on several event loops, over real provider clients
+# against a local keep-alive server (the real_client fixture).
+
+THREAD_TIMEOUT_SECONDS = 30
+
+
+def run_in_threads(target: Callable[[], None], count: int) -> list[BaseException]:
+    """Run ``target`` on ``count`` threads at once and return what they raised."""
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(count)
+
+    def call() -> None:
+        barrier.wait()
+        try:
+            target()
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=call) for _ in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(THREAD_TIMEOUT_SECONDS)
+        assert not thread.is_alive(), "a run hung"
+    return errors
+
+
+def test_run_sync_works_from_several_threads(real_client: UseCase) -> None:
+    agent = build_agent(real_client)
+    outputs: list[str] = []
+
+    def call() -> None:
+        outputs.append(run_sync(agent, "hi").output)
+
+    for _ in range(2):
+        assert run_in_threads(call, 1) == []
+
+    assert outputs == ["ok", "ok"]
+
+
+def test_run_sync_works_from_concurrent_threads(real_client: UseCase) -> None:
+    agent = build_agent(real_client)
+    outputs: list[str] = []
+
+    def call() -> None:
+        outputs.extend(run_sync(agent, "hi").output for _ in range(3))
+
+    assert run_in_threads(call, 4) == []
+    assert outputs == ["ok"] * 12
+
+
+def test_run_works_under_successive_event_loops(real_client: UseCase) -> None:
+    agent = build_agent(real_client)
+
+    outputs = [asyncio.run(run(agent, "hi")).output for _ in range(2)]
+
+    assert outputs == ["ok", "ok"]
+
+
+def test_a_finished_threads_loop_is_released_by_the_agent(
+    real_client: UseCase,
+) -> None:
+    agent = build_agent(real_client)
+    loops: list[weakref.ref[asyncio.AbstractEventLoop]] = []
+
+    def call() -> None:
+        run_sync(agent, "hi")
+        loops.append(weakref.ref(asyncio.get_event_loop()))
+
+    assert run_in_threads(call, 1) == []
+    gc.collect()
+
+    assert loops[0]() is None
+
+
+def test_a_dropped_loops_clients_log_no_errors_on_a_later_loop(
+    real_client: UseCase, caplog: pytest.LogCaptureFixture
+) -> None:
+    agent = build_agent(real_client)
+
+    async def call() -> None:
+        await run(agent, "hi")
+        # Collect the earlier loops' clients while this loop runs, which is when
+        # an SDK client's __del__ schedules its close on the wrong loop.
+        gc.collect()
+
+    for _ in range(5):
+        asyncio.run(call())
+
+    assert [r.getMessage() for r in caplog.records if r.name == "asyncio"] == []
+
+
+@pytest.mark.parametrize("real_client", [(GEMINI,)], indirect=True, ids=["google"])
+def test_run_stream_works_under_successive_event_loops(real_client: UseCase) -> None:
+    agent = build_agent(real_client)
+
+    async def stream() -> str:
+        async with agent.run_stream("hi") as result:
+            output: str = await result.get_output()
+            return output
+
+    outputs = [asyncio.run(stream()) for _ in range(2)]
+
+    assert outputs == ["ok", "ok"]

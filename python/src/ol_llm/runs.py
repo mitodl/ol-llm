@@ -17,7 +17,6 @@ the use case's model, run by ``run``, so a call site that outgrows them builds t
 same agent with ``build_agent`` and keeps everything else.
 """
 
-import asyncio
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar, cast, overload
@@ -296,34 +295,15 @@ def run_sync(  # noqa: PLR0913
     return results[0]
 
 
-def _sync_loop() -> asyncio.AbstractEventLoop:
-    """Return the event loop ``run_sync`` will use in this thread.
-
-    PydanticAI's sync entry points run on the thread's current loop, and set a new
-    one when there is none or it is closed
-    (``pydantic_graph._utils.get_event_loop``). This does the same first, so the
-    loop it returns is the one the call runs on.
-    """
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = None
-    if loop is None or loop.is_closed():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    return loop
-
-
 def _completion(
     use_case: UseCase,
     messages: Sequence[ModelMessage] | str,
     output_type: OutputSpec[Any],
     instructions: str | None,
-    loop: asyncio.AbstractEventLoop,
 ) -> tuple[Agent[None, Any], str | None, Sequence[ModelMessage] | None]:
     """Return the agent, user prompt, and history a single call runs with."""
     agent = agent_over(
-        shared_model(use_case, loop), output_type=output_type, instructions=instructions
+        shared_model(use_case), output_type=output_type, instructions=instructions
     )
     if isinstance(messages, str):
         return agent, messages, None
@@ -381,7 +361,7 @@ async def complete(  # noqa: PLR0913
         ``build_model`` rejects the use case.
     """
     agent, user_prompt, history = _completion(
-        use_case, messages, output_type, instructions, asyncio.get_running_loop()
+        use_case, messages, output_type, instructions
     )
     return await run(
         agent,
@@ -429,7 +409,7 @@ def complete_sync(  # noqa: PLR0913
     :rtype: LLMResult
     """
     agent, user_prompt, history = _completion(
-        use_case, messages, output_type, instructions, _sync_loop()
+        use_case, messages, output_type, instructions
     )
     return run_sync(
         agent,
