@@ -34,12 +34,7 @@ from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar, cast, overload
 
-import opik
 from opik import opik_context
-from opik.api_objects.trace import TraceData
-from opik.decorator import error_info_collector
-from opik.decorator.arguments_helpers import TrackOptions
-from opik.decorator.tracker import OpikTrackDecorator
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
@@ -52,9 +47,7 @@ from ol_llm.attribution import (
     NO_ATTRIBUTION,
     Attribution,
     DegradedReason,
-    TraceFields,
     degraded_metadata,
-    trace_fields,
 )
 from ol_llm.errors import LLMError
 from ol_llm.models import (
@@ -69,28 +62,17 @@ from ol_llm.models import (
     shared_model,
     usage_limits,
 )
-from ol_llm.policy import UseCase, resolve_policy
-from ol_llm.prompts import ManagedPrompt, attach_prompt
-from ol_llm.settings import get_settings
-from ol_llm.tracing import enabled, include_content
+from ol_llm.policy import UseCase
+from ol_llm.prompts import ManagedPrompt
+from ol_llm.traces import TracedCall
+from ol_llm.tracing import enabled
 
 OutputT = TypeVar("OutputT")
 DepsT = TypeVar("DepsT")
-_T = TypeVar("_T")
-
-# Drives run_stream's root trace with the halves of opik.track's own wrapper.
-_TRACKER = OpikTrackDecorator()
 
 
 def _root_input(user_prompt: str | None) -> None:
     """Stand in for a traced function, so a stream's trace input matches ``run``'s."""
-
-
-@dataclass
-class _TraceOutput:
-    """What a trace opened by ``_Run.trace_scope`` records as its output."""
-
-    value: Any = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -127,149 +109,6 @@ class LLMResult(Generic[OutputT]):
     prompt_name: str | None
     prompt_version: str | None
     new_messages: Sequence[ModelMessage]
-
-
-@dataclass(frozen=True, kw_only=True)
-class TracedCall:
-    """The root trace of one entry-point call, for runs and embeddings alike.
-
-    :param use_case: the call site.
-    :param attribution: the per-call fields.
-    :param fields: what the root trace is opened with.
-    :param traced: whether tracing was on when the call started.
-    :param prompt: the managed prompt the call uses, linked to its trace.
-    """
-
-    use_case: UseCase
-    attribution: Attribution
-    fields: TraceFields
-    traced: bool
-    prompt: ManagedPrompt[Any] | None = None
-
-    @staticmethod
-    def fields_for(
-        use_case: UseCase,
-        attribution: Attribution,
-        prompt: ManagedPrompt[Any] | None = None,
-        *,
-        model_tags: Sequence[str] = (),
-    ) -> TraceFields:
-        """Return the root-trace fields for a call, with the policy it resolves to.
-
-        :param use_case: the call site.
-        :param attribution: the per-call fields.
-        :param prompt: the managed prompt the call uses, if any.
-        :param model_tags: the models' catalog-status tags, from ``status_tags``.
-        :returns: the fields.
-        :rtype: TraceFields
-        """
-        return trace_fields(
-            use_case,
-            environment=get_settings().environment,
-            policy=resolve_policy(use_case),
-            attribution=attribution,
-            model_tags=model_tags,
-            prompt_name=prompt.name if prompt else None,
-            prompt_version=prompt.version if prompt else None,
-        )
-
-    def track(self, func: Callable[..., _T]) -> Callable[..., _T]:
-        """Wrap ``func`` in the call's root trace, unless tracing is off."""
-        if not self.traced:
-            return func
-        content = include_content()
-        tracked: Callable[..., _T] = opik.track(
-            name=self.use_case.name,
-            project_name=self.fields.project_name,
-            tags=list(self.fields.tags),
-            metadata=dict(self.fields.metadata),
-            environment=self.fields.environment,
-            capture_input=content,
-            capture_output=content,
-        )(func)
-        return tracked
-
-    def _current_trace(self) -> TraceData | None:
-        """Return the trace this run marks, or ``None`` when it is not traced.
-
-        Read from the context each time rather than trusted from the start of the
-        run: tracing can be switched on at runtime after the run started without
-        a trace, and marking a trace that is not there raises.
-        """
-        return opik_context.get_current_trace_data() if self.traced else None
-
-    def mark_trace(self) -> None:
-        """Put the use case's tags, the thread, and the prompt link on the trace.
-
-        For a call the library opened the tags and prompt are already there; for
-        one inside a caller's trace, whose own metadata lands on its span, this adds
-        them there. A caller's trace that already has a thread keeps it.
-        """
-        if (trace := self._current_trace()) is not None:
-            opik_context.update_current_trace(
-                tags=list(self.fields.tags),
-                metadata={
-                    key: self.fields.metadata[key]
-                    for key in ("prompt_name", "prompt_version")
-                    if key in self.fields.metadata
-                },
-                thread_id=None if trace.thread_id else self.attribution.thread_id,
-            )
-            if self.prompt is not None:
-                attach_prompt(self.prompt)
-
-    @contextmanager
-    def trace_scope(self, user_prompt: str | None) -> Generator[_TraceOutput]:
-        """Hold the call's root trace current for the block, unless tracing is off.
-
-        The trace opened here matches the one ``track`` opens. It records the
-        block's exception, or else the output set on what this yields.
-        """
-        outcome = _TraceOutput()
-        if not (self.traced and opik.is_tracing_active()):
-            yield outcome
-            return
-        content = include_content()
-        options = TrackOptions(
-            name=self.use_case.name,
-            type="general",
-            tags=list(self.fields.tags),
-            metadata=dict(self.fields.metadata),
-            capture_input=content,
-            ignore_arguments=None,
-            capture_output=content,
-            generations_aggregator=None,
-            flush=False,
-            project_name=self.fields.project_name,
-            create_duplicate_root_span=True,
-            source=None,
-            environment=self.fields.environment,
-        )
-        # The two halves opik.track's wrapper runs around a call; the exact opik
-        # pin keeps these private methods stable.
-        span_started = _TRACKER._before_call(  # noqa: SLF001
-            func=_root_input, track_options=options, args=(user_prompt,), kwargs={}
-        )
-        try:
-            yield outcome
-        except BaseException as exc:
-            # A cancelled block closes the trace too, so the caller's context is
-            # left as it was.
-            _TRACKER._after_call(  # noqa: SLF001
-                output=None,
-                error_info=error_info_collector.collect(exc)
-                if isinstance(exc, Exception)
-                else None,
-                capture_output=content,
-                should_process_span_data=span_started,
-            )
-            raise
-        _TRACKER._after_call(  # noqa: SLF001
-            output=outcome.value,
-            error_info=None,
-            capture_output=content,
-            should_process_span_data=span_started,
-        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -551,7 +390,10 @@ async def run_stream(  # noqa: PLR0913
     :raises TypeError: if the agent's model did not come from ``build_model``.
     """
     state = _start(agent, attribution, postprocess, prompt)
-    with state.trace_scope(user_prompt) as outcome, recording_answers() as answers:
+    with (
+        state.trace_scope(_root_input, user_prompt) as outcome,
+        recording_answers() as answers,
+    ):
         arguments = state.agent_arguments()
         # What the caller's block or postprocess raised. LLMStream already
         # converts failures reading the stream; anything else is the caller's and

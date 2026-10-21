@@ -36,20 +36,18 @@ from pydantic_ai.exceptions import ContentFilterError, UnexpectedModelBehavior
 from pydantic_ai.usage import RequestUsage
 
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution
-from ol_llm.catalog import CatalogEntry
+from ol_llm.catalog import CatalogEntry, embedding_entry, status_tags
 from ol_llm.models import (
     LoopLocal,
-    catalog_entries,
     classify_failure,
     classify_run_failure,
     instrumentation_settings,
     provider_factory,
     retrying,
-    status_tags,
 )
 from ol_llm.policy import CallPolicy, UseCase, resolve_policy
-from ol_llm.runs import TracedCall
 from ol_llm.settings import Settings, get_settings
+from ol_llm.traces import TracedCall
 from ol_llm.tracing import enabled
 
 # The providers PydanticAI has an embedding model for that the library builds.
@@ -250,19 +248,7 @@ def build_embedder(
         does not build embeddings for its provider, or an environment policy value
         does not parse.
     """
-    if use_case.fallback_models:
-        msg = (
-            f"Use case {use_case.name!r} declares fallback_models; an embedding use "
-            "case takes none, since another model's vectors are not comparable"
-        )
-        raise ValueError(msg)
-    [entry] = catalog_entries(use_case, kind="embedding")
-    if entry is not None and entry.route_falls_back:
-        msg = (
-            f"{use_case.model}'s gateway route falls back on its own; an embedding "
-            "use case cannot take another model's vectors, which are not comparable"
-        )
-        raise ValueError(msg)
+    entry = embedding_entry(use_case)
     if (provider := use_case.model.partition(":")[0]) not in EMBEDDING_PROVIDERS:
         msg = (
             f"ol-llm does not build {provider!r} embedding models; "

@@ -70,6 +70,17 @@ jobs:
           assert ol_llm.check_model_ids(["openai:gpt-4o-mini"]).ok
           # So do the batch helpers.
           assert ol_llm.dagster_pool(use_case) == "llm/ci/base"
+          # So does the embedding trace for clients the library does not build.
+          ol_llm.configure(ol_llm.Settings(environment="ci"))
+          ol_llm.configure_tracing(ol_llm.TracingConfig(enabled=False))
+          search = ol_llm.UseCase(
+              app="ci",
+              name="search",
+              profile="request",
+              model="openai:text-embedding-3-small",
+          )
+          with ol_llm.traced_embedding(search, ["text"]) as request:
+              request.record([[0.0, 1.0]], input_tokens=1)
           try:
               ol_llm.build_model
           except ImportError as exc:
