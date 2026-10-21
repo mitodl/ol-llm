@@ -519,10 +519,11 @@ class Deferred(BaseModel):
 
 def test_workers_first_using_a_deferred_model_all_see_it_built() -> None:
     # Before pydantic 2.14, every thread that found a deferred model unbuilt rebuilt
-    # it, and a late rebuild deleted the schema an earlier one had set, so another
-    # thread read none. That is how a batch's first concurrent OpenAI responses
-    # failed to parse. Each trial races a new model; a short switch interval makes
-    # the threads interleave inside the rebuild.
+    # it with no lock, deleting and resetting the model's schema attributes while
+    # other threads read them. Here that surfaces as an AttributeError for
+    # __pydantic_core_schema__; in the openai SDK, as a response that cannot be
+    # constructed. Each trial races a new model; a short switch interval makes the
+    # threads interleave inside the rebuild.
     workers = 16
     interval = sys.getswitchinterval()
     sys.setswitchinterval(1e-6)
