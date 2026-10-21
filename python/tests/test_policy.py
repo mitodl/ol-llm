@@ -1,5 +1,5 @@
 import pytest
-from ol_llm.policy import CallPolicy, UseCase, resolve_policy
+from ol_llm.policy import CallPolicy, UseCase, resolve_policy, worst_case_seconds
 
 
 def use_case(**overrides: object) -> UseCase:
@@ -118,3 +118,16 @@ def test_fallbacks_are_stored_as_a_tuple() -> None:
     assert hash(declared) == hash(
         use_case(fallback_models=("anthropic:claude-haiku-4-5",))
     )
+
+
+def test_worst_case_seconds_at_the_profile_defaults() -> None:
+    # Spec §6.2: 190 s on the request profile, 3,300 s on the batch profile.
+    assert worst_case_seconds(use_case(profile="request"), {}) == 190
+    assert worst_case_seconds(use_case(profile="batch"), {}) == 3300
+
+
+def test_worst_case_seconds_covers_each_fallback_and_the_environment() -> None:
+    declared = use_case(fallback_models=("anthropic:claude-haiku-4-5",))
+    env = {"OL_LLM_COURSE_TRANSLATION_MAX_RETRIES": "1"}
+
+    assert worst_case_seconds(declared, env) == 2 * (2 * 300 + 300)
