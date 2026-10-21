@@ -24,6 +24,18 @@ from ol_llm.attribution import (
     degraded_metadata,
     trace_fields,
 )
+from ol_llm.batch import (
+    BatchFailed,
+    BatchKeys,
+    BatchReport,
+    Chunk,
+    CircuitBreaker,
+    Provenance,
+    RowFailure,
+    celery_rate_limit,
+    dagster_pool,
+    process_batch,
+)
 from ol_llm.catalog import CatalogEntry, check_model_ids, load_catalog
 from ol_llm.errors import (
     LLMBudgetExceeded,
@@ -34,7 +46,13 @@ from ol_llm.errors import (
     LLMRejected,
     LLMUnavailable,
 )
-from ol_llm.policy import CallPolicy, Profile, UseCase, resolve_policy
+from ol_llm.policy import (
+    CallPolicy,
+    Profile,
+    UseCase,
+    resolve_policy,
+    worst_case_seconds,
+)
 from ol_llm.prompts import (
     ChatTemplate,
     ManagedPrompt,
@@ -94,9 +112,14 @@ _PYDANTIC_AI_MODULES = frozenset({"pydantic_ai", "httpx2"})
 
 __all__ = [
     "Attribution",
+    "BatchFailed",
+    "BatchKeys",
+    "BatchReport",
     "CallPolicy",
     "CatalogEntry",
     "ChatTemplate",
+    "Chunk",
+    "CircuitBreaker",
     "DegradedReason",
     "EmbedResult",
     "GatewayRoute",
@@ -113,6 +136,8 @@ __all__ = [
     "ManagedPrompt",
     "PostProcessed",
     "Profile",
+    "Provenance",
+    "RowFailure",
     "Settings",
     "TemplateType",
     "TextTemplate",
@@ -121,18 +146,21 @@ __all__ = [
     "UseCase",
     "build_agent",
     "build_model",
+    "celery_rate_limit",
     "check_model_ids",
     "complete",
     "complete_sync",
     "configure",
     "configure_tracing",
     "create_prompt",
+    "dagster_pool",
     "degraded_metadata",
     "embed",
     "embed_sync",
     "get_prompt",
     "get_settings",
     "load_catalog",
+    "process_batch",
     "promote_prompt",
     "resolve_policy",
     "run",
@@ -140,6 +168,7 @@ __all__ = [
     "run_sync",
     "trace_fields",
     "usage_limits",
+    "worst_case_seconds",
 ]
 
 

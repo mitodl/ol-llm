@@ -90,18 +90,33 @@ is marked degraded, on the returned value and on the trace as `degraded` and
 
 ## Batch rows
 
-A row failure records its class and does not fail the chunk. `LLMRejected` opens the circuit at
+A row failure records its class and does not fail the chunk. An `LLMRejected` with a 400, 413,
+or 422 rejects the row's input and fails only that row, but ten in a row open the circuit,
+since then the request is wrong for every row. Any other `LLMRejected` opens the circuit at
 once, since retrying a configuration bug burns budget. `LLMRateLimited` and `LLMUnavailable`
-count toward the circuit's threshold. The other errors fail only their row.
+count toward a separate threshold (three in a row by default). A success, or a failure the
+provider answered (invalid output, a content filter, a usage limit, a row rejection), resets
+that count; a rate limit or an outage leaves the rejection count alone.
+
+The next run retries a row that failed with `LLMRateLimited`, `LLMUnavailable`, or an
+`LLMRejected` of the account or model, none of which is about the row. A row rejection,
+`LLMInvalidOutput`, `LLMContentFiltered`, and `LLMBudgetExceeded` would repeat under the same
+prompt and model, so the row waits for its idempotency key to change. When a run of row
+rejections opened the circuit, or every row the batch attempted was rejected for its input,
+the batch reports those rows so the caller can clear them once the request is fixed, since a fixed request parameter does not change the key. The key hashes the row's input, the prompt name, the prompt's
+template hash (its text and template type), and the use case's primary model; the prompt
+version is recorded beside it, not in it.
+A batch whose circuit opened, or whose every attempted row failed, raises.
 
 ## Python status
 
 Implemented: use cases, policy resolution, the error classes, classification of model
 requests, the retry wrapper, fallback composition, the content-filter and output-retry
-settings on agents, the entry points `run`, `run_sync`, `run_stream`, `complete`, and
-`complete_sync`, and the embedding entry points `embed` and `embed_sync`.
+settings on agents, the entry points `run`, `run_sync`, `run_stream`, `complete`,
+`complete_sync`, the embedding entry points `embed` and `embed_sync`, and the batch
+helpers (`ol_llm.batch`).
 
-Not yet: the batch helpers. A bare `agent.run` outside the entry points raises
-PydanticAI's own `ContentFilterError`, `UnexpectedModelBehavior`, and `UsageLimitExceeded`
-rather than `LLMContentFiltered`, `LLMInvalidOutput`, and `LLMBudgetExceeded`, does not apply
-`usage_limits`, does not pass the user id to the provider, and never sets `degraded`.
+A bare `agent.run` outside the entry points raises PydanticAI's own `ContentFilterError`,
+`UnexpectedModelBehavior`, and `UsageLimitExceeded` rather than `LLMContentFiltered`,
+`LLMInvalidOutput`, and `LLMBudgetExceeded`, does not apply `usage_limits`, does not pass the
+user id to the provider, and never sets `degraded`.

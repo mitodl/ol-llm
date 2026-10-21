@@ -74,7 +74,10 @@ class LLMUnavailable(LLMError):
 
 
 class LLMRejected(LLMError):
-    """The provider refused the request, which is our bug or our configuration.
+    """The provider refused the request: our bug or configuration, or one input.
+
+    A 400, 413, or 422 can reject one input (too long, malformed); the batch
+    helpers fail only that row (``ol_llm.batch.rejects_the_row``).
 
     :param status_code: the HTTP status, or ``None`` for a transport error that
         retrying cannot fix (a bad URL scheme, a proxy failure).

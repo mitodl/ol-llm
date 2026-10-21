@@ -245,6 +245,160 @@ switches its queries over once everything is re-embedded. The catalog entry reco
 embedding model's default length, e.g. `ol_llm.load_catalog().get(model_id).dimensions` to
 size a collection without an embedding call.
 
+### Batch
+
+`ol_llm.process_batch(rows, call, persist)` runs `call` on each row and hands every
+`chunk_size` rows to `persist` as soon as they finish, so a crash loses one chunk at most.
+A row whose call raises an `LLMError` goes in the failure ledger (`chunk.failed`) instead of
+failing its chunk. Each `RowFailure` says whether the next run should try the row again:
+rate limits, outages, and rejections of the account or model yes; invalid output, a content
+filter, an exceeded usage limit, or a rejection of the row's input (a 400, 413, or 422) no,
+because the same prompt and model would fail the same way. A `CircuitBreaker` stops the
+batch after the chunk in which any other `LLMRejected` arrives (a 401, 403, 404, or a
+transport error: our bug or configuration, which every later row would repeat), ten rows in
+a row rejected for their input (a request every row gets rejected for), or three
+rate-limited or unavailable rows in a row. The batch then raises `BatchFailed` with sample
+errors, as it does when every attempted row failed, which would otherwise look like a run
+with nothing to do. When rejections opened the circuit, or every attempted row was rejected
+for its input (a batch too short to reach ten), `report.request_rejections` lists those
+rows: they were marked not to retry, but the fix (e.g. dropping a parameter the model no
+longer takes) does not change their key, so clear their skip marks.
+Anything else a call raises is a bug and stops the batch unpersisted.
+
+`ol_llm.BatchKeys(model=use_case.model, prompt=prompt)`, built from the prompt the run
+fetched once at its start, makes the idempotency key from the row's input, the prompt name,
+`prompt.template_hash`, and the model. A prompt or model change reprocesses the row, and an
+Opik outage (which falls back to the same template) does not. The prompt version goes in
+the row's `Provenance`, not the key. Store the key with the row and skip rows whose key
+still matches.
+
+A Dagster asset, where the pool limit set on the instance (`dagster instance concurrency set
+llm/ol-data-platform/feedback-summary 2`) bounds the use case across assets:
+
+```python
+from dataclasses import asdict
+
+import dagster as dg
+import ol_llm
+
+SUMMARY = ol_llm.UseCase(
+    app="ol-data-platform",
+    name="feedback-summary",
+    profile="batch",
+    model="bedrock:global.anthropic.claude-haiku-4-5-20251001-v1:0",
+)
+SUMMARY_PROMPT = ol_llm.TextTemplate(template=EXPORTED_TEXT, version="v3")
+
+
+@dg.asset(pool=ol_llm.dagster_pool(SUMMARY))
+def feedback_summaries(context: dg.AssetExecutionContext) -> None:
+    prompt = ol_llm.get_prompt(
+        SUMMARY.name, project_name=SUMMARY.app, default=SUMMARY_PROMPT
+    )
+    keys = ol_llm.BatchKeys(model=SUMMARY.model, prompt=prompt)
+    stored = load_stored_keys()  # {conversation_pk: idempotency_key}
+    rows = [
+        row
+        for row in load_conversations()
+        if stored.get(row["pk"]) != keys.key(row["text"])
+    ]
+    attribution = ol_llm.Attribution(run_id=context.run_id)
+
+    def summarize(row: dict) -> dict:
+        result = ol_llm.complete_sync(
+            SUMMARY,
+            row["text"],
+            instructions=prompt.format(),
+            attribution=attribution,
+            prompt=prompt,
+        )
+        provenance = keys.provenance(row["text"], result)
+        return {"pk": row["pk"], "summary": result.output, **asdict(provenance)}
+
+    def persist(chunk: ol_llm.Chunk) -> None:
+        upsert_summaries([summary for _row, summary in chunk.succeeded])
+        # Recorded so the next run skips them until the prompt or model changes.
+        upsert_skipped(
+            [
+                failure.row["pk"]
+                for failure in chunk.failed
+                if not failure.retry_next_run
+            ]
+        )
+
+    try:
+        report = ol_llm.process_batch(
+            rows, summarize, persist, max_workers=20, logger=context.log
+        )
+    except ol_llm.BatchFailed as exc:
+        # The request, not these rows, was wrong; retry them once it is fixed.
+        clear_skipped([failure.row["pk"] for failure in exc.report.request_rejections])
+        raise dg.Failure(str(exc)) from exc
+    context.add_output_metadata(
+        {"summarized": report.succeeded, "failed": len(report.failures)}
+    )
+```
+
+A Celery task that summarizes one slice of a group, with the rate limit counted in model
+calls rather than task starts (Celery applies it per worker):
+
+```python
+from celery import shared_task
+from django.db import transaction
+
+import ol_llm
+
+SUMMARY = ol_llm.UseCase(
+    app="mit-learn", name="content-summary", profile="batch", model="openai:gpt-4o-mini"
+)
+SUMMARY_PROMPT = ol_llm.TextTemplate(template=EXPORTED_TEXT, version="v2")
+FILES_PER_TASK = 20
+
+
+@shared_task(
+    bind=True,
+    acks_late=True,
+    rate_limit=ol_llm.celery_rate_limit(100, rows_per_task=FILES_PER_TASK, workers=2),
+)
+def summarize_content_files_task(self, content_file_ids: list[int]) -> int:
+    prompt = ol_llm.get_prompt(
+        SUMMARY.name, project_name=SUMMARY.app, default=SUMMARY_PROMPT
+    )
+    summarizer = ol_llm.build_agent(SUMMARY, instructions=prompt.format())
+    keys = ol_llm.BatchKeys(model=SUMMARY.model, prompt=prompt)
+    attribution = ol_llm.Attribution(run_id=self.request.id)
+    files = [
+        content_file
+        for content_file in ContentFile.objects.filter(id__in=content_file_ids)
+        if content_file.summary_key != keys.key(content_file.content)
+    ]
+
+    def summarize(content_file: ContentFile) -> ol_llm.LLMResult[str]:
+        return ol_llm.run_sync(
+            summarizer, content_file.content, attribution=attribution, prompt=prompt
+        )
+
+    def persist(chunk: ol_llm.Chunk) -> None:
+        with transaction.atomic():
+            for content_file, result in chunk.succeeded:
+                content_file.summary = result.output
+                content_file.summary_key = keys.key(content_file.content)
+                content_file.save(update_fields=["summary", "summary_key"])
+
+    return ol_llm.process_batch(files, summarize, persist, chunk_size=5).succeeded
+```
+
+The breaker lives in one task, so each task of a group has its own. A task time limit
+(Celery `soft_time_limit`, Dagster `dagster/max_runtime`) has to sit above
+`ol_llm.worst_case_seconds(use_case)`, the longest one model request can take under the
+policy (3,300 s per model on the batch profile's defaults), or it kills a call that is still
+retrying.
+
+With `max_workers` above 1, rows run on threads, as in the Dagster example. `complete_sync`
+and `run_sync` over an agent built once both work there, since each thread's event loop gets
+its own provider clients. Threads do not inherit the caller's Opik context, so each row's run
+is its own root trace.
+
 ### Tracing
 
 Tracing reads the variables the Opik SDK reads, so the SDK and the span exporter always send
