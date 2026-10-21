@@ -5,7 +5,9 @@ integration (tracing, prompt management, evaluation), a single timeout and retry
 the attribution fields that let cost, quality, and traffic join across applications.
 
 Importing `ol_llm` sets `OPIK_SENTRY_ENABLE=false` before anything imports the Opik SDK, which
-otherwise replaces the host application's Sentry client with its own, so import it first.
+otherwise replaces the host application's Sentry client with its own, so import it first. It
+also sets `OPIK_ANALYTICS_ENABLE=false`, which stops the SDK reporting which of its features
+get used to Comet. Either one set explicitly in the environment is left alone.
 
 The design is in [mitodl/ol-infrastructure `docs/plans/shared-llm-library-spec.md`](https://github.com/mitodl/ol-infrastructure/blob/main/docs/plans/shared-llm-library-spec.md).
 The rules the code follows are in [`docs/`](https://github.com/mitodl/ol-llm/tree/main/docs):

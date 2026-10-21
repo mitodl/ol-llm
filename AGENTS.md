@@ -23,8 +23,8 @@ uv run prek run --all-files                     # the same hooks CI runs
 
 ## Rules that are easy to break
 
-- `ol_llm/__init__.py` sets `OPIK_SENTRY_ENABLE=false` before anything imports opik. Nothing
-  may import opik ahead of it.
+- `ol_llm/__init__.py` sets `OPIK_SENTRY_ENABLE=false` and `OPIK_ANALYTICS_ENABLE=false` before
+  anything imports opik. Nothing may import opik ahead of it.
 - `opik` is pinned exactly. Bumping it means the smoke test must still pass with the overrides
   in `python/smoke/pyproject.toml`, which are the overrides consumers copy from the README.
 - Do not add litellm as a dependency.

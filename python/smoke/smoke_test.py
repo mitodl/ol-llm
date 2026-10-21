@@ -15,7 +15,8 @@ What it proves, in an environment shaped like a consumer's runtime image:
   a run inside the caller's own @opik.track, where Opik files that run's trace;
 - ol_llm.get_prompt fetches a prompt by label through the SDK, and the run links
   its version to the root trace;
-- importing ol_llm first leaves no Sentry client running.
+- importing ol_llm first leaves no Sentry client running and opik's usage
+  analytics switched off.
 
 Opik and Keycloak are one fake server in this process, which records what it is
 sent. The first OTLP request gets a 401, as an expired token would.
@@ -123,10 +124,15 @@ os.environ.update(
         "OPIK_KEYCLOAK_TOKEN_URL": f"{base}{TOKEN_PATH}",
         "OPIK_KEYCLOAK_CLIENT_ID": "ol-llm-smoke",
         "OPIK_KEYCLOAK_CLIENT_SECRET": "smoke",
+        # Nothing listens on the discard port, so if the analytics default regresses
+        # the events opik reports during the run fail locally instead of reaching
+        # Comet from CI.
+        "OPIK_ANALYTICS_URL": "http://127.0.0.1:9/",
     }
 )
 
-# ol_llm before opik, so OPIK_SENTRY_ENABLE is set before opik reads it.
+# ol_llm before opik, so OPIK_SENTRY_ENABLE and OPIK_ANALYTICS_ENABLE are set before
+# opik reads them.
 import ol_llm  # noqa: E402
 import opik  # noqa: E402
 import sentry_sdk  # noqa: E402
@@ -289,7 +295,11 @@ def _spans(request: Request) -> list[dict[str, str]]:
 
 def main() -> int:
     """Run the checks and return a process exit status."""
-    failures = check()
+    failures = []
+    # Before the run, which is what would report events.
+    if opik.analytics.reporting_allowed():
+        failures.append("opik usage analytics would report after importing ol_llm")
+    failures += check()
     if imported := [name for name in DROPPED if name in sys.modules]:
         failures.append(f"dropped packages were imported: {imported}")
     if sentry_sdk.get_client().dsn is not None:
