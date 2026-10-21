@@ -1906,7 +1906,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.38" },
     { name = "opentelemetry-sdk", specifier = ">=1.38" },
-    { name = "opik", specifier = "==2.2.87" },
+    { name = "opik", specifier = "==2.2.94" },
     { name = "pydantic", specifier = ">=2,<3" },
     { name = "pydantic-ai-harness", marker = "extra == 'harness'", specifier = ">=0.52,<0.53" },
     { name = "pydantic-ai-slim", marker = "extra == 'pydantic-ai'", specifier = ">=2.52,<3" },
@@ -2078,7 +2078,7 @@ wheels = [
 
 [[package]]
 name = "opik"
-version = "2.2.87"
+version = "2.2.94"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3-stubs", extra = ["bedrock-runtime"] },
@@ -2102,9 +2102,9 @@ dependencies = [
     { name = "uuid6" },
     { name = "watchfiles" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c9/66/5fbddb7f10d455f1ba32f298ed907ef1b33a6ac41621757be6bc42e645f6/opik-2.2.87.tar.gz", hash = "sha256:12df4d75260d984908a1af25d8e59596d96ded801823fdca4a240bc943d4f6d7", size = 1369266, upload-time = "2026-10-01T13:31:31.918Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/eb/56/a433a491c46e15bf56bfd439fb18312e92eb2539345d40c869054be1e644/opik-2.2.94.tar.gz", hash = "sha256:5ad6dab275d23cc2820500ba97a65a077dd818bc592bc9bf59e22abcb5389259", size = 1397362, upload-time = "2026-10-07T14:26:53.644Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9f/99/860ad5774c7d583ef3d942cd7cf40f1730e4f203be870489b63ff527c24f/opik-2.2.87-py3-none-any.whl", hash = "sha256:fb681e7e278a8d9267266381686ed78c2386f84adaa4fb4378b4319ffc6cd0f3", size = 2098717, upload-time = "2026-10-01T13:31:30.226Z" },
+    { url = "https://files.pythonhosted.org/packages/f0/1d/15d3b9fd58e60ae789c3ae33931f679600ea4e107c2c555315ef71f22889/opik-2.2.94-py3-none-any.whl", hash = "sha256:f87cd0e890fbf684915ccd09ca102ebf9861ecb2896e3c605723cea7ffadc262", size = 2134186, upload-time = "2026-10-07T14:26:51.506Z" },
 ]
 
 [[package]]
