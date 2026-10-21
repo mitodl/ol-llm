@@ -30,6 +30,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
+from opik import context_storage
 from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import Instrumentation
@@ -76,6 +77,22 @@ def failing(status: int, body: str = "provider said no") -> FunctionModel:
         raise ModelHTTPError(status, "gpt-4o-mini", body=body)
 
     return FunctionModel(fail)
+
+
+def stalling(entered: asyncio.Event) -> FunctionModel:
+    async def stall(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        entered.set()
+        await asyncio.Event().wait()
+        raise AssertionError  # pragma: no cover
+
+    return FunctionModel(stall)
+
+
+def opik_context_is_empty() -> bool:
+    return (
+        context_storage.get_trace_data() is None
+        and context_storage.span_data_stack_empty()
+    )
 
 
 def recording(seen: list[AgentInfo]) -> FunctionModel:
@@ -254,6 +271,51 @@ def test_with_content_a_failure_is_described() -> None:
     assert trace.error_info is not None
     assert ECHO in trace.error_info["message"]
     assert ECHO in trace.error_info["traceback"]
+
+
+def test_a_cancelled_run_closes_its_trace() -> None:
+    left_empty: list[bool] = []
+
+    async def cancel() -> None:
+        entered = asyncio.Event()
+        agent = agent_for(SUMMARY, stalling(entered))
+
+        async def running() -> None:
+            try:
+                await run(agent, "hi")
+            except asyncio.CancelledError:
+                left_empty.append(opik_context_is_empty())
+                raise
+
+        task = asyncio.create_task(running())
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    with opik.record_traces_locally() as storage:
+        asyncio.run(cancel())
+        [trace] = storage.trace_trees
+
+    assert left_empty == [True]
+    assert trace.end_time is not None
+    assert trace.error_info is None
+
+
+def test_a_run_that_times_out_in_the_callers_task_closes_its_trace() -> None:
+    async def time_out() -> bool:
+        agent = agent_for(SUMMARY, stalling(asyncio.Event()))
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(run(agent, "hi"), timeout=0.01)
+        return opik_context_is_empty()
+
+    with opik.record_traces_locally() as storage:
+        left_empty = asyncio.run(time_out())
+        [trace] = storage.trace_trees
+
+    assert left_empty
+    assert trace.end_time is not None
+    assert trace.error_info is None
 
 
 def test_invalid_output_reaches_the_caller_as_llm_invalid_output() -> None:
