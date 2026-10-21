@@ -4,14 +4,18 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 import httpx2
 import opik
 import pytest
+from conftest import PromptLibrary
 from ol_llm import (
     Attribution,
     LLMInvalidOutput,
     LLMRejected,
     LLMResult,
     LLMUnavailable,
+    ManagedPrompt,
     PostProcessed,
+    TextTemplate,
     UseCase,
+    get_prompt,
     run_stream,
     run_sync,
     tracing,
@@ -428,3 +432,47 @@ def test_a_stream_with_tracing_disabled_records_nothing(
 def test_an_agent_not_from_build_agent_is_refused() -> None:
     with pytest.raises(TypeError, match="build_model"):
         streamed(Agent(TestModel()))
+
+
+def test_a_managed_prompt_is_linked_to_the_stream(
+    prompt_library: PromptLibrary,
+) -> None:
+    prompt_library.add("summary", "Summarize.", environments=("production",))
+    prompt = get_prompt(
+        "summary",
+        project_name="mit-learn",
+        default=TextTemplate(template="Summarize."),
+        environment="production",
+    )
+    _, model = scripted()
+    agent = agent_for(SUMMARY, model, instructions=prompt.format())
+
+    with opik.record_traces_locally() as storage:
+        result = streamed(agent, read_text, prompt=prompt)
+        [trace] = storage.trace_trees
+
+    assert (result.prompt_name, result.prompt_version) == ("summary", "v1")
+    assert trace.metadata is not None
+    assert trace.metadata["prompt_name"] == "summary"
+    [linked] = trace.metadata["opik_prompts"]
+    assert linked["version"]["version_number"] == "v1"
+
+
+def test_an_embedded_prompt_marks_the_stream_degraded() -> None:
+    prompt = ManagedPrompt(
+        name="summary",
+        template=TextTemplate(template="Summarize.", version="v3"),
+        source="embedded",
+        degraded_reasons=("embedded_prompt",),
+    )
+    _, model = scripted()
+    agent = agent_for(SUMMARY, model)
+
+    with opik.record_traces_locally() as storage:
+        result = streamed(agent, read_text, prompt=prompt)
+        [trace] = storage.trace_trees
+
+    assert (result.prompt_name, result.prompt_version) == ("summary", "v3")
+    assert result.degraded_reasons == ("embedded_prompt",)
+    assert trace.metadata is not None
+    assert trace.metadata["degraded_reason"] == "embedded_prompt"

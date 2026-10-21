@@ -7,13 +7,16 @@ from dataclasses import replace
 
 import opik
 import pytest
-from conftest import GEMINI
+from conftest import GEMINI, PromptLibrary
 from ol_llm import (
     Attribution,
     LLMInvalidOutput,
     LLMRateLimited,
+    ManagedPrompt,
     PostProcessed,
+    TextTemplate,
     UseCase,
+    get_prompt,
     run,
     run_sync,
     tracing,
@@ -492,3 +495,97 @@ def test_run_stream_works_under_successive_event_loops(real_client: UseCase) -> 
     outputs = [asyncio.run(stream()) for _ in range(2)]
 
     assert outputs == ["ok", "ok"]
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_a_managed_prompt_is_linked_to_the_run(
+    prompt_library: PromptLibrary,
+    sync: bool,  # noqa: FBT001
+) -> None:
+    prompt_library.add("summary", "Summarize.", environments=("production",))
+    prompt = get_prompt(
+        "summary",
+        project_name="mit-learn",
+        default=TextTemplate(template="Summarize."),
+        environment="production",
+    )
+    agent = agent_for(SUMMARY, replying("ok"), instructions=prompt.format())
+
+    with opik.record_traces_locally() as storage:
+        if sync:
+            result = run_sync(agent, "hi", prompt=prompt)
+        else:
+            result = asyncio.run(run(agent, "hi", prompt=prompt))
+        [trace] = storage.trace_trees
+
+    assert (result.prompt_name, result.prompt_version) == ("summary", "v1")
+    assert not result.degraded
+    assert trace.metadata is not None
+    assert trace.metadata["prompt_name"] == "summary"
+    assert trace.metadata["prompt_version"] == "v1"
+    [linked] = trace.metadata["opik_prompts"]
+    assert linked["version"]["version_number"] == "v1"
+
+
+def test_an_embedded_prompt_marks_the_result_and_the_trace() -> None:
+    prompt = ManagedPrompt(
+        name="summary",
+        template=TextTemplate(template="Summarize.", version="v3"),
+        source="embedded",
+        degraded_reasons=("embedded_prompt",),
+    )
+    agent = agent_for(
+        SUMMARY_WITH_FALLBACK, {PRIMARY: failing(503), FALLBACK: replying("backup")}
+    )
+
+    with opik.record_traces_locally() as storage:
+        result = run_sync(agent, "summarize", prompt=prompt)
+        [trace] = storage.trace_trees
+
+    assert (result.prompt_name, result.prompt_version) == ("summary", "v3")
+    assert result.degraded_reasons == ("fallback_model", "embedded_prompt")
+    assert trace.metadata is not None
+    assert trace.metadata["degraded_reason"] == "fallback_model,embedded_prompt"
+    assert trace.metadata["prompt_version"] == "v3"
+    assert "opik_prompts" not in trace.metadata
+
+
+@pytest.mark.parametrize("source", ["opik", "embedded"])
+def test_a_nested_run_names_its_prompt_on_the_callers_trace(
+    prompt_library: PromptLibrary, source: str
+) -> None:
+    prompt_library.add("summary", "Summarize.", environments=("production",))
+    prompt = (
+        get_prompt(
+            "summary",
+            project_name="mit-learn",
+            default=TextTemplate(template="Summarize."),
+            environment="production",
+        )
+        if source == "opik"
+        else ManagedPrompt(
+            name="summary",
+            template=TextTemplate(template="Summarize.", version="v1"),
+            source="embedded",
+        )
+    )
+    agent = agent_for(SUMMARY, replying("ok"), instructions=prompt.format())
+
+    @opik.track(project_name="mit-learn")
+    def handler() -> None:
+        run_sync(agent, "hi", prompt=prompt)
+
+    with opik.record_traces_locally() as storage:
+        handler()
+        [trace] = storage.trace_trees
+
+    assert trace.name == "handler"
+    assert trace.metadata is not None
+    assert trace.metadata["prompt_name"] == "summary"
+    assert trace.metadata["prompt_version"] == "v1"
+
+
+def test_without_a_prompt_the_result_names_none() -> None:
+    result = run_sync(agent_for(SUMMARY, replying("ok")), "hi")
+
+    assert (result.prompt_name, result.prompt_version) == (None, None)
