@@ -7,9 +7,10 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import ol_llm.catalog as catalog_module
 import opik
 import pytest
-from ol_llm import UseCase, models, run_sync
+from ol_llm import UseCase, run_sync
 from ol_llm.catalog import (
     TOKENS_PER_MTOK,
     Catalog,
@@ -99,7 +100,7 @@ def use_case(model: str, *fallbacks: str) -> UseCase:
 @pytest.fixture
 def test_catalog(monkeypatch: pytest.MonkeyPatch) -> Catalog:
     catalog = Catalog.from_toml(TEST_CATALOG)
-    monkeypatch.setattr(models, "load_catalog", lambda: catalog)
+    monkeypatch.setattr(catalog_module, "load_catalog", lambda: catalog)
     return catalog
 
 
@@ -110,7 +111,7 @@ def test_released_catalog_has_both_kinds() -> None:
 
 
 def test_unlisted_model_builds_and_warns(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level(logging.WARNING, logger="ol_llm.models"):
+    with caplog.at_level(logging.WARNING, logger="ol_llm.catalog"):
         model = build_model(use_case("openai:gpt-3.5-turbo"))
 
     assert isinstance(model, PolicyModel)
@@ -150,7 +151,7 @@ def test_build_model_refuses_an_embedding_model() -> None:
 
 @pytest.mark.usefixtures("test_catalog")
 def test_deprecated_model_builds_and_warns(caplog: pytest.LogCaptureFixture) -> None:
-    with caplog.at_level(logging.WARNING, logger="ol_llm.models"):
+    with caplog.at_level(logging.WARNING, logger="ol_llm.catalog"):
         model = build_model(use_case("openai:gpt-4-turbo"))
 
     assert isinstance(model, PolicyModel)

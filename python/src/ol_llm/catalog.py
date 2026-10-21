@@ -15,6 +15,7 @@ Needs no extra: call sites not built on PydanticAI check their ids here too.
 
 import argparse
 import json
+import logging
 import sys
 import tomllib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -34,6 +35,8 @@ from pydantic import (
     model_validator,
 )
 
+from ol_llm.policy import UseCase
+
 ModelKind = Literal["chat", "embedding"]
 ModelStatus = Literal["allowed", "deprecated", "retired"]
 Route = Literal["direct", "gateway"]
@@ -41,6 +44,8 @@ Route = Literal["direct", "gateway"]
 TOKENS_PER_MTOK = 1_000_000
 CATALOG_RESOURCE = "catalog.toml"
 PRICE_RULE_GROUP = "ol_llm_model_prices"
+
+log = logging.getLogger(__name__)
 
 # PydanticAI providers that reach the same model through another API shape. The
 # catalog lists the model once, under the base provider.
@@ -221,6 +226,95 @@ def load_catalog() -> Catalog:
     """
     text = files("ol_llm").joinpath(CATALOG_RESOURCE).read_text(encoding="utf-8")
     return Catalog.from_toml(text)
+
+
+def catalog_entries(use_case: UseCase, *, kind: ModelKind) -> list[CatalogEntry | None]:
+    """Look up every model the use case names; retired models and other kinds raise.
+
+    The catalog is not an allowlist: an id it does not list builds, with a warning
+    and no entry, and a deprecated one builds with a warning.
+
+    :param use_case: the call site.
+    :param kind: the kind of model the caller builds.
+    :returns: the entries, in the order of ``use_case.model_ids``, with ``None``
+        for an id the catalog does not list.
+    :rtype: list[CatalogEntry | None]
+    :raises ValueError: on a model id not in ``provider:model`` form, that is
+        retired, or that the catalog lists as another kind, or fallbacks behind a
+        route that falls back on its own.
+    """
+    catalog = load_catalog()
+    entries = [
+        catalog.buildable(model_id, kind=kind) for model_id in use_case.model_ids
+    ]
+    primary = entries[0]
+    if use_case.fallback_models and primary is not None and primary.route_falls_back:
+        msg = (
+            f"Use case {use_case.name!r} declares fallback_models, but the route to "
+            f"{use_case.model!r} already falls back on its own (spec §6.4)"
+        )
+        raise ValueError(msg)
+    for model_id, entry in zip(use_case.model_ids, entries, strict=True):
+        if entry is None:
+            log.warning(
+                "Use case %s names %s, which the model catalog does not list, so "
+                "the spend rules have no price for it",
+                use_case.name,
+                model_id,
+            )
+        elif entry.status == "deprecated":
+            log.warning(
+                "Use case %s names %s, which is deprecated and retires on %s",
+                use_case.name,
+                model_id,
+                entry.retires_on,
+            )
+    return entries
+
+
+def status_tags(entries: Iterable[CatalogEntry | None]) -> tuple[str, ...]:
+    """Return the ``model_status`` trace tags for a chain's catalog entries.
+
+    :param entries: one per model, ``None`` for a model the catalog does not list.
+    :returns: the tags, in a stable order.
+    :rtype: tuple[str, ...]
+    """
+    statuses = set()
+    for entry in entries:
+        if entry is None:
+            statuses.add("uncataloged")
+        elif entry.status == "deprecated":
+            statuses.add("deprecated")
+    return tuple(f"model_status:{status}" for status in sorted(statuses))
+
+
+def embedding_entry(use_case: UseCase) -> CatalogEntry | None:
+    """Check an embedding use case against the catalog and return its entry.
+
+    Another model's vectors are not comparable with the primary's, so an embedding
+    use case takes no fallback, its own or its gateway route's.
+
+    :param use_case: the call site.
+    :returns: the entry, or ``None`` when the catalog does not list the model.
+    :rtype: CatalogEntry | None
+    :raises ValueError: if the use case declares fallbacks, or its model is not in
+        ``provider:model`` form, is retired, is listed as a chat model, or is on a
+        gateway route that falls back.
+    """
+    if use_case.fallback_models:
+        msg = (
+            f"Use case {use_case.name!r} declares fallback_models; an embedding use "
+            "case takes none, since another model's vectors are not comparable"
+        )
+        raise ValueError(msg)
+    [entry] = catalog_entries(use_case, kind="embedding")
+    if entry is not None and entry.route_falls_back:
+        msg = (
+            f"{use_case.model}'s gateway route falls back on its own; an embedding "
+            "use case cannot take another model's vectors, which are not comparable"
+        )
+        raise ValueError(msg)
+    return entry
 
 
 @dataclass(frozen=True)

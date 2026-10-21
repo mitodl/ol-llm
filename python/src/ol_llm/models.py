@@ -7,7 +7,6 @@ the extra for each provider a use case names.
 """
 
 import asyncio
-import logging
 import os
 import random
 import sys
@@ -17,7 +16,6 @@ from collections.abc import (
     Awaitable,
     Callable,
     Generator,
-    Iterable,
     Iterator,
     Mapping,
     Sequence,
@@ -73,7 +71,7 @@ from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.usage import RequestUsage, UsageLimits
 
 from ol_llm.attribution import USE_CASE_HEADER, Attribution
-from ol_llm.catalog import CatalogEntry, ModelKind, load_catalog
+from ol_llm.catalog import CatalogEntry, catalog_entries, status_tags
 from ol_llm.errors import (
     LLMBudgetExceeded,
     LLMContentFiltered,
@@ -86,8 +84,6 @@ from ol_llm.errors import (
 from ol_llm.policy import CallPolicy, Profile, UseCase, resolve_policy
 from ol_llm.settings import GatewayRoute, Settings, get_settings
 from ol_llm.tracing import include_content, tracer_provider
-
-log = logging.getLogger(__name__)
 
 OutputT = TypeVar("OutputT")
 _T = TypeVar("_T")
@@ -958,50 +954,6 @@ def _provider_model(
     return infer_model(model_id, provider_factory=factory)
 
 
-def catalog_entries(use_case: UseCase, *, kind: ModelKind) -> list[CatalogEntry | None]:
-    """Look up every model the use case names; retired models and other kinds raise.
-
-    The catalog is not an allowlist: an id it does not list builds, with a warning
-    and no entry, and a deprecated one builds with a warning.
-
-    :param use_case: the call site.
-    :param kind: the kind of model the caller builds.
-    :returns: the entries, in the order of ``use_case.model_ids``, with ``None``
-        for an id the catalog does not list.
-    :rtype: list[CatalogEntry | None]
-    :raises ValueError: on a model id not in ``provider:model`` form, that is
-        retired, or that the catalog lists as another kind, or fallbacks behind a
-        route that falls back on its own.
-    """
-    catalog = load_catalog()
-    entries = [
-        catalog.buildable(model_id, kind=kind) for model_id in use_case.model_ids
-    ]
-    primary = entries[0]
-    if use_case.fallback_models and primary is not None and primary.route_falls_back:
-        msg = (
-            f"Use case {use_case.name!r} declares fallback_models, but the route to "
-            f"{use_case.model!r} already falls back on its own (spec §6.4)"
-        )
-        raise ValueError(msg)
-    for model_id, entry in zip(use_case.model_ids, entries, strict=True):
-        if entry is None:
-            log.warning(
-                "Use case %s names %s, which the model catalog does not list, so "
-                "the spend rules have no price for it",
-                use_case.name,
-                model_id,
-            )
-        elif entry.status == "deprecated":
-            log.warning(
-                "Use case %s names %s, which is deprecated and retires on %s",
-                use_case.name,
-                model_id,
-                entry.retires_on,
-            )
-    return entries
-
-
 def build_model(use_case: UseCase, *, settings: Settings | None = None) -> Model:
     """Build the model for a use case: the primary and any fallbacks, under policy.
 
@@ -1084,22 +1036,6 @@ def catalog_tags(model: Model) -> tuple[str, ...]:
             raise TypeError(msg)
         entries.append(member.catalog_entry)
     return status_tags(entries)
-
-
-def status_tags(entries: Iterable[CatalogEntry | None]) -> tuple[str, ...]:
-    """Return the ``model_status`` trace tags for a chain's catalog entries.
-
-    :param entries: one per model, ``None`` for a model the catalog does not list.
-    :returns: the tags, in a stable order.
-    :rtype: tuple[str, ...]
-    """
-    statuses = set()
-    for entry in entries:
-        if entry is None:
-            statuses.add("uncataloged")
-        elif entry.status == "deprecated":
-            statuses.add("deprecated")
-    return tuple(f"model_status:{status}" for status in sorted(statuses))
 
 
 def instrumentation_settings(use_case: UseCase) -> InstrumentationSettings | None:

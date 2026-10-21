@@ -68,6 +68,7 @@ from ol_llm.settings import (
     configure,
     get_settings,
 )
+from ol_llm.traces import EmbeddingRequest, traced_embedding
 from ol_llm.tracing import (
     KeycloakClient,
     TracingConfig,
@@ -122,6 +123,7 @@ __all__ = [
     "CircuitBreaker",
     "DegradedReason",
     "EmbedResult",
+    "EmbeddingRequest",
     "GatewayRoute",
     "KeycloakClient",
     "LLMBudgetExceeded",
@@ -167,6 +169,7 @@ __all__ = [
     "run_stream",
     "run_sync",
     "trace_fields",
+    "traced_embedding",
     "usage_limits",
     "worst_case_seconds",
 ]

@@ -9,6 +9,7 @@ from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+import ol_llm.catalog as catalog_module
 import opik
 import pytest
 from botocore.exceptions import ReadTimeoutError
@@ -26,7 +27,6 @@ from ol_llm import (
     embed,
     embed_sync,
     embeddings,
-    models,
     tracing,
 )
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
@@ -581,7 +581,7 @@ def test_build_embedder_refuses_a_route_that_falls_back(
         output_usd_per_mtok=Decimal(0),
     )
     catalog = Catalog({**load_catalog().entries, routed.id: routed})
-    monkeypatch.setattr(models, "load_catalog", lambda: catalog)
+    monkeypatch.setattr(catalog_module, "load_catalog", lambda: catalog)
 
     with pytest.raises(ValueError, match="route falls back"):
         build_embedder(UseCase(app="a", name="b", profile="batch", model=routed.id))
@@ -598,7 +598,7 @@ def test_build_embedder_refuses_a_provider_it_does_not_build(
         output_usd_per_mtok=Decimal(0),
     )
     catalog = Catalog({**load_catalog().entries, cohere.id: cohere})
-    monkeypatch.setattr(models, "load_catalog", lambda: catalog)
+    monkeypatch.setattr(catalog_module, "load_catalog", lambda: catalog)
 
     with pytest.raises(ValueError, match="does not build 'cohere' embedding"):
         build_embedder(UseCase(app="a", name="b", profile="batch", model=cohere.id))

@@ -10,6 +10,7 @@ from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+import ol_llm.catalog as catalog_module
 import pytest
 from ol_llm import GatewayRoute, UseCase, models, tracing
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
@@ -368,7 +369,7 @@ def real_client(
         output_usd_per_mtok=Decimal(1),
     )
     catalog = Catalog({**load_catalog().entries, GEMINI: gemini})
-    monkeypatch.setattr(models, "load_catalog", lambda: catalog)
+    monkeypatch.setattr(catalog_module, "load_catalog", lambda: catalog)
     model, *fallbacks = request.param
     # A chain's primary is unavailable, so every call is answered by a fallback.
     prefix = "/unavailable" if fallbacks else ""

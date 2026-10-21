@@ -51,7 +51,8 @@ and Google default credential chains, and so on). Operators can change a use cas
 without a release, e.g. `OL_LLM_CONTENT_SUMMARY_TIMEOUT_SECONDS=120`.
 
 Call sites not built on PydanticAI (LangGraph, a plain SDK) apply the same numbers with
-`ol_llm.resolve_policy(use_case)`, which needs no extra.
+`ol_llm.resolve_policy(use_case)`, which needs no extra. Their embedding requests go through
+`ol_llm.traced_embedding` (see Embeddings).
 
 Run the agent with `ol_llm.run`, or `ol_llm.run_sync` in a Celery task or Dagster asset:
 
@@ -209,14 +210,14 @@ An embedding call site is a use case too, naming an embedding model from the cat
 `complete`, `ol_llm.embed` (or `ol_llm.embed_sync`) takes the use case and the texts:
 
 ```python
-SEARCH_QUERY = ol_llm.UseCase(
-    app="mit-learn",
-    name="search-query",
-    profile="request",
-    model="openai:text-embedding-3-large",
+FEEDBACK_EMBEDDING = ol_llm.UseCase(
+    app="ol-data-platform",
+    name="feedback-embedding",
+    profile="batch",
+    model="bedrock:amazon.titan-embed-text-v2:0",
 )
 
-result = ol_llm.embed_sync(SEARCH_QUERY, [query], input_type="query")
+result = ol_llm.embed_sync(FEEDBACK_EMBEDDING, [summary], input_type="document")
 result.embeddings  # one vector per text
 result.model, result.dimensions  # store these with the vectors
 ```
@@ -231,6 +232,41 @@ than texts, raises `LLMInvalidOutput`. The attribution's user id reaches OpenAI 
 the request's `user` field; Bedrock and Google have no such field, so for them it is on the
 trace only. An embedding use case takes no `fallback_models`, since
 another model's vectors are not comparable with the primary's.
+
+A call site built on LangChain or LangGraph keeps its own embedding client, since `embed`
+would bring PydanticAI in beside it, and its OpenAI path needs `openai>=3.19`, which litellm
+and llama-index-llms-openai do not allow yet. It wraps each provider request in
+`ol_llm.traced_embedding`, which needs no extra:
+
+```python
+SEARCH_QUERY = ol_llm.UseCase(
+    app="mit-learn",
+    name="search-query",
+    profile="request",
+    model="openai:text-embedding-3-large",
+)
+
+with ol_llm.traced_embedding(SEARCH_QUERY, [query], attribution=attribution) as request:
+    response = litellm.embedding(model="text-embedding-3-large", input=[query])
+    cached = response._hidden_params.get("cache_hit") is True
+    request.record(
+        [item["embedding"] for item in response.data],
+        input_tokens=0 if cached else response.usage.prompt_tokens,
+    )
+```
+
+It runs the same catalog checks as `embed`, opens the same root trace, and records a span
+shaped like `embed`'s with the model and the input tokens the caller reports. Report zero for
+a response served wholly from a cache, since litellm fills in the usage of cached items.
+litellm also marks a partial hit as a cache hit and sums cached and billed usage, so for
+several texts count the misses' tokens or embed them without its cache. Read the response
+before `to_dict()`, which drops `_hidden_params`. Wrap each request rather than a call that
+hedges around several, so every billed request is counted; a request made on a worker
+thread is its own root trace unless it is submitted with `contextvars.copy_context().run`.
+The client must call the use case's model. Retries, timeouts (from `resolve_policy`), and
+errors stay with the client: the block's exception passes through unchanged, and the trace
+records its message only when `OL_LLM_TRACE_CONTENT` is on. A block that ends without
+`record` raises `ValueError`.
 
 Hedging, caching, batching texts to the provider's limits, and the vector store stay in the
 application. Bedrock's Titan models take one text per request, so the library sends one

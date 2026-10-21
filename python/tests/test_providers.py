@@ -15,9 +15,10 @@ from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+import ol_llm.catalog as catalog_module
 import pytest
 from botocore.exceptions import EventStreamError
-from ol_llm import LLMRejected, LLMUnavailable, UseCase, models
+from ol_llm import LLMRejected, LLMUnavailable, UseCase
 from ol_llm.attribution import USE_CASE_HEADER
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.embeddings import PolicyEmbeddingModel, build_embedder
@@ -61,7 +62,7 @@ def provider_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
         output_usd_per_mtok=Decimal(0),
     )
     catalog = Catalog({**released.entries, **unlisted})
-    monkeypatch.setattr(models, "load_catalog", lambda: catalog)
+    monkeypatch.setattr(catalog_module, "load_catalog", lambda: catalog)
 
 
 def use_case(model: str) -> UseCase:
