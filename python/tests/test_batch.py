@@ -1,7 +1,9 @@
 import pickle
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import pytest
@@ -31,6 +33,7 @@ from ol_llm import (
     run_sync,
 )
 from ol_llm.models import build_agent, override_models
+from pydantic import BaseModel, ConfigDict, create_model
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -506,6 +509,47 @@ def test_workers_run_real_clients_on_their_own_event_loops(
     assert [result for chunk in persist.chunks for _, result in chunk.succeeded] == [
         "ok"
     ] * 6
+
+
+class Deferred(BaseModel):
+    """Built on first use, as the openai SDK builds its response models."""
+
+    model_config = ConfigDict(defer_build=True)
+
+
+def test_workers_first_using_a_deferred_model_all_see_it_built() -> None:
+    # Before pydantic 2.14, every thread that found a deferred model unbuilt rebuilt
+    # it with no lock, deleting and resetting the model's schema attributes while
+    # other threads read them. Here that surfaces as an AttributeError for
+    # __pydantic_core_schema__; in the openai SDK, as a response that cannot be
+    # constructed. Each trial races a new model; a short switch interval makes the
+    # threads interleave inside the rebuild.
+    workers = 16
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    try:
+        with ThreadPoolExecutor(workers) as pool:
+            for trial in range(200):
+                inner = create_model(
+                    f"Inner{trial}",
+                    __base__=Deferred,
+                    **{f"field{n}": (str, "") for n in range(5)},
+                )
+                model = create_model(
+                    f"Outer{trial}", __base__=Deferred, inner=(list[inner], [])
+                )
+                start = threading.Barrier(workers)
+
+                def first_use(
+                    model: type[BaseModel] = model, start: threading.Barrier = start
+                ) -> BaseModel:
+                    start.wait()
+                    return model.model_validate({"inner": [{}]})
+
+                for future in [pool.submit(first_use) for _ in range(workers)]:
+                    future.result()
+    finally:
+        sys.setswitchinterval(interval)
 
 
 def test_a_rejection_with_workers_stops_later_chunks() -> None:

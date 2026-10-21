@@ -29,8 +29,11 @@ dependencies = [
     "opentelemetry-exporter-otlp-proto-http>=1.38",
     "opentelemetry-sdk>=1.38",
     "opik==2.2.94",
-    # Validates the model catalog. opik requires it already.
-    "pydantic>=2,<3",
+    # Validates the model catalog. opik requires it already. 2.14 makes rebuilding a
+    # deferred model thread-safe (pydantic/pydantic#13438); the openai SDK defers
+    # its response models, so batch workers' first concurrent responses failed to
+    # parse before it.
+    "pydantic>=2.14,<3",
     # The OTLP exporter takes a requests session, which is where the refreshing
     # Keycloak auth for span export attaches.
     "requests>=2.32",
