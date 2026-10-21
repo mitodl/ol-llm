@@ -124,6 +124,10 @@ os.environ.update(
         "OPIK_KEYCLOAK_TOKEN_URL": f"{base}{TOKEN_PATH}",
         "OPIK_KEYCLOAK_CLIENT_ID": "ol-llm-smoke",
         "OPIK_KEYCLOAK_CLIENT_SECRET": "smoke",
+        # Nothing listens on the discard port, so if the analytics default regresses
+        # the events opik reports during the run fail locally instead of reaching
+        # Comet from CI.
+        "OPIK_ANALYTICS_URL": "http://127.0.0.1:9/",
     }
 )
 
@@ -291,13 +295,15 @@ def _spans(request: Request) -> list[dict[str, str]]:
 
 def main() -> int:
     """Run the checks and return a process exit status."""
-    failures = check()
+    failures = []
+    # Before the run, which is what would report events.
+    if opik.analytics.reporting_allowed():
+        failures.append("opik usage analytics would report after importing ol_llm")
+    failures += check()
     if imported := [name for name in DROPPED if name in sys.modules]:
         failures.append(f"dropped packages were imported: {imported}")
     if sentry_sdk.get_client().dsn is not None:
         failures.append("a Sentry client is running after importing opik")
-    if opik.analytics.reporting_allowed():
-        failures.append("opik usage analytics would report after importing ol_llm")
 
     print(f"ol-llm {ol_llm.__version__}: {len(FakeOpik.received)} requests to Opik")
     for failure in failures:
