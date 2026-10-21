@@ -7,11 +7,12 @@ from dataclasses import replace
 
 import opik
 import pytest
-from conftest import GEMINI, PromptLibrary
+from conftest import GEMINI, PromptLibrary, assert_error_kept_without_content
 from ol_llm import (
     Attribution,
     LLMInvalidOutput,
     LLMRateLimited,
+    LLMRejected,
     ManagedPrompt,
     PostProcessed,
     TextTemplate,
@@ -55,6 +56,8 @@ SUMMARY_WITH_FALLBACK = UseCase(
     fallback_models=(FALLBACK,),
 )
 ATTRIBUTION = Attribution(user_id="user-1", thread_id="thread-1", run_id="run-1")
+# A provider error body that quotes the request.
+ECHO = "echoed: the learner's essay"
 
 
 class Summary(BaseModel):
@@ -68,9 +71,9 @@ def replying(text: str) -> FunctionModel:
     return FunctionModel(reply)
 
 
-def failing(status: int) -> FunctionModel:
+def failing(status: int, body: str = "provider said no") -> FunctionModel:
     def fail(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
-        raise ModelHTTPError(status, "gpt-4o-mini", body="provider said no")
+        raise ModelHTTPError(status, "gpt-4o-mini", body=body)
 
     return FunctionModel(fail)
 
@@ -219,6 +222,38 @@ def test_a_provider_failure_reaches_the_caller_as_the_library_error() -> None:
     assert isinstance(caught.value.__cause__, ModelHTTPError)
     assert trace.error_info is not None
     assert trace.error_info["exception_type"] == "LLMRateLimited"
+
+
+@pytest.mark.parametrize("entry", [run_sync, lambda *a: asyncio.run(run(*a))])
+def test_without_content_a_failure_keeps_only_its_type_and_frames(
+    entry: Callable[..., object], exported: InMemorySpanExporter
+) -> None:
+    tracing.reset()
+    configure_tracing(TracingConfig(include_content=False))
+    agent = agent_for(SUMMARY, failing(400, ECHO))
+
+    with opik.record_traces_locally() as storage:
+        with pytest.raises(LLMRejected, match=ECHO):
+            entry(agent, "hi")
+        [trace] = storage.trace_trees
+    tracing.flush()
+
+    assert trace.error_info is not None
+    assert trace.error_info["exception_type"] == "LLMRejected"
+    assert_error_kept_without_content(trace, exported.get_finished_spans(), ECHO)
+
+
+def test_with_content_a_failure_is_described() -> None:
+    agent = agent_for(SUMMARY, failing(400, ECHO))
+
+    with opik.record_traces_locally() as storage:
+        with pytest.raises(LLMRejected):
+            run_sync(agent, "hi")
+        [trace] = storage.trace_trees
+
+    assert trace.error_info is not None
+    assert ECHO in trace.error_info["message"]
+    assert ECHO in trace.error_info["traceback"]
 
 
 def test_invalid_output_reaches_the_caller_as_llm_invalid_output() -> None:

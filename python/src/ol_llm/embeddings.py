@@ -438,7 +438,7 @@ async def embed(
         results.append(_finish(call, result))
         return _trace_output(results[0])
 
-    await call.track(traced)(listed)
+    await call.track_async(traced)(listed)
     return results[0]
 
 

@@ -446,7 +446,7 @@ to the same instance:
 | `OPIK_WORKSPACE` | `default` on our instances |
 | `OPIK_KEYCLOAK_TOKEN_URL`, `OPIK_KEYCLOAK_CLIENT_ID`, `OPIK_KEYCLOAK_CLIENT_SECRET` | the Keycloak client the app authenticates to Opik with; `OPIK_KEYCLOAK_SCOPE` if it needs one. Leave `OPIK_API_KEY` unset |
 | `OPIK_TRACK_DISABLE` | `true` turns tracing off, for local development without an Opik |
-| `OL_LLM_TRACE_CONTENT` | `false` keeps prompts, completions, and tool arguments out of traces. On by default until the data-handling policy decides |
+| `OL_LLM_TRACE_CONTENT` | `false` keeps prompts, completions, tool arguments, and error messages out of traces. On by default until the data-handling policy decides |
 
 Without a call, tracing reads these the first time an agent or embedder is built or a run
 starts. A host

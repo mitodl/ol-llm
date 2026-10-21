@@ -5,7 +5,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -16,11 +16,13 @@ from ol_llm import GatewayRoute, UseCase, models, tracing
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.settings import Settings, configure
 from ol_llm.tracing import TracingConfig, configure_tracing
+from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
 from opik.api_objects.prompt import prompt_cache
+from opik.message_processing.emulation.models import TraceModel
 
 _PROMPTS = "/api/v1/private/prompts/versions"
 _ENVIRONMENTS = re.compile(rf"{_PROMPTS}/(?P<id>[^/]+)/environments")
@@ -212,6 +214,30 @@ os.environ["OPIK_WORKSPACE"] = "default"
 
 
 TRACING = TracingConfig()
+
+# A frame of a traceback that names where each frame is and quotes nothing.
+_FRAME = re.compile(r'  File ".+", line \d+, in \S+')
+
+
+def assert_error_kept_without_content(
+    trace: TraceModel, spans: Sequence[ReadableSpan], text: str
+) -> None:
+    """Check a failed call recorded its error's type and frames, and not ``text``.
+
+    :param trace: the call's root trace, from ``opik.record_traces_locally``.
+    :param spans: the model spans the call exported.
+    :param text: what the error's message carries, e.g. a provider's response body.
+    """
+    error = trace.error_info
+    assert error is not None
+    assert error["exception_type"]
+    assert error.get("message") is None
+    frames = error["traceback"].splitlines()
+    assert frames
+    assert all(_FRAME.fullmatch(frame) for frame in frames), frames
+    assert text not in repr(trace)
+    assert spans
+    assert not [span.name for span in spans if text in span.to_json()]
 
 
 @pytest.fixture(autouse=True)

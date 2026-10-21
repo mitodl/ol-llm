@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 import httpx2
 import opik
 import pytest
-from conftest import PromptLibrary
+from conftest import PromptLibrary, assert_error_kept_without_content
 from ol_llm import (
     Attribution,
     LLMInvalidOutput,
@@ -22,6 +22,7 @@ from ol_llm import (
 )
 from ol_llm.models import build_agent, override_models
 from ol_llm.testing import tracing_disabled
+from ol_llm.tracing import TracingConfig, configure_tracing
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
@@ -46,6 +47,8 @@ SUMMARY_WITH_FALLBACK = UseCase(
 )
 ATTRIBUTION = Attribution(user_id="user-1", thread_id="thread-1", run_id="run-1")
 CHUNKS = ("a ", "short ", "summary")
+# A provider error body that quotes the request.
+ECHO = "echoed: the learner's essay"
 
 
 class Summary(BaseModel):
@@ -79,12 +82,12 @@ def scripted(*failures: Exception) -> tuple[Scripted, FunctionModel]:
     return script, FunctionModel(script, stream_function=script.stream)
 
 
-def failing(status: int) -> FunctionModel:
+def failing(status: int, body: str = "provider said no") -> FunctionModel:
     def fail(_m: list[ModelMessage], _i: AgentInfo) -> ModelResponse:
-        raise ModelHTTPError(status, "gpt-4o-mini", body="provider said no")
+        raise ModelHTTPError(status, "gpt-4o-mini", body=body)
 
     async def stream(_m: list[ModelMessage], _i: AgentInfo) -> AsyncIterator[str]:
-        raise ModelHTTPError(status, "gpt-4o-mini", body="provider said no")
+        raise ModelHTTPError(status, "gpt-4o-mini", body=body)
         yield ""  # pragma: no cover
 
     return FunctionModel(fail, stream_function=stream)
@@ -295,6 +298,24 @@ def test_a_failure_before_the_first_chunk_raises_on_entry() -> None:
         streamed(agent)
 
     assert isinstance(caught.value.__cause__, ModelHTTPError)
+
+
+def test_without_content_a_failure_keeps_only_its_type_and_frames(
+    exported: InMemorySpanExporter,
+) -> None:
+    tracing.reset()
+    configure_tracing(TracingConfig(include_content=False))
+    agent = agent_for(SUMMARY, failing(400, ECHO))
+
+    with opik.record_traces_locally() as storage:
+        with pytest.raises(LLMRejected):
+            streamed(agent)
+        [trace] = storage.trace_trees
+    tracing.flush()
+
+    assert trace.error_info is not None
+    assert trace.error_info["exception_type"] == "LLMRejected"
+    assert_error_kept_without_content(trace, exported.get_finished_spans(), ECHO)
 
 
 @pytest.mark.parametrize(

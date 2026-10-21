@@ -14,9 +14,11 @@ tag still find it. With tracing off, runs open no trace.
 
 ``run_stream`` holds the same root trace open while the caller consumes the stream
 inside its own ``async with``. ``opik.track`` cannot do that: on an async generator
-it makes the trace current only during each ``__anext__``. So the entry and exit
-halves of the SDK's decorator run around the caller's block instead, which reaches
-into opik internals that the exact opik pin and the smoke test keep honest.
+it makes the trace current only during each ``__anext__``. Nor can it keep an
+exception's message off the trace when ``include_content`` is off. So every entry
+point runs the entry and exit halves of the SDK's decorator around its call
+(``TracedCall.trace_scope``) instead, which reaches into opik internals that the
+exact opik pin and the smoke test keep honest.
 
 ``complete`` and ``complete_sync`` are the single-call path: a tool-less agent over
 the use case's model, run by ``run``, so a call site that outgrows them builds the
@@ -317,7 +319,7 @@ async def run(  # noqa: PLR0913
         results.append(state.finish(result))
         return results[0].output
 
-    await state.track(traced)(user_prompt)
+    await state.track_async(traced)(user_prompt)
     return results[0]
 
 
