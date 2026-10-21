@@ -1,23 +1,35 @@
 import asyncio
+import logging
+from collections.abc import Generator
+from datetime import date
 from decimal import Decimal
 
 import ol_llm.catalog as catalog_module
 import opik
 import pytest
-from ol_llm import Attribution, UseCase, traced_embedding, tracing
+from ol_llm import Attribution, UseCase, embed_sync, traced_embedding, traces, tracing
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
-from ol_llm.testing import tracing_disabled
+from ol_llm.testing import override_embedding_models, tracing_disabled
 from ol_llm.tracing import PROJECT_ATTRIBUTE, TracingConfig, configure_tracing
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
 from opentelemetry.trace import StatusCode
+from pydantic_ai.embeddings.test import TestEmbeddingModel
 
 MODEL = "openai:text-embedding-3-small"
 
 SEARCH = UseCase(app="mit-learn", name="search-query", profile="request", model=MODEL)
 ATTRIBUTION = Attribution(user_id="user-1", thread_id="thread-1", run_id="run-1")
 VECTORS = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
+
+
+@pytest.fixture(autouse=True)
+def fresh_catalog_checks() -> Generator[None]:
+    """Check each test's use cases against the catalog it patches in."""
+    traces._model_tags.cache_clear()  # noqa: SLF001
+    yield
+    traces._model_tags.cache_clear()  # noqa: SLF001
 
 
 def embed_two(use_case: UseCase = SEARCH, *, input_tokens: int = 7) -> None:
@@ -250,3 +262,136 @@ def test_an_unlisted_model_is_traced_tagged_and_warned_about(
 
     assert "model_status:uncataloged" in (trace.tags or [])
     assert "the model catalog does not list" in caplog.text
+
+
+def test_the_root_trace_and_span_match_embeds(exported: InMemorySpanExporter) -> None:
+    with (
+        override_embedding_models(
+            TestEmbeddingModel("text-embedding-3-small", provider_name="openai")
+        ),
+        opik.record_traces_locally() as storage,
+    ):
+        result = embed_sync(SEARCH, ["a"], input_type="query", attribution=ATTRIBUTION)
+        with traced_embedding(SEARCH, ["a"], attribution=ATTRIBUTION) as request:
+            request.record(result.embeddings, input_tokens=result.usage.input_tokens)
+        embedded, traced = storage.trace_trees
+    tracing.flush()
+
+    def fields(trace: object) -> tuple[object, ...]:
+        names = ("name", "project_name", "thread_id", "tags", "metadata")
+        return (*(getattr(trace, name) for name in names), trace.input, trace.output)  # type: ignore[attr-defined]
+
+    assert fields(traced) == fields(embedded)
+    embed_span, traced_span = exported.get_finished_spans()
+    shared = (
+        "gen_ai.operation.name",
+        "gen_ai.provider.name",
+        "gen_ai.request.model",
+        "gen_ai.response.model",
+        "gen_ai.usage.input_tokens",
+        "gen_ai.embeddings.dimension.count",
+        "inputs_count",
+        "inputs",
+        PROJECT_ATTRIBUTE,
+    )
+    assert traced_span.name == embed_span.name
+    embed_attributes = embed_span.attributes or {}
+    traced_attributes = traced_span.attributes or {}
+    assert {key: traced_attributes.get(key) for key in shared} == {
+        key: embed_attributes.get(key) for key in shared
+    }
+
+
+def test_a_single_text_is_one_input() -> None:
+    with opik.record_traces_locally() as storage:
+        with traced_embedding(SEARCH, "a query") as request:
+            request.record([[1.0]], input_tokens=2)
+        [trace] = storage.trace_trees
+
+    assert request.texts == ["a query"]
+    assert trace.input == {"texts": ["a query"]}
+
+
+def test_without_content_an_error_keeps_only_its_type(
+    exported: InMemorySpanExporter,
+) -> None:
+    tracing.reset()
+    configure_tracing(TracingConfig(include_content=False))
+
+    with pytest.raises(RuntimeError), traced_embedding(SEARCH, ["a"]):
+        raise RuntimeError("the provider echoed: secret text")  # noqa: EM101, TRY003
+    tracing.flush()
+
+    [span] = exported.get_finished_spans()
+    assert span.status.status_code is StatusCode.ERROR
+    assert span.status.description is None
+    [event] = span.events
+    assert dict(event.attributes or {}) == {
+        "exception.type": "RuntimeError",
+        "exception.escaped": "False",
+    }
+
+
+def test_with_content_an_error_is_described(exported: InMemorySpanExporter) -> None:
+    with pytest.raises(RuntimeError), traced_embedding(SEARCH, ["a"]):
+        raise RuntimeError("rate limited")  # noqa: EM101, TRY003
+    tracing.flush()
+
+    [span] = exported.get_finished_spans()
+    assert span.status.description == "RuntimeError: rate limited"
+    [event] = span.events
+    assert (event.attributes or {})["exception.message"] == "rate limited"
+
+
+def test_a_deprecated_model_is_traced_tagged_and_warned_about(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    deprecated = CatalogEntry(
+        id="openai:text-embedding-old",
+        kind="embedding",
+        dimensions=1024,
+        status="deprecated",
+        retires_on=date(2027, 1, 1),
+        input_usd_per_mtok=Decimal("0.1"),
+        output_usd_per_mtok=Decimal(0),
+    )
+    catalog = Catalog({**load_catalog().entries, deprecated.id: deprecated})
+    monkeypatch.setattr(catalog_module, "load_catalog", lambda: catalog)
+
+    with opik.record_traces_locally() as storage:
+        embed_two(UseCase(app="a", name="b", profile="batch", model=deprecated.id))
+        [trace] = storage.trace_trees
+
+    assert "model_status:deprecated" in (trace.tags or [])
+    assert "2027-01-01" in caplog.text
+
+
+def test_an_unlisted_model_warns_once_per_use_case(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    unlisted = UseCase(
+        app="a", name="b", profile="batch", model="openai:text-embedding-ada-002"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="ol_llm.catalog"):
+        embed_two(unlisted)
+        embed_two(unlisted)
+
+    assert caplog.text.count("does not list") == 1
+
+
+def test_a_route_that_falls_back_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    routed = CatalogEntry(
+        id="openai:text-embedding-3-large",
+        kind="embedding",
+        dimensions=3072,
+        route="gateway",
+        route_falls_back=True,
+        input_usd_per_mtok=Decimal("0.13"),
+        output_usd_per_mtok=Decimal(0),
+    )
+    catalog = Catalog({**load_catalog().entries, routed.id: routed})
+    monkeypatch.setattr(catalog_module, "load_catalog", lambda: catalog)
+
+    with pytest.raises(ValueError, match="route falls back"):
+        embed_two(UseCase(app="a", name="b", profile="batch", model=routed.id))

@@ -246,8 +246,8 @@ SEARCH_QUERY = ol_llm.UseCase(
     model="openai:text-embedding-3-large",
 )
 
-with ol_llm.traced_embedding(SEARCH_QUERY, texts, attribution=attribution) as request:
-    response = litellm.embedding(model="text-embedding-3-large", input=texts)
+with ol_llm.traced_embedding(SEARCH_QUERY, [query], attribution=attribution) as request:
+    response = litellm.embedding(model="text-embedding-3-large", input=[query])
     cached = response._hidden_params.get("cache_hit") is True
     request.record(
         [item["embedding"] for item in response.data],
@@ -257,11 +257,16 @@ with ol_llm.traced_embedding(SEARCH_QUERY, texts, attribution=attribution) as re
 
 It runs the same catalog checks as `embed`, opens the same root trace, and records a span
 shaped like `embed`'s with the model and the input tokens the caller reports. Report zero for
-a response served from a cache, since litellm fills in the usage of cached items, and wrap
-each request rather than a call that hedges around several, so every billed request is
-counted. The client must call the use case's model. Retries, timeouts (from
-`resolve_policy`), and errors stay with the client: the block's exception passes through
-unchanged. A block that ends without `record` raises `ValueError`.
+a response served wholly from a cache, since litellm fills in the usage of cached items.
+litellm also marks a partial hit as a cache hit and sums cached and billed usage, so for
+several texts count the misses' tokens or embed them without its cache. Read the response
+before `to_dict()`, which drops `_hidden_params`. Wrap each request rather than a call that
+hedges around several, so every billed request is counted; a request made on a worker
+thread is its own root trace unless it is submitted with `contextvars.copy_context().run`.
+The client must call the use case's model. Retries, timeouts (from `resolve_policy`), and
+errors stay with the client: the block's exception passes through unchanged, and the span
+records its message only when `OL_LLM_TRACE_CONTENT` is on. A block that ends without
+`record` raises `ValueError`.
 
 Hedging, caching, batching texts to the provider's limits, and the vector store stay in the
 application. Bedrock's Titan models take one text per request, so the library sends one

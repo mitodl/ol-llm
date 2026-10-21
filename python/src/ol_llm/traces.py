@@ -17,6 +17,7 @@ import json
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import cache
 from typing import Any, TypeVar
 
 import opik
@@ -197,6 +198,15 @@ class TracedCall:
         )
 
 
+@cache
+def _model_tags(use_case: UseCase) -> tuple[str, ...]:
+    """Check a use case's embedding model once, as ``embed`` does per embedder.
+
+    A rejected use case raises every time; an unlisted or deprecated one warns once.
+    """
+    return status_tags([embedding_entry(use_case)])
+
+
 def _embedding_input(texts: list[str]) -> None:
     """Stand in for a traced function, so the trace input matches ``embed``'s."""
 
@@ -222,8 +232,10 @@ class EmbeddingRequest:
 
         :param vectors: the vectors the client returned.
         :param input_tokens: the input tokens the provider billed for this request.
-            Report zero for a response served from a cache: litellm fills in the
-            usage of cached items, which were not billed.
+            Report zero for a response served wholly from a cache: litellm fills
+            in the usage of cached items, which were not billed. litellm also marks
+            a partial hit as a cache hit and sums cached and billed usage, so for
+            several texts count the misses' tokens or embed without its cache.
         """
         dimensions = len(vectors[0]) if vectors else 0
         if self.span is not None:
@@ -255,13 +267,18 @@ def traced_embedding(
     Wrap each provider request, not a call that hedges or caches around several, so
     the trace counts every request that was billed. The client must call the use
     case's model: the span names it. The block's exception passes through
-    unchanged and is recorded on the span and the trace. The texts are recorded
+    unchanged. The span records its message only when ``include_content`` is on;
+    the root trace records it either way, as for ``embed``. The texts are recorded
     only when ``include_content`` is on, and the vectors never are.
+
+    The trace is the current Opik trace's child, or a new root trace. A worker
+    thread does not inherit the caller's context, so a request made on one is its
+    own root trace unless it is submitted with ``contextvars.copy_context().run``.
 
     For example, around litellm's embedding call::
 
-        with ol_llm.traced_embedding(SEARCH_QUERY, texts) as request:
-            response = litellm.embedding(model=..., input=texts)
+        with ol_llm.traced_embedding(SEARCH_QUERY, [query]) as request:
+            response = litellm.embedding(model=..., input=[query])
             cached = response._hidden_params.get("cache_hit") is True
             request.record(
                 [item["embedding"] for item in response.data],
@@ -282,12 +299,11 @@ def traced_embedding(
     if not listed:
         msg = "traced_embedding needs at least one text"
         raise ValueError(msg)
-    entry = embedding_entry(use_case)
     call = TracedCall(
         use_case=use_case,
         attribution=attribution,
         fields=TracedCall.fields_for(
-            use_case, attribution, model_tags=status_tags([entry])
+            use_case, attribution, model_tags=_model_tags(use_case)
         ),
         traced=enabled(),
     )
@@ -319,7 +335,8 @@ def _embedding_span(call: TracedCall, texts: list[str]) -> Generator[Span | None
         "gen_ai.request.model": model_name,
         "inputs_count": len(texts),
     }
-    if include_content():
+    content = include_content()
+    if content:
         attributes["inputs"] = json.dumps(texts)
     with provider.get_tracer("ol_llm").start_as_current_span(
         f"embeddings {model_name}",
@@ -330,6 +347,31 @@ def _embedding_span(call: TracedCall, texts: list[str]) -> Generator[Span | None
         try:
             yield span
         except Exception as exc:
-            span.record_exception(exc)
-            span.set_status(Status(StatusCode.ERROR, str(exc)))
+            _record_error(span, exc, content=content)
             raise
+
+
+def _record_error(span: Span, error: Exception, *, content: bool) -> None:
+    """Mark the span failed, as PydanticAI's ``record_uncaught_errors`` does.
+
+    Without content only the exception's type is kept: a provider's error response
+    can echo the request.
+    """
+    if not span.is_recording():
+        return
+    if content:
+        span.record_exception(error, escaped=False)
+        description: str | None = f"{type(error).__name__}: {error}"
+    else:
+        kind = type(error)
+        name = (
+            kind.__qualname__
+            if kind.__module__ == "builtins"
+            else f"{kind.__module__}.{kind.__qualname__}"
+        )
+        span.add_event(
+            "exception",
+            attributes={"exception.type": name, "exception.escaped": "False"},
+        )
+        description = None
+    span.set_status(Status(StatusCode.ERROR, description=description))
