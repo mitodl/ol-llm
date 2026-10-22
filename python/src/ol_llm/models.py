@@ -1272,6 +1272,54 @@ def build_agent(  # noqa: PLR0913
     )
 
 
+@overload
+def agent_over(
+    model: Model,
+    *,
+    instructions: str | None = None,
+    tools: Sequence[Any] = (),
+    toolsets: Sequence[Any] | None = None,
+    capabilities: Sequence[Any] | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, str]] = (),
+) -> Agent[None, str]: ...
+@overload
+def agent_over(
+    model: Model,
+    *,
+    output_type: OutputSpec[OutputT],
+    instructions: str | None = None,
+    tools: Sequence[Any] = (),
+    toolsets: Sequence[Any] | None = None,
+    capabilities: Sequence[Any] | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, OutputT]] = (),
+) -> Agent[None, OutputT]: ...
+@overload
+def agent_over(
+    model: Model,
+    *,
+    deps_type: type[DepsT],
+    instructions: str | None = None,
+    tools: Sequence[Any] = (),
+    toolsets: Sequence[Any] | None = None,
+    capabilities: Sequence[Any] | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[DepsT, str]] = (),
+) -> Agent[DepsT, str]: ...
+@overload
+def agent_over(
+    model: Model,
+    *,
+    deps_type: type[DepsT],
+    output_type: OutputSpec[OutputT],
+    instructions: str | None = None,
+    tools: Sequence[Any] = (),
+    toolsets: Sequence[Any] | None = None,
+    capabilities: Sequence[Any] | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[DepsT, OutputT]] = (),
+) -> Agent[DepsT, OutputT]: ...
 def agent_over(  # noqa: PLR0913
     model: Model,
     *,
