@@ -91,11 +91,15 @@ _V = TypeVar("_V")
 _NO_DEPS: type[None] = type(None)
 DepsT = TypeVar("DepsT")
 
-RETRYABLE_STATUSES = frozenset({408, 424, 500, 502, 503, 504, 529})
-"""HTTP statuses that mean the provider is unavailable (spec §3.2 rule 2).
+RETRYABLE_STATUSES = frozenset({408, 500, 502, 503, 504, 529})
+"""HTTP statuses that mean the provider is unavailable (spec §6.3)."""
 
-424 is the status PydanticAI gives Bedrock's in-stream modelStreamErrorException,
-which Bedrock says to retry.
+IN_STREAM_RETRYABLE_STATUSES = frozenset({424})
+"""Statuses that mean the provider is unavailable only when reported inside a stream.
+
+PydanticAI gives Bedrock's in-stream modelStreamErrorException status 424, and
+Bedrock says to retry it. Before a stream opens, Bedrock's 424 is a
+ModelErrorException, which it gives no retry advice for, so it stays rejected.
 """
 
 RATE_LIMITED_STATUS = 429
@@ -218,7 +222,9 @@ def classify_failure(  # noqa: PLR0911
             return LLMRateLimited(
                 message, use_case=use_case, model=model, retry_after=exc.retry_after
             )
-        if exc.status_code in RETRYABLE_STATUSES:
+        if exc.status_code in RETRYABLE_STATUSES or (
+            exc.in_stream and exc.status_code in IN_STREAM_RETRYABLE_STATUSES
+        ):
             return LLMUnavailable(message, use_case=use_case, model=model)
         return LLMRejected(
             message, use_case=use_case, model=model, status_code=exc.status_code

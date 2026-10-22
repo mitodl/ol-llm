@@ -455,6 +455,17 @@ def test_bedrock_stream_error_is_retried_as_unavailable(
     assert len(opened) == 3
 
 
+@pytest.mark.usefixtures("provider_env")
+def test_bedrock_throttle_after_the_first_chunk_is_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent, opened = stream_bedrock(monkeypatch, [*ANSWER[:2], THROTTLED])
+
+    with pytest.raises(LLMRateLimited):
+        asyncio.run(consume(agent))
+    assert len(opened) == 1
+
+
 # An agent refreshes its model's HTTP client at the start of every run, and a
 # provider that made its own client (Google, Mistral) records the loop it ran on.
 @pytest.mark.usefixtures("provider_env")
