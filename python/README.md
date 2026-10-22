@@ -174,7 +174,10 @@ when the block ends. A block that reads the whole stream without calling `result
 the trace. The run's trace stays current for the whole block, so the model spans land in it. A
 failure before the first chunk is retried and falls back as in `run` and raises on entry; a
 failure after it raises `LLMUnavailable` (or another `LLMError`) where the stream is read, and
-is not retried.
+is not retried. Invalid output is not retried either: an output validator's `ModelRetry` raises
+`LLMInvalidOutput`. Validators also run on each partial output (`stream_text(delta=False)`,
+`stream_output()`) with `ctx.partial_output` set, so one that checks for a complete answer
+should return a partial one unchanged.
 
 ### Prompts
 

@@ -399,7 +399,9 @@ async def run_stream(  # noqa: PLR0913
     and raises on entry; a failure after it reaches the caller. Invalid output is
     not retried: PydanticAI's ``run_stream`` keeps the first output that matches
     the output type, so the use case's ``output_retries`` do not apply and the
-    caller gets ``LLMInvalidOutput``. When the block ends with the stream read, the
+    caller gets ``LLMInvalidOutput``. That includes an output validator's
+    ``ModelRetry``, on the complete output or on a partial one, which validators
+    see with ``ctx.partial_output`` set. When the block ends with the stream read, the
     result is built if ``result`` was not called.
 
     :returns: the stream.

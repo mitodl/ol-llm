@@ -46,6 +46,7 @@ from pydantic_ai.exceptions import (
     FallbackExceptionGroup,
     ModelAPIError,
     ModelHTTPError,
+    ModelRetry,
     UnexpectedModelBehavior,
     UsageLimitExceeded,
 )
@@ -274,7 +275,9 @@ def classify_run_failure(
     # ContentFilterError subclasses UnexpectedModelBehavior, so it goes first.
     if isinstance(exc, ContentFilterError):
         return LLMContentFiltered(message, use_case=use_case, model=model)
-    if isinstance(exc, UnexpectedModelBehavior):
+    # A run retries an output validator's ModelRetry; a stream's partial output
+    # is validated without that, so the validator's own exception reaches it.
+    if isinstance(exc, UnexpectedModelBehavior | ModelRetry):
         return LLMInvalidOutput(message, use_case=use_case, model=model)
     if isinstance(exc, UsageLimitExceeded):
         return LLMBudgetExceeded(message, use_case=use_case, model=model)
@@ -1247,7 +1250,8 @@ def build_agent(  # noqa: PLR0913
         ``max_tokens``; see ``agent_over``.
     :param output_validators: called on each output, in order; one that raises
         ``ModelRetry`` sends the output back to the model, within
-        ``use_case.output_retries``.
+        ``use_case.output_retries``. Under ``run_stream`` they are not retried,
+        and they also see each partial output with ``ctx.partial_output`` set.
     :param settings: overrides the configured settings, mainly for tests.
     :returns: the agent.
     :rtype: Agent
@@ -1303,7 +1307,8 @@ def agent_over(  # noqa: PLR0913
     :param model_settings: settings for every request the agent makes.
     :param output_validators: called on each output, in order; one that raises
         ``ModelRetry`` sends the output back to the model, within the use case's
-        ``output_retries``.
+        ``output_retries``. Under ``run_stream`` they are not retried, and they
+        also see each partial output with ``ctx.partial_output`` set.
     :returns: the agent.
     :rtype: Agent
     :raises ValueError: if ``NativeOutput`` is asked of a model that lacks it,

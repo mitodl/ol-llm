@@ -28,7 +28,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 )
 from opik import opik_context
 from pydantic import BaseModel
-from pydantic_ai import Agent
+from pydantic_ai import Agent, ModelRetry
 from pydantic_ai.exceptions import ModelHTTPError, UnexpectedModelBehavior
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
@@ -204,6 +204,33 @@ def test_invalid_output_is_not_retried_and_raises_invalid_output() -> None:
     assert calls == 1
     assert caught.value.model == PRIMARY
     assert isinstance(caught.value.__cause__, UnexpectedModelBehavior)
+
+
+def test_a_validators_retry_on_partial_text_raises_invalid_output() -> None:
+    def complete_sentence(text: str) -> str:
+        if not text.endswith("summary"):
+            msg = "Finish the sentence."
+            raise ModelRetry(msg)
+        return text
+
+    async def slow(_m: list[ModelMessage], _i: AgentInfo) -> AsyncIterator[str]:
+        for chunk in CHUNKS:
+            yield chunk
+            # Past PydanticAI's 0.1 s debounce, so each chunk is validated.
+            await asyncio.sleep(0.15)
+
+    model = FunctionModel(stream_function=slow)
+    agent = agent_for(SUMMARY, model, output_validators=[complete_sentence])
+
+    async def consume() -> None:
+        async with run_stream(agent, "summarize") as stream:
+            async for _ in stream.stream_text(delta=False):
+                pass
+
+    with pytest.raises(LLMInvalidOutput) as caught:
+        asyncio.run(consume())
+
+    assert isinstance(caught.value.__cause__, ModelRetry)
 
 
 def test_the_root_trace_matches_runs(exported: InMemorySpanExporter) -> None:
