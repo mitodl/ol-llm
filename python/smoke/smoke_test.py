@@ -15,6 +15,8 @@ What it proves, in an environment shaped like a consumer's runtime image:
   a run inside the caller's own @opik.track, where Opik files that run's trace;
 - ol_llm.get_prompt fetches a prompt by label through the SDK, and the run links
   its version to the root trace;
+- an Opik LLM-judge metric scores through ol_llm.evaluation.judge_model, which
+  traces the judge call under the eval-judge use case, without litellm;
 - importing ol_llm first leaves no Sentry client running and opik's usage
   analytics switched off.
 
@@ -136,11 +138,13 @@ os.environ.update(
 import ol_llm  # noqa: E402
 import opik  # noqa: E402
 import sentry_sdk  # noqa: E402
+from ol_llm.evaluation import judge_model  # noqa: E402
 from ol_llm.models import override_models  # noqa: E402
 from ol_llm.testing import override_embedding_models  # noqa: E402
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (  # noqa: E402
     ExportTraceServiceRequest,
 )
+from opik.evaluation.metrics import Hallucination  # noqa: E402
 from pydantic_ai.embeddings import TestEmbeddingModel  # noqa: E402
 from pydantic_ai.models.test import TestModel  # noqa: E402
 
@@ -188,6 +192,17 @@ def sdk_traces() -> list[dict[str, Any]]:
     return traces
 
 
+def judge() -> list[str]:
+    """Score with an Opik judge metric whose model calls through ol-llm."""
+    verdict = {"score": 0.0, "reason": ["grounded"]}
+    metric = Hallucination(model=judge_model(APP, "openai:gpt-4o-mini"), track=False)
+    with override_models(TestModel(custom_output_args=verdict)):
+        judged = metric.score(input="ping", output="pong", context=["pong"])
+    if (judged.value, judged.reason) != (0.0, "grounded"):
+        return [f"the judge metric scored {judged}"]
+    return []
+
+
 def check() -> list[str]:  # noqa: C901
     """Run a traced call and return what is wrong with what Opik received."""
     ol_llm.configure_tracing()
@@ -212,6 +227,7 @@ def check() -> list[str]:  # noqa: C901
     )
     with override_embedding_models(TestEmbeddingModel(dimensions=8)):
         embedded = ol_llm.embed_sync(SMOKE_EMBED, ["ping"], input_type="query")
+    failures = judge()
 
     @opik.track(name="caller", project_name=CALLER)
     def caller() -> str:
@@ -221,17 +237,30 @@ def check() -> list[str]:  # noqa: C901
     if not ol_llm.tracing.flush():
         return ["the span exporter did not finish"]
 
-    failures = []
     outputs = (result.output, completed.output, streamed)
     if outputs != ("pong", "pong", "pong"):
         failures.append(f"outputs were {outputs}")
     if embedded.dimensions != 8:  # noqa: PLR2004
         failures.append(f"embedding dimensions were {embedded.dimensions}")
-    names = ("smoke", "smoke-complete", "smoke-stream", "smoke-embed", "caller")
+    names = (
+        "smoke",
+        "smoke-complete",
+        "smoke-stream",
+        "smoke-embed",
+        "eval-judge",
+        "caller",
+    )
     roots = {name: ended_traces(name) for name in names}
     if wrong := {name: ts for name, ts in roots.items() if len(ts) != 1}:
         return [*failures, f"expected one ended trace for each name, got {wrong}"]
-    [trace], [complete_trace], [stream_trace], [embed_trace], callers = roots.values()
+    (
+        [trace],
+        [complete_trace],
+        [stream_trace],
+        [embed_trace],
+        [judge_trace],
+        callers,
+    ) = roots.values()
     expected = {
         "project_name": APP,
         "environment": "ci",
@@ -266,6 +295,7 @@ def check() -> list[str]:  # noqa: C901
             complete_trace["id"],
             stream_trace["id"],
             embed_trace["id"],
+            judge_trace["id"],
         },
         CALLER: {callers[0]["id"]},
     }
