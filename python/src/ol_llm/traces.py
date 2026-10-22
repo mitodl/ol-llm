@@ -59,14 +59,15 @@ class TracedCall:
     :param attribution: the per-call fields.
     :param fields: what the root trace is opened with.
     :param traced: whether tracing was on when the call started.
-    :param prompt: the managed prompt the call uses, linked to its trace.
+    :param prompts: the managed prompts the call uses, each linked to its trace.
+        The first names the call in the trace metadata.
     """
 
     use_case: UseCase
     attribution: Attribution
     fields: TraceFields
     traced: bool
-    prompt: ManagedPrompt[Any] | None = None
+    prompts: tuple[ManagedPrompt[Any], ...] = ()
 
     @staticmethod
     def fields_for(
@@ -130,7 +131,7 @@ class TracedCall:
         return opik_context.get_current_trace_data() if self.traced else None
 
     def mark_trace(self) -> None:
-        """Put the use case's tags, the thread, and the prompt link on the trace.
+        """Put the use case's tags, the thread, and the prompt links on the trace.
 
         For a call the library opened the tags and prompt are already there; for
         one inside a caller's trace, whose own metadata lands on its span, this adds
@@ -146,8 +147,8 @@ class TracedCall:
                 },
                 thread_id=None if trace.thread_id else self.attribution.thread_id,
             )
-            if self.prompt is not None:
-                attach_prompt(self.prompt)
+            for prompt in self.prompts:
+                attach_prompt(prompt)
 
     @contextmanager
     def trace_scope(

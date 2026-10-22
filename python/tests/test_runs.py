@@ -682,6 +682,47 @@ def test_a_nested_run_names_its_prompt_on_the_callers_trace(
     assert trace.metadata["prompt_version"] == "v1"
 
 
+@pytest.mark.parametrize("sync", [False, True])
+def test_every_prompt_is_linked_and_an_embedded_one_marks_the_run(
+    prompt_library: PromptLibrary,
+    sync: bool,  # noqa: FBT001
+) -> None:
+    for name in ("summary.system", "summary.user"):
+        prompt_library.add(name, "Summarize.", environments=("production",))
+    system, user = (
+        get_prompt(
+            name,
+            project_name="mit-learn",
+            default=TextTemplate(template="Summarize."),
+            environment="production",
+        )
+        for name in ("summary.system", "summary.user")
+    )
+    embedded = ManagedPrompt(
+        name="summary.example",
+        template=TextTemplate(template="For example:", version="v2"),
+        source="embedded",
+        degraded_reasons=("embedded_prompt",),
+    )
+    agent = agent_for(SUMMARY, replying("ok"), instructions=system.format())
+    prompts = [system, user, embedded]
+
+    with opik.record_traces_locally() as storage:
+        if sync:
+            result = run_sync(agent, "hi", prompt=prompts)
+        else:
+            result = asyncio.run(run(agent, "hi", prompt=prompts))
+        [trace] = storage.trace_trees
+
+    assert (result.prompt_name, result.prompt_version) == ("summary.system", "v1")
+    assert result.degraded_reasons == ("embedded_prompt",)
+    assert trace.metadata is not None
+    assert trace.metadata["prompt_name"] == "summary.system"
+    assert trace.metadata["degraded_reason"] == "embedded_prompt"
+    linked = [p["name"] for p in trace.metadata["opik_prompts"]]
+    assert linked == ["summary.system", "summary.user"]
+
+
 def test_without_a_prompt_the_result_names_none() -> None:
     result = run_sync(agent_for(SUMMARY, replying("ok")), "hi")
 

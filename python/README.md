@@ -186,7 +186,10 @@ With tracing off (`OPIK_TRACK_DISABLE=true`) `get_prompt` returns the embedded d
 unmarked, so local development needs no Opik.
 
 Passing the prompt to `complete`, `run`, or `run_stream` links its version to the run's trace and puts `prompt_name` and
-`prompt_version` on the result and in the trace metadata. A call site that is not built on
+`prompt_version` on the result and in the trace metadata. A run that renders several managed
+prompts, e.g. the instructions and a user message template, passes them as a list,
+`prompt=[system, update]`: every version is linked, an embedded default among them marks the
+run degraded, and the first names the result and the trace metadata. A call site that is not built on
 PydanticAI gets the link by calling `get_prompt` inside its own `@opik.track`, and marks a
 fallback itself with `degraded_metadata(prompt.degraded_reasons)`.
 
