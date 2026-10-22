@@ -460,9 +460,6 @@ already hold, as a new version, so the job can run on every change to the file. 
 from the file stay in Opik, where the dataset is curated. Fields Opik keeps for itself (`id`,
 `description`, `source`, and the like) are refused.
 
-A failure in the task aborts the whole run at every Opik error tolerance, so the task should
-handle an `LLMError` it can expect (a content filter, say) by returning an output the metrics
-score as a failure.
 
 Run the experiment with the managed prompts the task uses, so Opik links their versions:
 
@@ -516,6 +513,12 @@ check_thresholds(
 `evaluate` refuses an embedded default prompt, since it has no version to link, and tags the
 experiment `app:` and `env:`. `dataset_version` pins what the gate runs against; the latest
 version when omitted.
+
+Opik aborts the whole run when a task raises. `evaluate` catches an `LLMError` from the task
+instead (a content filter, retries spent): the item's output becomes
+`{"ol_llm_error": "<error class>"}`, visible on its trace, a `ValidatorMetric` scores it 0.0,
+and every other metric gives it a failed score, which `check_thresholds` counts as unscored. A
+judge metric's own `LLMError` is a failed score too. Any other exception still aborts the run.
 
 `judge_model(app, model)` gives an Opik judge metric that takes `model=` a model that calls
 through `complete`, under the `eval-judge` use case in the app's project: the judge is
@@ -610,9 +613,10 @@ override-dependencies = [
 
 Drop `openai` from that list if the application uses the `openai` extra. The overrides belong
 in runtime images, not in an environment that runs evaluations: `opik.evaluate` imports
-litellm and openai whenever a task or metric raises. Opik's judge metrics on
-`ol_llm.evaluation.judge_model` do not need litellm, and the smoke test scores one in the
-slimmed install. CI checks this exact list on every change (`python/smoke/`).
+litellm and openai whenever a task or metric raises something other than the `LLMError`
+that `ol_llm.evaluation.evaluate` catches. Opik's judge metrics on
+`ol_llm.evaluation.judge_model` do not need litellm, and the smoke test scores one, and an
+item whose task raised an `LLMError`, in the slimmed install. CI checks this exact list on every change (`python/smoke/`).
 
 Applications that cap how new a dependency may be (`exclude-newer` in uv) should exempt this
 package so releases are usable the day they ship:

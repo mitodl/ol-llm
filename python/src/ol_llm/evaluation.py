@@ -10,7 +10,8 @@ for that:
   run on every change to the file. Each insert that adds items makes a new
   dataset version, which a gate pins.
 - ``evaluate`` runs ``opik.evaluate`` with the managed prompts the task uses, so
-  the experiment links their versions.
+  the experiment links their versions. An ``LLMError`` from the task or a judge
+  fails that item's scores instead of aborting the run.
 - ``ValidatorMetric`` turns a deterministic check (an SRT structure check, a
   placeholder check) into an Opik metric, and ``judge_model`` gives Opik's
   LLM-judge metrics a model that calls through this library, so the judge is
@@ -26,15 +27,14 @@ check from a CI job. Needs the ``pydantic-ai`` extra, and the provider extra for
 the judge's model.
 
 Run ``evaluate`` where the Opik SDK is installed whole, not with the slimming
-overrides: when a task or metric raises, ``opik.evaluate`` checks whether it was a
-rate limit by importing ``openai`` and ``litellm``
-(``opik/evaluation/engine/exception_analyzer.py``), so without them a metric's
-failure aborts the run instead of becoming a failed score. A failure of the task
-itself aborts the run either way, at every Opik error tolerance, so an advisory
-gate reports nothing for that run.
+overrides: when a task or metric raises anything else, ``opik.evaluate`` checks
+whether it was a rate limit by importing ``openai`` and ``litellm``
+(``opik/evaluation/engine/exception_analyzer.py``), so without them that failure
+aborts the run with ``ModuleNotFoundError``.
 """
 
 import argparse
+import functools
 import inspect
 import json
 import logging
@@ -48,7 +48,8 @@ from typing import Any, Literal, cast
 import opik
 import pydantic
 from opik.evaluation.evaluation_result import EvaluationResult
-from opik.evaluation.metrics import BaseMetric, score_result
+from opik.evaluation.metrics import BaseMetric, arguments_helpers, score_result
+from opik.evaluation.metrics.arguments_validator import validate_score_arguments
 from opik.evaluation.models import OpikBaseModel
 from opik.evaluation.models.base_model import ConversationDict
 from pydantic_ai.messages import (
@@ -61,6 +62,7 @@ from pydantic_ai.messages import (
 
 from ol_llm import tracing
 from ol_llm.catalog import load_catalog
+from ol_llm.errors import LLMError
 from ol_llm.policy import UseCase
 from ol_llm.prompts import ManagedPrompt
 from ol_llm.runs import LLMResult, complete, complete_sync
@@ -73,6 +75,10 @@ JUDGE_USE_CASE = "eval-judge"
 
 GateMode = Literal["advisory", "blocking"]
 """Advisory reports and does not fail; blocking fails the check (spec §5.1)."""
+
+LLM_ERROR_FIELD = "ol_llm_error"
+"""The output field ``evaluate`` records, as the error's class name, for an item
+whose task raised an ``LLMError``. It shows on the item's trace in Opik."""
 
 Verdict = bool | Sequence[str]
 """What a validator returns: whether the output passed, or the problems it found,
@@ -279,7 +285,8 @@ class ValidatorMetric(BaseMetric):
     ``lambda source, output: placeholders(source) == placeholders(output)``.
 
     Opik records an exception raised by the check as a failed score, which
-    ``check_thresholds`` counts against the metric.
+    ``check_thresholds`` counts against the metric. An item whose task raised an
+    ``LLMError`` in ``evaluate`` scores 0.0 without running the check.
 
     :param name: the score's name.
     :param check: the validator.
@@ -315,6 +322,10 @@ class ValidatorMetric(BaseMetric):
         :raises TypeError: if the check returns a string, which reads as neither a
             pass nor a list of problems.
         """
+        if (error := inputs.get(LLM_ERROR_FIELD)) is not None:
+            return score_result.ScoreResult(
+                name=self.name, value=0.0, reason=f"the task raised {error}"
+            )
         if missing := sorted(self._required - inputs.keys()):
             msg = (
                 f"{self.name} needs {missing}; the item and output have "
@@ -432,6 +443,82 @@ def seed_dataset(
     return dataset
 
 
+def _guard_task(
+    task: Callable[[dict[str, Any]], dict[str, Any]],
+) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """Return the task with an ``LLMError`` turned into an output naming it.
+
+    Opik aborts the whole run on any task exception (``engine.py``), so one
+    content filter or exhausted retry would leave a gate with nothing to report.
+    """
+
+    @functools.wraps(task)
+    def guarded(item: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return task(item)
+        except LLMError as exc:
+            # The class, not the message: a provider's message can quote the request.
+            log.warning(
+                "The task raised %s; its item scores as a failure", type(exc).__name__
+            )
+            return {LLM_ERROR_FIELD: type(exc).__name__}
+
+    return guarded
+
+
+class _FailsAfterLLMError(BaseMetric):
+    """A metric that reports a failed score for an item an ``LLMError`` cut short.
+
+    Wraps every metric ``evaluate`` runs except ``ValidatorMetric``, which scores
+    such an item 0.0 itself. A judge metric cannot do that: 0.0 is the passing
+    end of some, e.g. ``Hallucination``. So the item gets a failed score, which
+    Opik leaves out of the mean and does not store, and ``check_thresholds``
+    counts as unscored. A judge's own ``LLMError`` is reported the same way,
+    which also keeps Opik's rate-limit check, and its litellm import, off that
+    path.
+
+    :param metric: the metric.
+    """
+
+    def __init__(self, metric: BaseMetric) -> None:
+        """Take the metric's name; the metric keeps its own tracking."""
+        super().__init__(name=metric.name, track=False)
+        self.metric = metric
+
+    def score(
+        self,
+        **inputs: Any,  # noqa: ANN401
+    ) -> score_result.ScoreResult | list[score_result.ScoreResult]:
+        """Score the item with the metric, or fail it after an ``LLMError``."""
+        if (error := inputs.get(LLM_ERROR_FIELD)) is not None:
+            return self._failed(f"the task raised {error}")
+        # What opik.evaluate does before calling a metric, so a missing input
+        # still aborts the run as it would without the wrapper.
+        validate_score_arguments(self.metric, inputs, None)
+        positional, keyword = arguments_helpers.select_score_arguments(
+            self.metric.score, inputs, self.name
+        )
+        try:
+            return self.metric.score(*positional, **keyword)
+        except LLMError as exc:
+            return self._failed(f"the judge raised {type(exc).__name__}")
+
+    def _failed(self, reason: str) -> score_result.ScoreResult:
+        return score_result.ScoreResult(
+            name=self.name, value=0.0, reason=reason, scoring_failed=True
+        )
+
+
+def _guard_metric(metric: BaseMetric) -> BaseMetric:
+    if isinstance(metric, ValidatorMetric):
+        return metric
+    # Opik passes the task span only to a metric whose score names it, which a
+    # wrapper would hide.
+    if "task_span" in inspect.signature(metric.score).parameters:
+        return metric
+    return _FailsAfterLLMError(metric)
+
+
 def evaluate(  # noqa: PLR0913
     task: Callable[[dict[str, Any]], dict[str, Any]],
     *,
@@ -452,6 +539,13 @@ def evaluate(  # noqa: PLR0913
     against. The experiment is tagged with the app and environment, and its
     config records the environment. Buffered traces and spans are sent before it
     returns, so a CI job can exit straight after.
+
+    An ``LLMError`` from the task does not abort the run, as Opik would: the
+    item's output becomes ``{"ol_llm_error": "<error class>"}``, a
+    ``ValidatorMetric`` scores it 0.0, and every other metric reports a failed
+    score, which ``check_thresholds`` counts as unscored. A judge metric's
+    ``LLMError`` is a failed score too. Any other exception from the task still
+    aborts the run.
 
     :param task: called with each dataset item's fields; returns the output the
         metrics score.
@@ -489,8 +583,8 @@ def evaluate(  # noqa: PLR0913
         dataset=source
         if dataset_version is None
         else source.get_version_view(dataset_version),
-        task=task,
-        scoring_metrics=list(metrics),
+        task=_guard_task(task),
+        scoring_metrics=[_guard_metric(metric) for metric in metrics],
         experiment_name=experiment_name,
         experiment_config={"environment": environment, **(experiment_config or {})},
         prompts=[p.opik_prompt for p in prompts if p.opik_prompt is not None],

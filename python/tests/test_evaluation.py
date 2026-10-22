@@ -12,8 +12,10 @@ import pytest
 from conftest import PromptLibrary
 from ol_llm import TextTemplate, UseCase, get_prompt, tracing
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
+from ol_llm.errors import LLMContentFiltered
 from ol_llm.evaluation import (
     JUDGE_USE_CASE,
+    LLM_ERROR_FIELD,
     EvaluationGateError,
     JudgeModel,
     Threshold,
@@ -32,6 +34,8 @@ from opik.evaluation import test_case, test_result
 from opik.evaluation.evaluation_result import EvaluationResult
 from opik.evaluation.metrics import Hallucination
 from opik.evaluation.metrics.score_result import ScoreResult
+from opik.exceptions import ScoreMethodMissingArguments
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -257,7 +261,7 @@ def test_evaluate_links_the_prompt_versions_to_the_experiment(
     assert production_prompt.version == "v2"
     assert call["prompts"] == [production_prompt.opik_prompt]
     assert call["dataset"] == ("summary-golden", "v1")
-    assert call["task"] is task
+    assert call["task"].__wrapped__ is task
     assert call["scoring_metrics"] == [metric]
     assert call["experiment_tags"] == [f"app:{APP}", "env:ci"]
     assert call["experiment_config"] == {
@@ -316,6 +320,168 @@ def test_evaluate_needs_the_prompts_it_runs() -> None:
             metrics=[],
             prompts=[],
         )
+
+
+# Task and judge failures, through Opik's own evaluation engine
+
+ON_OPIKS_ENGINE = pytest.mark.usefixtures("client", "opiks_engine")
+VERDICT = {"score": 0.0, "reason": ["grounded"]}
+FILTERED = "Who wrote the essay?"
+RAG = [
+    {"question": "Who teaches 8.01?", "context": ["Prof. Lewin teaches 8.01."]},
+    {"question": FILTERED, "context": ["A learner wrote it."]},
+]
+
+
+@pytest.fixture
+def opiks_engine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run ``opik.evaluate``'s item engine on the fake dataset's items.
+
+    ``evaluate_on_dict_items`` drives the same ``EvaluationEngine.run_and_score``
+    as ``opik.evaluate``, without the dataset and experiment calls the fake Opik
+    does not answer.
+    """
+    on_items = opik.evaluate_on_dict_items
+
+    def evaluate_items(
+        *,
+        dataset: FakeDataset,
+        task: Callable[[dict[str, Any]], dict[str, Any]],
+        scoring_metrics: list[Any],
+        scoring_key_mapping: dict[str, str],
+        task_threads: int,
+        **_: object,
+    ) -> EvaluationResult:
+        result = on_items(
+            list(dataset.items.values()),
+            task,
+            scoring_metrics=scoring_metrics,
+            scoring_key_mapping=scoring_key_mapping,
+            scoring_threads=task_threads,
+        )
+        return EvaluationResult(
+            experiment_id="exp-1",
+            dataset_id="ds-1",
+            experiment_name="summary-ci",
+            test_results=result.test_results,
+            experiment_url=None,
+            trial_count=1,
+        )
+
+    monkeypatch.setattr(opik, "evaluate", evaluate_items)
+
+
+def answer(item: dict[str, Any]) -> dict[str, Any]:
+    if item["question"] == FILTERED:
+        msg = "filtered"
+        raise LLMContentFiltered(msg, use_case="summary", model=JUDGE)
+    return {"output": "Prof. Lewin."}
+
+
+def run_rag(
+    production_prompt: ManagedPrompt[TextTemplate],
+    task: Callable[[dict[str, Any]], dict[str, Any]] = answer,
+    mapping: dict[str, str] | None = None,
+) -> EvaluationResult:
+    seed_dataset("rag-golden", RAG, project_name=APP)
+    return evaluate(
+        task,
+        dataset="rag-golden",
+        project_name=APP,
+        metrics=[
+            ValidatorMetric("nonempty", nonempty, track=False),
+            Hallucination(model=judge_model(APP, JUDGE), track=False),
+        ],
+        prompts=[production_prompt],
+        scoring_key_mapping={"input": "question"} if mapping is None else mapping,
+        task_threads=1,
+    )
+
+
+def by_question(result: EvaluationResult) -> dict[str, dict[str, ScoreResult]]:
+    return {
+        r.test_case.dataset_item_content["question"]: {
+            s.name: s for s in r.score_results
+        }
+        for r in result.test_results
+    }
+
+
+@ON_OPIKS_ENGINE
+def test_a_task_llm_error_fails_its_item_instead_of_the_run(
+    production_prompt: ManagedPrompt[TextTemplate],
+) -> None:
+    with override_models(TestModel(custom_output_args=VERDICT)):
+        result = run_rag(production_prompt)
+
+    scores = by_question(result)
+    good, filtered = scores[RAG[0]["question"]], scores[FILTERED]
+    assert (good["nonempty"].value, good["hallucination_metric"].value) == (1.0, 0.0)
+    assert not good["hallucination_metric"].scoring_failed
+    assert (filtered["nonempty"].value, filtered["nonempty"].reason) == (
+        0.0,
+        "the task raised LLMContentFiltered",
+    )
+    assert not filtered["nonempty"].scoring_failed
+    judged = filtered["hallucination_metric"]
+    assert judged.scoring_failed
+    assert judged.reason == "the task raised LLMContentFiltered"
+    [failed] = [
+        r for r in result.test_results if r.test_case.task_output.get(LLM_ERROR_FIELD)
+    ]
+    assert failed.test_case.task_output == {LLM_ERROR_FIELD: "LLMContentFiltered"}
+
+    report = check_thresholds(
+        result,
+        [
+            Threshold(metric="nonempty", minimum=1.0),
+            Threshold(metric="hallucination_metric", maximum=0.2),
+        ],
+    )
+    nonempty, hallucination = report.outcomes
+    assert (nonempty.mean, nonempty.unscored, nonempty.passed) == (0.5, 0, False)
+    assert (hallucination.mean, hallucination.unscored) == (0.0, 1)
+    assert not hallucination.passed
+
+
+@ON_OPIKS_ENGINE
+def test_a_judge_llm_error_is_a_failed_score(
+    production_prompt: ManagedPrompt[TextTemplate],
+) -> None:
+    def refuse(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        raise ModelHTTPError(400, "gpt-4o-mini", body="no")
+
+    with override_models(FunctionModel(refuse)):
+        result = run_rag(production_prompt, task=lambda _item: {"output": "x"})
+
+    for scores in by_question(result).values():
+        judged = scores["hallucination_metric"]
+        assert judged.scoring_failed
+        assert judged.reason == "the judge raised LLMRejected"
+        assert scores["nonempty"].value == 1.0
+
+
+@ON_OPIKS_ENGINE
+def test_any_other_task_error_still_aborts_the_run(
+    production_prompt: ManagedPrompt[TextTemplate],
+) -> None:
+    def broken(_item: dict[str, Any]) -> dict[str, Any]:
+        msg = "a bug in the task"
+        raise RuntimeError(msg)
+
+    with pytest.raises(RuntimeError, match="a bug in the task"):
+        run_rag(production_prompt, task=broken)
+
+
+@ON_OPIKS_ENGINE
+def test_a_missing_metric_input_still_aborts_the_run(
+    production_prompt: ManagedPrompt[TextTemplate],
+) -> None:
+    with (
+        override_models(TestModel(custom_output_args=VERDICT)),
+        pytest.raises(ScoreMethodMissingArguments),
+    ):
+        run_rag(production_prompt, task=lambda _item: {"output": "x"}, mapping={})
 
 
 # Metrics
