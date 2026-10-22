@@ -15,8 +15,8 @@ for that:
   placeholder check) into an Opik metric, and ``judge_model`` gives Opik's
   LLM-judge metrics a model that calls through this library, so the judge is
   catalog-checked, routed, retried, and traced like any other call, under the
-  ``eval-judge`` use case. Opik's judge metrics take any ``OpikBaseModel``, and
-  with one they never import litellm.
+  ``eval-judge`` use case. Opik's judge metrics that take a ``model`` accept any
+  ``OpikBaseModel``, and given one they do not import litellm.
 - ``check_thresholds`` compares an experiment's scores to the declared
   thresholds. Gates are advisory until a use case's owner makes them blocking
   (spec §5.1 item 4), so by default it reports and does not raise.
@@ -28,8 +28,10 @@ the judge's model.
 Run ``evaluate`` where the Opik SDK is installed whole, not with the slimming
 overrides: when a task or metric raises, ``opik.evaluate`` checks whether it was a
 rate limit by importing ``openai`` and ``litellm``
-(``opik/evaluation/engine/exception_analyzer.py``), so without them the first
-failure aborts the run instead of becoming a failed score.
+(``opik/evaluation/engine/exception_analyzer.py``), so without them a metric's
+failure aborts the run instead of becoming a failed score. A failure of the task
+itself aborts the run either way, at every Opik error tolerance, so an advisory
+gate reports nothing for that run.
 """
 
 import argparse
@@ -80,9 +82,12 @@ where none means it passed."""
 def judge_model(app: str, model: str) -> "JudgeModel":
     """Return a judge for Opik's LLM-judge metrics that calls through ol-llm.
 
-    Pass it as the ``model`` of any Opik judge metric, e.g.
-    ``Hallucination(model=judge_model("learn-ai", "openai:gpt-4o-mini"))``. The
-    judge should not be the model under test (spec §5.1 item 7).
+    Pass it as the ``model`` of an Opik judge metric that takes one, e.g.
+    ``Hallucination(model=judge_model("learn-ai", "openai:gpt-4o-mini"))``.
+    ``SycEval`` also needs it as ``rebuttal_model``, or it builds a LiteLLM model
+    for the rebuttal; Opik's dataset-item evaluators (``LLMJudge``) take only a
+    model name and cannot use it. The judge should not be the model under test
+    (spec §5.1 item 7).
 
     :param app: the app being evaluated; the judge's calls are traced and costed
         under its project.
@@ -94,9 +99,6 @@ def judge_model(app: str, model: str) -> "JudgeModel":
         an uncataloged model: its spend is shared evaluation cost, and the catalog
         is where that is priced.
     """
-    if load_catalog().buildable(model, kind="chat") is None:
-        msg = f"{model!r} is not in the model catalog; a judge must use a listed model"
-        raise ValueError(msg)
     return JudgeModel(
         UseCase(app=app, name=JUDGE_USE_CASE, profile="batch", model=model)
     )
@@ -110,13 +112,21 @@ class JudgeModel(OpikBaseModel):
     the instructions, the rest the conversation, and a structured verdict comes
     back as its JSON, which is what the metrics parse.
 
-    Build it with ``judge_model``.
+    Build it with ``judge_model``, which names the use case ``eval-judge``.
 
     :param use_case: the judge's use case.
+    :raises ValueError: if the catalog does not list the use case's model, or
+        lists it as retired or as an embedding model.
     """
 
     def __init__(self, use_case: UseCase) -> None:
-        """Hold the use case; the model is built on the first call."""
+        """Check the model against the catalog; it is built on the first call."""
+        if load_catalog().buildable(use_case.model, kind="chat") is None:
+            msg = (
+                f"{use_case.model!r} is not in the model catalog; a judge must use "
+                "a listed model"
+            )
+            raise ValueError(msg)
         super().__init__(model_name=use_case.model)
         self.use_case = use_case
 
@@ -365,6 +375,21 @@ def load_items(path: Path, *, group: str | None = None) -> list[dict[str, Any]]:
     return data
 
 
+_ITEM_FIELDS = frozenset(
+    {
+        "id",
+        "trace_id",
+        "span_id",
+        "source",
+        "description",
+        "evaluators",
+        "execution_policy",
+    }
+)
+"""The keys ``opik.api_objects.dataset.dataset_item.DatasetItem`` takes as its
+own fields rather than as the item's data."""
+
+
 def seed_dataset(
     name: str,
     items: Iterable[Mapping[str, Any]],
@@ -389,11 +414,21 @@ def seed_dataset(
     :returns: the dataset; ``get_current_version_name()`` gives the version to
         pin.
     :rtype: opik.Dataset
+    :raises ValueError: if an item has a field Opik keeps for itself, e.g. ``id``
+        or ``description``.
     """
+    rows = [dict(item) for item in items]
+    if reserved := sorted({key for row in rows for key in row} & _ITEM_FIELDS):
+        msg = (
+            f"Golden items may not have the fields {reserved}: Opik reads them as "
+            "the dataset item's own (an id must be a UUID, a description is dropped "
+            "from what the task sees). Rename them."
+        )
+        raise ValueError(msg)
     dataset = tracing.opik_client().get_or_create_dataset(
         name, description=description, project_name=project_name
     )
-    dataset.insert([dict(item) for item in items])
+    dataset.insert(rows)
     return dataset
 
 
@@ -621,9 +656,9 @@ def check_thresholds(
 ) -> GateReport:
     """Compare an experiment's scores to its thresholds.
 
-    A metric fails its threshold when any item has no score for it, whether its
-    scoring raised or it never ran, since a gate cannot vouch for items it did not
-    score.
+    A metric fails its threshold when any item has no score for it, because its
+    scoring raised or the metric returned no score of that name, since a gate
+    cannot vouch for items it did not score.
 
     :param result: what ``evaluate`` returned.
     :param thresholds: the use case's thresholds.
@@ -637,13 +672,15 @@ def check_thresholds(
         for score in test_result.score_results:
             if not score.scoring_failed:
                 scores.setdefault(score.name, []).append(score.value)
-    return _report(
-        experiment=result.experiment_name or result.experiment_id,
-        url=result.experiment_url,
-        items=len(result.test_results),
-        scores=scores,
-        thresholds=thresholds,
-        mode=mode,
+    return _enforce(
+        _report(
+            experiment=result.experiment_name or result.experiment_id,
+            url=result.experiment_url,
+            items=len(result.test_results),
+            scores=scores,
+            thresholds=thresholds,
+            mode=mode,
+        )
     )
 
 
@@ -667,6 +704,12 @@ def check_experiment(
     :rtype: GateReport
     :raises EvaluationGateError: in blocking mode, if a threshold was not met.
     """
+    return _enforce(_experiment_report(experiment_id, thresholds, mode=mode))
+
+
+def _experiment_report(
+    experiment_id: str, thresholds: Sequence[Threshold], *, mode: GateMode
+) -> GateReport:
     experiment = tracing.opik_client().get_experiment_by_id(experiment_id)
     items = experiment.get_items()
     scores: dict[str, list[float]] = {}
@@ -703,11 +746,15 @@ def _report(  # noqa: PLR0913
                 unscored=max(items - len(values), 0),
             )
         )
-    report = GateReport(
+    return GateReport(
         experiment=experiment, url=url, mode=mode, outcomes=tuple(outcomes)
     )
+
+
+def _enforce(report: GateReport) -> GateReport:
+    """Raise for a blocking miss, log an advisory one, and return the report."""
     if not report.passed:
-        if mode == "blocking":
+        if report.mode == "blocking":
             raise EvaluationGateError(report)
         log.warning("%s", report.describe())
     return report
@@ -760,15 +807,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         version = dataset.get_current_version_name() or "unversioned"
         sys.stdout.write(f"{args.dataset} {version}\n")
         return 0
-    try:
-        report = check_experiment(
-            args.experiment_id, args.threshold, mode=cast("GateMode", args.mode)
-        )
-    except EvaluationGateError as exc:
-        sys.stdout.write(f"{exc}\n")
-        return 1
+    report = _experiment_report(
+        args.experiment_id, args.threshold, mode=cast("GateMode", args.mode)
+    )
     sys.stdout.write(f"{report.describe()}\n")
-    return 0
+    return 1 if report.mode == "blocking" and not report.passed else 0
 
 
 if __name__ == "__main__":

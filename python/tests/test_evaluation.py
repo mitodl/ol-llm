@@ -10,11 +10,12 @@ import ol_llm.catalog as catalog_module
 import opik
 import pytest
 from conftest import PromptLibrary
-from ol_llm import TextTemplate, get_prompt, tracing
+from ol_llm import TextTemplate, UseCase, get_prompt, tracing
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.evaluation import (
     JUDGE_USE_CASE,
     EvaluationGateError,
+    JudgeModel,
     Threshold,
     ValidatorMetric,
     check_thresholds,
@@ -154,6 +155,15 @@ def test_seeding_a_changed_file_adds_only_the_new_items(client: FakeClient) -> N
 
     assert len(client.datasets[APP, "summary-golden"].items) == len(GOLDEN) + 1
     assert dataset.get_current_version_name() == "v2"
+
+
+@pytest.mark.parametrize("field", ["id", "description"])
+def test_seeding_refuses_a_field_opik_keeps_for_itself(
+    client: FakeClient, field: str
+) -> None:
+    with pytest.raises(ValueError, match=f"fields \\['{field}'\\]"):
+        seed_dataset("summary-golden", [{**GOLDEN[0], field: "x"}], project_name=APP)
+    assert not client.datasets
 
 
 def test_load_items_reads_one_named_list(tmp_path: Path) -> None:
@@ -458,6 +468,9 @@ def test_the_judge_model_comes_from_the_catalog_under_the_judge_use_case() -> No
 def test_an_uncataloged_judge_model_is_rejected() -> None:
     with pytest.raises(ValueError, match="not in the model catalog"):
         judge_model(APP, UNCATALOGED)
+    use_case = UseCase(app=APP, name="judge", profile="batch", model=UNCATALOGED)
+    with pytest.raises(ValueError, match="not in the model catalog"):
+        JudgeModel(use_case)
 
 
 def test_a_retired_judge_model_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -611,6 +624,7 @@ def test_the_seed_command_prints_the_version(
 def test_the_check_command_fails_only_when_blocking(
     client: FakeClient,
     capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
     mode: str,
     status: int,
 ) -> None:
@@ -628,6 +642,8 @@ def test_the_check_command_fails_only_when_blocking(
     out = capsys.readouterr().out
     assert "Experiment summary-ci" in out
     assert "FAIL placeholders: mean 1.00, needs >= 1.00 (1 scored, 1 unscored)" in out
+    assert out.count("FAIL placeholders") == 1
+    assert not caplog.records
 
 
 def test_the_check_command_passes_a_met_threshold(

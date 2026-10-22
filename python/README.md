@@ -457,7 +457,12 @@ ol-llm-eval seed test_json/rag_evaluation.json --group syllabus \
 or `seed_dataset("syllabus-golden", load_items(path, group="syllabus"),
 project_name="learn-ai")`. Seeding again adds only items whose content the dataset does not
 already hold, as a new version, so the job can run on every change to the file. Items deleted
-from the file stay in Opik, where the dataset is curated.
+from the file stay in Opik, where the dataset is curated. Fields Opik keeps for itself (`id`,
+`description`, `source`, and the like) are refused.
+
+A failure in the task aborts the whole run at every Opik error tolerance, so the task should
+handle an `LLMError` it can expect (a content filter, say) by returning an output the metrics
+score as a failure.
 
 Run the experiment with the managed prompts the task uses, so Opik links their versions:
 
@@ -512,10 +517,12 @@ check_thresholds(
 experiment `app:` and `env:`. `dataset_version` pins what the gate runs against; the latest
 version when omitted.
 
-`judge_model(app, model)` gives any Opik judge metric a model that calls through
-`complete`, under the `eval-judge` use case in the app's project: the judge is routed,
-retried, traced, and costed like any other call. Its model must be in the catalog; an
-uncataloged id raises. It should not be the model under test.
+`judge_model(app, model)` gives an Opik judge metric that takes `model=` a model that calls
+through `complete`, under the `eval-judge` use case in the app's project: the judge is
+routed, retried, traced, and costed like any other call. Its model must be in the catalog; an
+uncataloged id raises. It should not be the model under test. `SycEval` needs it as
+`rebuttal_model=` too, or it calls a LiteLLM model for the rebuttal; Opik's dataset-item
+evaluators (`LLMJudge`) take only a model name and cannot use it.
 
 `ValidatorMetric(name, check)` makes a deterministic check a metric, scored 1.0 on a pass and
 0.0 otherwise. The check names the item and output fields it takes as parameters and returns
