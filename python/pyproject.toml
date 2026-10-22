@@ -44,7 +44,13 @@ dependencies = [
 pydantic-ai = ["pydantic-ai-slim>=2.52,<3"]
 # Provider SDKs, each through PydanticAI's own extra, so a provider extra also
 # installs PydanticAI.
-anthropic = ["pydantic-ai-slim[anthropic]>=2.52,<3"]
+anthropic = [
+    "pydantic-ai-slim[anthropic]>=2.52,<3",
+    # anthropic 2.0 made BetaMessageParam a Union, which AnthropicModel calls to
+    # build every request, so no released PydanticAI can send one with it:
+    # https://github.com/pydantic/pydantic-ai/issues/10923
+    "anthropic<2",
+]
 bedrock = ["pydantic-ai-slim[bedrock]>=2.52,<3"]
 google = ["pydantic-ai-slim[google]>=2.52,<3"]
 mistral = ["pydantic-ai-slim[mistral]>=2.52,<3"]
