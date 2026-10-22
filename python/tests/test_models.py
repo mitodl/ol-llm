@@ -241,6 +241,40 @@ def test_the_output_tool_may_be_forced_on_an_agent_with_tools() -> None:
     assert result.output == Summary(text="short")
 
 
+@pytest.mark.parametrize("choice", ["required", ["lookup", "record_summary"]])
+def test_a_choice_that_still_reaches_the_output_tool_is_allowed(
+    choice: str | list[str],
+) -> None:
+    def record(_m: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        [tool] = info.output_tools
+        return ModelResponse(parts=[ToolCallPart(tool.name, {"text": "short"})])
+
+    output = ToolOutput(Summary, name="record_summary")
+    with override_models(FunctionModel(record)):
+        agent = build_agent(
+            SUMMARY,
+            output_type=output,
+            tools=[lookup],
+            model_settings={"tool_choice": choice},
+        )
+        result = agent.run_sync("hi")
+
+    assert result.output == Summary(text="short")
+
+
+@pytest.mark.parametrize("override", ["auto", "none"])
+def test_a_runs_choice_lifts_an_agents_forced_function_tool(override: str) -> None:
+    script = Scripted()
+    with override_models(FunctionModel(script)):
+        agent = build_agent(
+            SUMMARY, tools=[lookup], model_settings={"tool_choice": ["lookup"]}
+        )
+        agent.run_sync("hi", model_settings={"tool_choice": override})  # type: ignore[typeddict-item]
+
+    assert script.calls[0].model_settings is not None
+    assert script.calls[0].model_settings["tool_choice"] == override
+
+
 def test_environment_override_reaches_the_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -1102,8 +1102,8 @@ class _RequestSettings(AbstractCapability[Any]):
     A capability, not ``Agent(model_settings=...)``, because the agent refuses a
     static ``tool_choice`` that forces any tool, output tools included, and
     capability settings are not checked. This makes the check that matters: a
-    forced function tool would be called on every request, so the run would never
-    give a final response.
+    choice that forces function tools and leaves out every output tool makes each
+    request call a function tool, so the run would never give a final response.
     """
 
     settings: ModelSettings
@@ -1117,30 +1117,30 @@ class _RequestSettings(AbstractCapability[Any]):
         ctx: RunContext[Any],  # noqa: ARG002 - the hook's signature
         request_context: ModelRequestContext,
     ) -> ModelRequestContext:
-        """Refuse a ``tool_choice`` that forces a function tool.
+        """Refuse a ``tool_choice`` that forces only function tools.
 
-        Checked per request, where every tool the agent has is known, whether it
-        came from ``tools``, ``toolsets``, or a capability.
+        Checked per request against the settings the request will use, after the
+        run's override, and every tool the agent has, whether it came from
+        ``tools``, ``toolsets``, or a capability.
 
-        :raises ValueError: if the settings force a function tool.
+        :raises ValueError: if the choice forces a function tool and no output tool.
         """
-        choice = self.settings.get("tool_choice")
-        functions = {
-            tool.name
-            for tool in request_context.model_request_parameters.function_tools
-        }
-        forced = (
-            functions
-            if choice == "required"
-            else functions.intersection(choice)
-            if isinstance(choice, list)
-            else set()
-        )
-        if forced:
+        choice = (request_context.model_settings or {}).get("tool_choice")
+        parameters = request_context.model_request_parameters
+        # "required" sends every tool with a must-call-one choice, output tools
+        # included; a list restricts the request to the tools it names.
+        if choice == "required":
+            selected = set(parameters.tool_defs)
+        elif isinstance(choice, list):
+            selected = set(choice)
+        else:
+            return request_context
+        forced = selected & {tool.name for tool in parameters.function_tools}
+        if forced and not selected & {tool.name for tool in parameters.output_tools}:
             msg = (
                 f"tool_choice={choice!r} forces the function tools {sorted(forced)} "
-                "on every request, so the run would never give a final response; "
-                "use ToolOrOutput"
+                "and no output tool on every request, so the run would never give a "
+                "final response; use ToolOrOutput or name an output tool"
             )
             raise ValueError(msg)
         return request_context
