@@ -104,6 +104,7 @@ def always(exc: Callable[[], Exception], count: int = 20) -> list[Exception]:
     [
         (http_error(429), LLMRateLimited, None),
         (http_error(408), LLMUnavailable, None),
+        (http_error(424), LLMUnavailable, None),
         (http_error(500), LLMUnavailable, None),
         (http_error(502), LLMUnavailable, None),
         (http_error(503), LLMUnavailable, None),

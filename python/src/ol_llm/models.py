@@ -91,8 +91,12 @@ _V = TypeVar("_V")
 _NO_DEPS: type[None] = type(None)
 DepsT = TypeVar("DepsT")
 
-RETRYABLE_STATUSES = frozenset({408, 500, 502, 503, 504, 529})
-"""HTTP statuses that mean the provider is unavailable (spec §3.2 rule 2)."""
+RETRYABLE_STATUSES = frozenset({408, 424, 500, 502, 503, 504, 529})
+"""HTTP statuses that mean the provider is unavailable (spec §3.2 rule 2).
+
+424 is the status PydanticAI gives Bedrock's in-stream modelStreamErrorException,
+which Bedrock says to retry.
+"""
 
 RATE_LIMITED_STATUS = 429
 INITIAL_BACKOFF_SECONDS = 0.5

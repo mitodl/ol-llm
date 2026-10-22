@@ -440,6 +440,21 @@ def test_bedrock_stream_gives_up_after_its_retries(
     assert len(opened) == 3
 
 
+@pytest.mark.usefixtures("provider_env")
+def test_bedrock_stream_error_is_retried_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream_error = EventStreamError(
+        {"Error": {"Code": "modelStreamErrorException", "Message": "retry"}},
+        "ConverseStream",
+    )
+    agent, opened = stream_bedrock(monkeypatch, [stream_error])
+
+    with pytest.raises(LLMUnavailable):
+        asyncio.run(consume(agent))
+    assert len(opened) == 3
+
+
 # An agent refreshes its model's HTTP client at the start of every run, and a
 # provider that made its own client (Google, Mistral) records the loop it ran on.
 @pytest.mark.usefixtures("provider_env")
