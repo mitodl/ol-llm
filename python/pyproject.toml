@@ -41,24 +41,24 @@ dependencies = [
 
 [project.optional-dependencies]
 # The default construction path for agents and single calls.
-pydantic-ai = ["pydantic-ai-slim>=2.52,<3"]
+pydantic-ai = ["pydantic-ai-slim>=2.59,<3"]
 # Provider SDKs, each through PydanticAI's own extra, so a provider extra also
 # installs PydanticAI.
 anthropic = [
-    "pydantic-ai-slim[anthropic]>=2.52,<3",
+    "pydantic-ai-slim[anthropic]>=2.59,<3",
     # anthropic 2.0 made BetaMessageParam a Union, which AnthropicModel calls to
     # build every request, so no released PydanticAI can send one with it:
     # https://github.com/pydantic/pydantic-ai/issues/10923
     "anthropic<2",
 ]
-bedrock = ["pydantic-ai-slim[bedrock]>=2.52,<3"]
-google = ["pydantic-ai-slim[google]>=2.52,<3"]
-mistral = ["pydantic-ai-slim[mistral]>=2.52,<3"]
-openai = ["pydantic-ai-slim[openai]>=2.52,<3"]
+bedrock = ["pydantic-ai-slim[bedrock]>=2.59,<3"]
+google = ["pydantic-ai-slim[google]>=2.59,<3"]
+mistral = ["pydantic-ai-slim[mistral]>=2.59,<3"]
+openai = ["pydantic-ai-slim[openai]>=2.59,<3"]
 # PydanticAI's first-party capabilities: in-session memory, compaction, and
 # conversation search. Each harness release pins pydantic-ai-slim exactly, so
 # this extra also fixes the PydanticAI version. 0.x: pinned to a minor series.
-harness = ["pydantic-ai-harness>=0.53,<0.54"]
+harness = ["pydantic-ai-harness>=0.59,<0.60"]
 # Client for the shared memory service (cross-session recall and user-scoped
 # facts). Hindsight is the leading candidate and its PoC is still open, so this
 # extra may change backend before the memory interface ships.

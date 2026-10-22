@@ -6,9 +6,11 @@ what arrives.
 """
 
 import asyncio
+import gc
 import json
 import threading
 import time
+import weakref
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -18,7 +20,7 @@ from typing import Any
 import ol_llm.catalog as catalog_module
 import pytest
 from botocore.exceptions import EventStreamError
-from ol_llm import LLMRejected, LLMUnavailable, UseCase
+from ol_llm import LLMRateLimited, LLMRejected, LLMUnavailable, UseCase, run_sync
 from ol_llm.attribution import USE_CASE_HEADER
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.embeddings import PolicyEmbeddingModel, build_embedder
@@ -416,9 +418,39 @@ def test_bedrock_stream_gives_up_after_its_retries(
 ) -> None:
     agent, opened = stream_bedrock(monkeypatch, [THROTTLED])
 
-    with pytest.raises(LLMUnavailable):
+    with pytest.raises(LLMRateLimited):
         asyncio.run(consume(agent))
     assert len(opened) == 3
+
+
+# An agent refreshes its model's HTTP client at the start of every run, and a
+# provider that made its own client (Google, Mistral) records the loop it ran on.
+@pytest.mark.usefixtures("provider_env")
+@pytest.mark.parametrize("model_id", MOCKED_MODELS)
+def test_a_finished_threads_loop_is_released_by_every_provider(
+    mock_provider: MockProvider, monkeypatch: pytest.MonkeyPatch, model_id: str
+) -> None:
+    point_at(mock_provider, model_id, monkeypatch)
+    mock_provider.mode = "rejected"
+    agent = build_agent(use_case(model_id))
+    loops: list[weakref.ref[asyncio.AbstractEventLoop]] = []
+    errors: list[BaseException] = []
+
+    def call() -> None:
+        try:
+            run_sync(agent, "hi")
+        except LLMRejected:
+            loops.append(weakref.ref(asyncio.get_event_loop()))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=call)
+    thread.start()
+    thread.join()
+    gc.collect()
+
+    assert errors == []
+    assert loops[0]() is None
 
 
 @pytest.mark.usefixtures("provider_env")

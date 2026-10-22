@@ -532,6 +532,16 @@ class PolicyModel(WrapperModel):
         """Exit the running loop's provider model."""
         return await self._loop_model().__aexit__(exc_type, exc_val, exc_tb)
 
+    def _refresh_http_client(self) -> None:
+        """Refresh the running loop's provider model, which is the one requests use.
+
+        An agent calls this at the start of every run. ``WrapperModel`` would refresh
+        ``wrapped``, whose provider then records the run's loop as the one its client
+        is used on and keeps it alive as long as the model, which ``shared_model``
+        keeps for the life of the process.
+        """
+        self._loop_model()._refresh_http_client()  # noqa: SLF001
+
     async def count_tokens(
         self,
         messages: list[ModelMessage],
