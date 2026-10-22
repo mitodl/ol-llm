@@ -185,6 +185,25 @@ def test_every_request_gets_the_policy_timeout() -> None:
     assert script.calls[0].model_settings["timeout"] == 60
 
 
+def test_an_agents_model_settings_reach_every_request_under_the_policy() -> None:
+    script = Scripted()
+    with override_models(FunctionModel(script)):
+        agent = build_agent(SUMMARY, model_settings={"max_tokens": 100})
+        agent.run_sync("hi", model_settings={"timeout": 999})
+
+    assert script.calls[0].model_settings is not None
+    assert script.calls[0].model_settings["max_tokens"] == 100
+    assert script.calls[0].model_settings["timeout"] == 60
+
+
+def test_a_forced_tool_is_refused_on_an_agent_with_tools() -> None:
+    def lookup(term: str) -> str:
+        return term  # pragma: no cover
+
+    with override_models(TestModel()), pytest.raises(ValueError, match="ToolOrOutput"):
+        build_agent(SUMMARY, tools=[lookup], model_settings={"tool_choice": ["lookup"]})
+
+
 def test_environment_override_reaches_the_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

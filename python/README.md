@@ -112,6 +112,36 @@ result = ol_llm.complete_sync(
 result.output  # a Rubric
 ```
 
+`model_settings` apply to every request, e.g. `max_tokens`. The timeout and the provider user id
+fields are the library's, and setting them raises `ValueError`. PydanticAI leaves a
+`ToolOutput`'s tool unforced on a request that would think, since forcing a tool turns thinking
+off (Claude models that think by default); naming the tool in `tool_choice` forces it.
+`output_validators` run on the output once it matches the type, and one that raises PydanticAI's
+`ModelRetry` sends the output back to the model with its message, within the use case's
+`output_retries`:
+
+```python
+from pydantic_ai import ModelRetry
+
+
+def score_in_range(rubric: Rubric) -> Rubric:
+    if not 0 <= rubric.score <= 10:
+        raise ModelRetry("score must be between 0 and 10")
+    return rubric
+
+
+result = ol_llm.complete_sync(
+    GRADING,
+    submission,
+    output_type=ToolOutput(Rubric, name="record_grade"),
+    model_settings={"max_tokens": 4000, "tool_choice": ["record_grade"]},
+    output_validators=[score_in_range],
+)
+```
+
+`build_agent` takes both too. An agent with tools may not force a tool, which
+would make every request call one.
+
 `complete` runs a tool-less agent over the use case's model through `run`, so the timeout,
 retries, fallback, trace, errors, and `LLMResult` are the same. The model is built on the first
 call for a use case and reused after that. A call site that grows tools or more steps moves to

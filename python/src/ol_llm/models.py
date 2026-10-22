@@ -67,6 +67,7 @@ from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.output import NativeOutput, OutputSpec
 from pydantic_ai.providers import Provider
+from pydantic_ai.result import OutputValidatorFunc
 from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.usage import RequestUsage, UsageLimits
 
@@ -1086,6 +1087,50 @@ def _check_output_mode(output_type: object, model: Model) -> None:
             raise ValueError(msg)
 
 
+_POLICY_SETTINGS = frozenset({"timeout"})
+# What attribution_model_settings sends.
+_ATTRIBUTION_SETTINGS = frozenset({"openai_user", "anthropic_metadata"})
+
+
+@dataclass
+class _RequestSettings(AbstractCapability[Any]):
+    """A caller's model settings, applied to every request of a run.
+
+    A capability, not ``Agent(model_settings=...)``, because the agent refuses a
+    static ``tool_choice`` that forces a tool, and capability settings are not
+    checked. ``agent_over`` makes the check that matters here.
+    """
+
+    settings: ModelSettings
+
+    def get_model_settings(self) -> ModelSettings:
+        """Return the settings, merged over the agent's and under the run's."""
+        return self.settings
+
+
+def _check_model_settings(settings: ModelSettings, *, has_tools: bool) -> None:
+    if owned := sorted(_POLICY_SETTINGS & settings.keys()):
+        msg = (
+            f"model_settings may not set {owned}: the use case's policy sets it; "
+            "override it with UseCase.timeout_seconds or "
+            "OL_LLM_<USE_CASE>_TIMEOUT_SECONDS"
+        )
+        raise ValueError(msg)
+    if owned := sorted(_ATTRIBUTION_SETTINGS & settings.keys()):
+        msg = (
+            f"model_settings may not set {owned}: the user id comes from "
+            "Attribution.user_id"
+        )
+        raise ValueError(msg)
+    choice = settings.get("tool_choice")
+    if has_tools and (choice == "required" or (isinstance(choice, list) and choice)):
+        msg = (
+            f"tool_choice={choice!r} forces a tool on every request, so an agent "
+            "with tools would never give a final response; use ToolOrOutput"
+        )
+        raise ValueError(msg)
+
+
 @overload
 def build_agent(
     use_case: UseCase,
@@ -1094,6 +1139,8 @@ def build_agent(
     tools: Sequence[Any] = (),
     toolsets: Sequence[Any] | None = None,
     capabilities: Sequence[Any] | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, str]] = (),
     settings: Settings | None = None,
 ) -> Agent[None, str]: ...
 @overload
@@ -1105,6 +1152,8 @@ def build_agent(
     tools: Sequence[Any] = (),
     toolsets: Sequence[Any] | None = None,
     capabilities: Sequence[Any] | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, OutputT]] = (),
     settings: Settings | None = None,
 ) -> Agent[None, OutputT]: ...
 @overload
@@ -1116,6 +1165,8 @@ def build_agent(
     tools: Sequence[Any] = (),
     toolsets: Sequence[Any] | None = None,
     capabilities: Sequence[Any] | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[DepsT, str]] = (),
     settings: Settings | None = None,
 ) -> Agent[DepsT, str]: ...
 @overload
@@ -1128,6 +1179,8 @@ def build_agent(
     tools: Sequence[Any] = (),
     toolsets: Sequence[Any] | None = None,
     capabilities: Sequence[Any] | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[DepsT, OutputT]] = (),
     settings: Settings | None = None,
 ) -> Agent[DepsT, OutputT]: ...
 def build_agent(  # noqa: PLR0913
@@ -1139,6 +1192,8 @@ def build_agent(  # noqa: PLR0913
     tools: Sequence[Any] = (),
     toolsets: Sequence[Any] | None = None,
     capabilities: Sequence[Any] | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[Any, Any]] = (),
     settings: Settings | None = None,
 ) -> Agent[Any, Any]:
     """Build a PydanticAI agent over the use case's model.
@@ -1156,11 +1211,17 @@ def build_agent(  # noqa: PLR0913
     :param tools: function tools.
     :param toolsets: toolsets.
     :param capabilities: capabilities added after the library's own.
+    :param model_settings: settings for every request the agent makes, e.g.
+        ``max_tokens``; see ``agent_over``.
+    :param output_validators: called on each output, in order; one that raises
+        ``ModelRetry`` sends the output back to the model, within
+        ``use_case.output_retries``.
     :param settings: overrides the configured settings, mainly for tests.
     :returns: the agent.
     :rtype: Agent
-    :raises ValueError: if ``NativeOutput`` is asked of a model that lacks it, or
-        ``build_model`` rejects the use case.
+    :raises ValueError: if ``NativeOutput`` is asked of a model that lacks it,
+        ``model_settings`` sets what the library owns, or ``build_model`` rejects
+        the use case.
     """
     return agent_over(
         build_model(use_case, settings=settings),
@@ -1170,6 +1231,8 @@ def build_agent(  # noqa: PLR0913
         tools=tools,
         toolsets=toolsets,
         capabilities=capabilities,
+        model_settings=model_settings,
+        output_validators=output_validators,
     )
 
 
@@ -1182,8 +1245,20 @@ def agent_over(  # noqa: PLR0913
     tools: Sequence[Any] = (),
     toolsets: Sequence[Any] | None = None,
     capabilities: Sequence[Any] | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[Any, Any]] = (),
 ) -> Agent[Any, Any]:
     """Build the agent ``build_agent`` would, over a model already built.
+
+    For agents built per run: every agent over one model shares its provider
+    clients, where each ``build_agent`` call creates new ones.
+
+    ``model_settings`` apply to every request, under the library's own: the policy
+    timeout and the user id from ``Attribution`` are not the caller's to set. A
+    ``tool_choice`` that forces a tool is applied too, which PydanticAI refuses in
+    an agent's own settings: forcing the output tool is how a single structured
+    call makes a model that thinks by default (Claude) call it. With function
+    tools a forced choice would call one on every request, so it is refused.
 
     :param model: a model from ``build_model``.
     :param deps_type: the type of the run's dependencies.
@@ -1192,13 +1267,21 @@ def agent_over(  # noqa: PLR0913
     :param tools: function tools.
     :param toolsets: toolsets.
     :param capabilities: capabilities added after the library's own.
+    :param model_settings: settings for every request the agent makes.
+    :param output_validators: called on each output, in order; one that raises
+        ``ModelRetry`` sends the output back to the model, within the use case's
+        ``output_retries``.
     :returns: the agent.
     :rtype: Agent
-    :raises ValueError: if ``NativeOutput`` is asked of a model that lacks it.
+    :raises ValueError: if ``NativeOutput`` is asked of a model that lacks it,
+        ``model_settings`` sets ``timeout`` or a user id field, or it forces a
+        tool on an agent with tools.
     :raises TypeError: if the model did not come from ``build_model``.
     """
     use_case = call_site(model)
     _check_output_mode(output_type, model)
+    if model_settings:
+        _check_model_settings(model_settings, has_tools=bool(tools or toolsets))
     agent: Agent[Any, Any] = Agent(
         model,
         output_type=output_type,
@@ -1211,12 +1294,15 @@ def agent_over(  # noqa: PLR0913
         capabilities=[
             RaiseContentFilterError(),
             *instrumentation(use_case),
+            *([_RequestSettings(model_settings)] if model_settings else []),
             *(capabilities or ()),
         ],
     )
     # None would take Agent.instrument_all()'s setting when tracing is off. With
     # tracing on, the Instrumentation capability takes precedence over this.
     agent.instrument = False
+    for validator in output_validators:
+        agent.output_validator(validator)
     return agent
 
 

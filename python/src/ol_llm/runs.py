@@ -41,8 +41,9 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
 from pydantic_ai.output import OutputSpec
-from pydantic_ai.result import StreamedRunResult
+from pydantic_ai.result import OutputValidatorFunc, StreamedRunResult
 from pydantic_ai.run import AgentRunResult
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RunUsage
 
 from ol_llm.attribution import (
@@ -439,15 +440,22 @@ async def run_stream(  # noqa: PLR0913
             raise callers
 
 
-def _completion(
+def _completion(  # noqa: PLR0913
     use_case: UseCase,
     messages: Sequence[ModelMessage] | str,
+    *,
     output_type: OutputSpec[Any],
     instructions: str | None,
+    model_settings: ModelSettings | None,
+    output_validators: Sequence[OutputValidatorFunc[None, Any]],
 ) -> tuple[Agent[None, Any], str | None, Sequence[ModelMessage] | None]:
     """Return the agent, user prompt, and history a single call runs with."""
     agent = agent_over(
-        shared_model(use_case), output_type=output_type, instructions=instructions
+        shared_model(use_case),
+        output_type=output_type,
+        instructions=instructions,
+        model_settings=model_settings,
+        output_validators=output_validators,
     )
     if isinstance(messages, str):
         return agent, messages, None
@@ -461,6 +469,8 @@ async def complete(
     messages: Sequence[ModelMessage] | str,
     *,
     instructions: str | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, str]] = (),
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[str], PostProcessed[str]] | None = None,
     prompt: Prompts = None,
@@ -472,6 +482,8 @@ async def complete(
     *,
     output_type: OutputSpec[OutputT],
     instructions: str | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, OutputT]] = (),
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None = None,
     prompt: Prompts = None,
@@ -482,6 +494,8 @@ async def complete(  # noqa: PLR0913
     *,
     output_type: OutputSpec[Any] = str,
     instructions: str | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, Any]] = (),
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[Any], PostProcessed[Any]] | None = None,
     prompt: Prompts = None,
@@ -489,8 +503,9 @@ async def complete(  # noqa: PLR0913
     """Make one model call for a use case, with no agent to build.
 
     The same as ``run`` over ``build_agent(use_case, output_type=...,
-    instructions=...)``: the same model, policy, trace, and errors. The model is
-    built once per use case and reused.
+    instructions=..., model_settings=..., output_validators=...)``: the same
+    model, policy, trace, and errors. The model is built once per use case and
+    reused.
 
     :param use_case: the call site.
     :param messages: the user's message, or the conversation so far ending in the
@@ -498,6 +513,11 @@ async def complete(  # noqa: PLR0913
     :param output_type: the output spec, ``str`` for free text; ``ToolOutput``
         names the tool the model is made to call.
     :param instructions: the instructions.
+    :param model_settings: settings for the request, e.g. ``max_tokens``, or a
+        ``tool_choice`` naming the output tool to force it; see ``agent_over``.
+    :param output_validators: called on the output, in order; one that raises
+        ``ModelRetry`` sends the output back to the model, within the use case's
+        ``output_retries``.
     :param attribution: the per-call attribution fields.
     :param postprocess: as for ``run``.
     :param prompt: the managed prompt ``instructions`` came from, or every prompt
@@ -506,11 +526,17 @@ async def complete(  # noqa: PLR0913
     :rtype: LLMResult
     :raises LLMError: on a model failure, invalid output, a content filter, or an
         exceeded usage limit.
-    :raises ValueError: if ``NativeOutput`` is asked of a model that lacks it, or
-        ``build_model`` rejects the use case.
+    :raises ValueError: if ``NativeOutput`` is asked of a model that lacks it,
+        ``model_settings`` sets what the library owns, or ``build_model`` rejects
+        the use case.
     """
     agent, user_prompt, history = _completion(
-        use_case, messages, output_type, instructions
+        use_case,
+        messages,
+        output_type=output_type,
+        instructions=instructions,
+        model_settings=model_settings,
+        output_validators=output_validators,
     )
     return await run(
         agent,
@@ -528,6 +554,8 @@ def complete_sync(
     messages: Sequence[ModelMessage] | str,
     *,
     instructions: str | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, str]] = (),
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[str], PostProcessed[str]] | None = None,
     prompt: Prompts = None,
@@ -539,6 +567,8 @@ def complete_sync(
     *,
     output_type: OutputSpec[OutputT],
     instructions: str | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, OutputT]] = (),
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None = None,
     prompt: Prompts = None,
@@ -549,6 +579,8 @@ def complete_sync(  # noqa: PLR0913
     *,
     output_type: OutputSpec[Any] = str,
     instructions: str | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, Any]] = (),
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[Any], PostProcessed[Any]] | None = None,
     prompt: Prompts = None,
@@ -562,7 +594,12 @@ def complete_sync(  # noqa: PLR0913
     :rtype: LLMResult
     """
     agent, user_prompt, history = _completion(
-        use_case, messages, output_type, instructions
+        use_case,
+        messages,
+        output_type=output_type,
+        instructions=instructions,
+        model_settings=model_settings,
+        output_validators=output_validators,
     )
     return run_sync(
         agent,

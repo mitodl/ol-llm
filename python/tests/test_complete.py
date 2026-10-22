@@ -33,12 +33,13 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
 from pydantic import BaseModel
-from pydantic_ai import ToolOutput
+from pydantic_ai import ModelRetry, ToolOutput
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    RetryPromptPart,
     TextPart,
     ToolCallPart,
 )
@@ -145,6 +146,110 @@ def test_a_tool_output_forces_a_call_to_the_named_tool() -> None:
     assert [(t.name, t.description) for t in seen[0].output_tools] == [
         ("record_summary", "Record it.")
     ]
+
+
+@ENTRIES
+def test_model_settings_reach_the_request_under_the_librarys(
+    entry: Callable[..., object],
+) -> None:
+    seen: list[AgentInfo] = []
+
+    with override_models(replying("ok", seen)):
+        entry(
+            SUMMARY,
+            "hi",
+            model_settings={"max_tokens": 1024, "temperature": 0.0},
+            attribution=ATTRIBUTION,
+        )
+
+    assert seen[0].model_settings == {
+        "max_tokens": 1024,
+        "temperature": 0.0,
+        "openai_user": "user-1",
+        "anthropic_metadata": {"user_id": "user-1"},
+        "timeout": 60,
+    }
+
+
+def test_a_tool_choice_forces_the_output_tool() -> None:
+    # PydanticAI refuses a forcing tool_choice in an agent's or a run's settings.
+    seen: list[AgentInfo] = []
+    output = ToolOutput(Summary, name="record_summary")
+
+    with override_models(calling_output_tool("short", seen)):
+        result = complete_sync(
+            SUMMARY,
+            "summarize",
+            output_type=output,
+            model_settings={"tool_choice": ["record_summary"]},
+        )
+
+    assert result.output == Summary(text="short")
+    assert seen[0].model_settings is not None
+    assert seen[0].model_settings["tool_choice"] == ["record_summary"]
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"timeout": 300},
+        {"openai_user": "someone"},
+        {"anthropic_metadata": {"user_id": "someone"}},
+    ],
+    ids=["timeout", "openai_user", "anthropic_metadata"],
+)
+def test_settings_the_library_owns_are_refused(settings: dict[str, Any]) -> None:
+    with override_models(replying("ok")), pytest.raises(ValueError, match="may not"):
+        complete_sync(SUMMARY, "hi", model_settings=settings)  # type: ignore[arg-type]
+
+
+@ENTRIES
+def test_an_output_validator_sends_bad_output_back_to_the_model(
+    entry: Callable[..., object],
+) -> None:
+    replies = iter(["", "short"])
+    sent: list[list[ModelMessage]] = []
+
+    def reply(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        sent.append(messages)
+        [tool] = info.output_tools
+        return ModelResponse(parts=[ToolCallPart(tool.name, {"text": next(replies)})])
+
+    def not_empty(output: Summary) -> Summary:
+        if not output.text:
+            msg = "The summary was empty."
+            raise ModelRetry(msg)
+        return output
+
+    with override_models(FunctionModel(reply)):
+        result = entry(
+            SUMMARY, "summarize", output_type=Summary, output_validators=[not_empty]
+        )
+
+    assert result.output == Summary(text="short")  # type: ignore[attr-defined]
+    assert result.usage.requests == 2  # type: ignore[attr-defined]
+    retry = sent[1][-1]
+    assert isinstance(retry, ModelRequest)
+    [part] = retry.parts
+    assert isinstance(part, RetryPromptPart)
+    assert part.content == "The summary was empty."
+
+
+def test_output_still_invalid_after_its_retries_raises_llm_invalid_output() -> None:
+    def never(_output: Summary) -> Summary:
+        msg = "Try again."
+        raise ModelRetry(msg)
+
+    with (
+        override_models(calling_output_tool("short", seen := [])),
+        pytest.raises(LLMInvalidOutput),
+    ):
+        complete_sync(
+            SUMMARY, "summarize", output_type=Summary, output_validators=[never]
+        )
+
+    # The use case's output_retries, 1, then the run fails.
+    assert len(seen) == 2
 
 
 def test_a_message_list_is_sent_as_the_conversation() -> None:
