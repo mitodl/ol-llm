@@ -569,6 +569,12 @@ class PolicyModel(WrapperModel):
         )
 
     def _with_timeout(self, model_settings: ModelSettings | None) -> ModelSettings:
+        if "timeout" in self.wrapped.unsupported_settings:
+            # Bedrock: the timeout is the boto3 client's (_bedrock_client), and a
+            # timeout setting would only draw a warning on every request.
+            settings = ModelSettings(**(model_settings or {}))
+            settings.pop("timeout", None)
+            return settings
         timeout = ModelSettings(timeout=self.policy.timeout_seconds)
         return merge_model_settings(model_settings, timeout) or timeout
 

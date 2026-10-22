@@ -294,6 +294,23 @@ def test_one_retry_layer_per_provider(  # noqa: PLR0913, PLR0917
     assert len(mock_provider.requests) == attempts
 
 
+# Bedrock's timeout is the boto3 client's, so it gets no timeout setting; the hang
+# case above shows the client still enforces it.
+@pytest.mark.usefixtures("provider_env")
+@pytest.mark.filterwarnings("error::pydantic_ai.UnsupportedSettingWarning")
+@pytest.mark.parametrize("model_id", MOCKED_MODELS)
+def test_requests_send_no_setting_the_model_ignores(
+    mock_provider: MockProvider, monkeypatch: pytest.MonkeyPatch, model_id: str
+) -> None:
+    point_at(mock_provider, model_id, monkeypatch)
+    mock_provider.mode = "rejected"
+
+    with pytest.raises(LLMRejected):
+        build_agent(use_case(model_id)).run_sync("hi", model_settings={"timeout": 9})
+
+    assert len(mock_provider.requests) == 1
+
+
 MOCKED_EMBEDDING_MODELS = [
     "openai:text-embedding-3-large",
     "bedrock:amazon.titan-embed-text-v2:0",
