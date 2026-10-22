@@ -4,6 +4,7 @@ import threading
 import weakref
 from collections.abc import Callable
 from dataclasses import replace
+from typing import Any
 
 import opik
 import pytest
@@ -18,11 +19,12 @@ from ol_llm import (
     TextTemplate,
     UseCase,
     get_prompt,
+    models,
     run,
     run_sync,
     tracing,
 )
-from ol_llm.models import build_agent, override_models
+from ol_llm.models import agent_over, build_agent, build_model, override_models
 from ol_llm.testing import tracing_disabled
 from ol_llm.tracing import PROJECT_ATTRIBUTE, TracingConfig, configure_tracing
 from opentelemetry.sdk.trace import TracerProvider
@@ -578,6 +580,39 @@ def test_a_dropped_loops_clients_log_no_errors_on_a_later_loop(
         asyncio.run(call())
 
     assert [r.getMessage() for r in caplog.records if r.name == "asyncio"] == []
+
+
+def test_agents_over_one_model_share_its_provider_clients(
+    real_client: UseCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    providers: list[str] = []
+    provider_factory = models.provider_factory
+
+    def counting(*args: Any) -> Callable[[str], Any]:  # noqa: ANN401
+        factory = provider_factory(*args)
+
+        def build(provider: str) -> Any:  # noqa: ANN401
+            providers.append(provider)
+            return factory(provider)
+
+        return build
+
+    monkeypatch.setattr(models, "provider_factory", counting)
+    model = build_model(real_client)
+
+    async def two_agents() -> list[int]:
+        built = []
+        for instructions in ("Summarize.", "Translate."):
+            await run(agent_over(model, instructions=instructions), "hi")
+            built.append(len(providers))
+        return built
+
+    first, second = asyncio.run(two_agents())
+    build_agent(real_client)
+
+    assert first == second
+    # build_agent builds a new model, so the count would have grown.
+    assert len(providers) > second
 
 
 @pytest.mark.parametrize("real_client", [(GEMINI,)], indirect=True, ids=["google"])

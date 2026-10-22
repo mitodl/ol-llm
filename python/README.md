@@ -45,7 +45,10 @@ subclasses (`LLMRateLimited`, `LLMUnavailable`, `LLMRejected`, ...) with the pro
 exception as the cause. Build agents once, not per request: each build creates new provider
 clients. An agent built once can run on any thread or event loop (`run_sync` from a thread pool,
 `asyncio.run` per task); its model keeps one set of provider clients per event loop, released
-with the thread that ran the loop.
+with the thread that ran the loop. A call site that needs a new agent per run (per-run
+instructions, output schema, or validators) builds the model once with `ol_llm.build_model` and
+each agent over it with `ol_llm.agent_over(model, ...)`, which takes the arguments
+`build_agent` does after the use case. Agents over one model share its provider clients.
 
 Set `OL_LLM_ENVIRONMENT`, or call `ol_llm.configure(ol_llm.Settings(environment=...))` at
 startup. Provider credentials are each SDK's own (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, the AWS
@@ -139,7 +142,7 @@ result = ol_llm.complete_sync(
 )
 ```
 
-`build_agent` takes both too. An agent with tools may not force a tool, which
+`build_agent` and `agent_over` take both too. An agent with tools may not force a tool, which
 would make every request call one.
 
 `complete` runs a tool-less agent over the use case's model through `run`, so the timeout,

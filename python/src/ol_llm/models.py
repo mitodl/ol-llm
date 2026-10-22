@@ -1203,6 +1203,10 @@ def build_agent(  # noqa: PLR0913
     ``use_case.output_retries`` times, and sends its spans to Opik unless tracing
     is off.
 
+    Each call builds a new model with new provider clients. To build agents per run,
+    e.g. for per-run instructions, build the model once with ``build_model`` and
+    pass it to ``agent_over``.
+
     :param use_case: the call site.
     :param deps_type: the type of the run's dependencies.
     :param output_type: the output spec; ``ToolOutput`` is the default mode, and
