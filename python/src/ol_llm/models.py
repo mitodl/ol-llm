@@ -1097,8 +1097,10 @@ class _RequestSettings(AbstractCapability[Any]):
     """A caller's model settings, applied to every request of a run.
 
     A capability, not ``Agent(model_settings=...)``, because the agent refuses a
-    static ``tool_choice`` that forces a tool, and capability settings are not
-    checked. ``agent_over`` makes the check that matters here.
+    static ``tool_choice`` that forces any tool, output tools included, and
+    capability settings are not checked. This makes the check that matters: a
+    forced function tool would be called on every request, so the run would never
+    give a final response.
     """
 
     settings: ModelSettings
@@ -1107,8 +1109,41 @@ class _RequestSettings(AbstractCapability[Any]):
         """Return the settings, merged over the agent's and under the run's."""
         return self.settings
 
+    async def before_model_request(
+        self,
+        ctx: RunContext[Any],  # noqa: ARG002 - the hook's signature
+        request_context: ModelRequestContext,
+    ) -> ModelRequestContext:
+        """Refuse a ``tool_choice`` that forces a function tool.
 
-def _check_model_settings(settings: ModelSettings, *, has_tools: bool) -> None:
+        Checked per request, where every tool the agent has is known, whether it
+        came from ``tools``, ``toolsets``, or a capability.
+
+        :raises ValueError: if the settings force a function tool.
+        """
+        choice = self.settings.get("tool_choice")
+        functions = {
+            tool.name
+            for tool in request_context.model_request_parameters.function_tools
+        }
+        forced = (
+            functions
+            if choice == "required"
+            else functions.intersection(choice)
+            if isinstance(choice, list)
+            else set()
+        )
+        if forced:
+            msg = (
+                f"tool_choice={choice!r} forces the function tools {sorted(forced)} "
+                "on every request, so the run would never give a final response; "
+                "use ToolOrOutput"
+            )
+            raise ValueError(msg)
+        return request_context
+
+
+def _check_model_settings(settings: ModelSettings) -> None:
     if owned := sorted(_POLICY_SETTINGS & settings.keys()):
         msg = (
             f"model_settings may not set {owned}: the use case's policy sets it; "
@@ -1120,13 +1155,6 @@ def _check_model_settings(settings: ModelSettings, *, has_tools: bool) -> None:
         msg = (
             f"model_settings may not set {owned}: the user id comes from "
             "Attribution.user_id"
-        )
-        raise ValueError(msg)
-    choice = settings.get("tool_choice")
-    if has_tools and (choice == "required" or (isinstance(choice, list) and choice)):
-        msg = (
-            f"tool_choice={choice!r} forces a tool on every request, so an agent "
-            "with tools would never give a final response; use ToolOrOutput"
         )
         raise ValueError(msg)
 
@@ -1261,8 +1289,9 @@ def agent_over(  # noqa: PLR0913
     timeout and the user id from ``Attribution`` are not the caller's to set. A
     ``tool_choice`` that forces a tool is applied too, which PydanticAI refuses in
     an agent's own settings: forcing the output tool is how a single structured
-    call makes a model that thinks by default (Claude) call it. With function
-    tools a forced choice would call one on every request, so it is refused.
+    call makes a model that thinks by default (Claude) call it. A forced function
+    tool would be called on every request, so a run of the agent raises
+    ``ValueError`` before its first request when the settings force one.
 
     :param model: a model from ``build_model``.
     :param deps_type: the type of the run's dependencies.
@@ -1278,14 +1307,13 @@ def agent_over(  # noqa: PLR0913
     :returns: the agent.
     :rtype: Agent
     :raises ValueError: if ``NativeOutput`` is asked of a model that lacks it,
-        ``model_settings`` sets ``timeout`` or a user id field, or it forces a
-        tool on an agent with tools.
+        or ``model_settings`` sets ``timeout`` or a user id field.
     :raises TypeError: if the model did not come from ``build_model``.
     """
     use_case = call_site(model)
     _check_output_mode(output_type, model)
     if model_settings:
-        _check_model_settings(model_settings, has_tools=bool(tools or toolsets))
+        _check_model_settings(model_settings)
     agent: Agent[Any, Any] = Agent(
         model,
         output_type=output_type,

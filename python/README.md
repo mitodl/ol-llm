@@ -142,8 +142,8 @@ result = ol_llm.complete_sync(
 )
 ```
 
-`build_agent` and `agent_over` take both too. An agent with tools may not force a tool, which
-would make every request call one.
+`build_agent` and `agent_over` take both too. A `tool_choice` that forces one of the agent's
+function tools would make every request call it, so a run of that agent raises `ValueError`.
 
 `complete` runs a tool-less agent over the use case's model through `run`, so the timeout,
 retries, fallback, trace, errors, and `LLMResult` are the same. The model is built on the first

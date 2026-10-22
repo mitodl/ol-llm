@@ -28,8 +28,8 @@ from ol_llm.models import (
 )
 from ol_llm.testing import policy_model, tracing_disabled
 from pydantic import BaseModel
-from pydantic_ai import Agent, DeferredToolRequests
-from pydantic_ai.capabilities import RaiseContentFilterError
+from pydantic_ai import Agent, DeferredToolRequests, ToolOutput
+from pydantic_ai.capabilities import RaiseContentFilterError, Toolset
 from pydantic_ai.exceptions import (
     ContentFilterError,
     FallbackExceptionGroup,
@@ -38,10 +38,11 @@ from pydantic_ai.exceptions import (
     UnexpectedModelBehavior,
     UsageLimitExceeded,
 )
-from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.output import NativeOutput, OutputSpec
+from pydantic_ai.toolsets import FunctionToolset
 
 PRIMARY = "openai:gpt-4o-mini"
 FALLBACK = "bedrock:global.anthropic.claude-haiku-4-5-20251001-v1:0"
@@ -196,12 +197,48 @@ def test_an_agents_model_settings_reach_every_request_under_the_policy() -> None
     assert script.calls[0].model_settings["timeout"] == 60
 
 
-def test_a_forced_tool_is_refused_on_an_agent_with_tools() -> None:
-    def lookup(term: str) -> str:
-        return term  # pragma: no cover
+def lookup(term: str) -> str:
+    return term  # pragma: no cover
 
-    with override_models(TestModel()), pytest.raises(ValueError, match="ToolOrOutput"):
-        build_agent(SUMMARY, tools=[lookup], model_settings={"tool_choice": ["lookup"]})
+
+@pytest.mark.parametrize(
+    "tools",
+    [
+        {"tools": [lookup]},
+        {"toolsets": [FunctionToolset([lookup])]},
+        {"capabilities": [Toolset(FunctionToolset([lookup]))]},
+    ],
+    ids=["tools", "toolsets", "capability"],
+)
+@pytest.mark.parametrize("choice", ["required", ["lookup"]])
+def test_a_forced_function_tool_is_refused(
+    tools: dict[str, Any], choice: str | list[str]
+) -> None:
+    script = Scripted()
+    with override_models(FunctionModel(script)):
+        agent = build_agent(SUMMARY, model_settings={"tool_choice": choice}, **tools)  # type: ignore[call-overload]
+        with pytest.raises(ValueError, match="never give a final response"):
+            agent.run_sync("hi")
+
+    assert script.calls == []
+
+
+def test_the_output_tool_may_be_forced_on_an_agent_with_tools() -> None:
+    def record(_m: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        [tool] = info.output_tools
+        return ModelResponse(parts=[ToolCallPart(tool.name, {"text": "short"})])
+
+    output = ToolOutput(Summary, name="record_summary")
+    with override_models(FunctionModel(record)):
+        agent = build_agent(
+            SUMMARY,
+            output_type=output,
+            tools=[lookup],
+            model_settings={"tool_choice": ["record_summary"]},
+        )
+        result = agent.run_sync("hi")
+
+    assert result.output == Summary(text="short")
 
 
 def test_environment_override_reaches_the_request(
