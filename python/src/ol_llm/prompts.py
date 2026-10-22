@@ -325,7 +325,7 @@ def create_prompt(
     :raises opik.exceptions.PromptTemplateStructureMismatch: if the prompt exists
         with the other structure.
     """
-    client = _client()
+    client = tracing.opik_client()
     latest = client.get_prompts_client().get_prompt(
         name=name,
         project_name=project_name,
@@ -385,7 +385,7 @@ def promote_prompt(
         registered in the workspace (Opik seeds only ``development``, ``staging``,
         and ``production``).
     """
-    client = _client()
+    client = tracing.opik_client()
     detail = client.get_prompts_client().get_prompt(
         name=name, version=version, project_name=project_name
     )
@@ -409,15 +409,8 @@ _inflight_lock = threading.Lock()
 _inflight: dict[_Lookup, Future[BasePrompt | None]] = {}
 
 
-def _client() -> opik.Opik:
-    # Settles the tracing configuration first: that registers the Keycloak hook,
-    # which the SDK reads only when it builds its client.
-    tracing.get_tracing_config()
-    return opik.get_global_client()
-
-
 def _fetch(lookup: _Lookup) -> BasePrompt | None:
-    client = _client()
+    client = tracing.opik_client()
     getter = client.get_chat_prompt if lookup.chat else client.get_prompt
     return getter(
         name=lookup.name,
