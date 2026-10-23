@@ -56,6 +56,7 @@ from pydantic_ai.messages import (
     ModelRequestPart,
     ModelResponse,
     RetryFeedbackPart,
+    RetryPromptPart,
     ToolReturnPart,
 )
 from pydantic_ai.models import (
@@ -667,11 +668,14 @@ class PolicyModel(WrapperModel):
 def _asks_for_a_retry(part: ModelRequestPart) -> bool:
     """Whether a request part sends the model's last response back to it.
 
-    Output the run cannot use (invalid, or refused by an output validator) comes
-    back as a ``RetryFeedbackPart``, or, when it came through an output tool, as
-    that tool's return with ``outcome='retried'``, as does a tool's ``ModelRetry``.
+    A response the run cannot use (invalid output, output an output validator
+    refused, or no output at all) comes back as a ``RetryFeedbackPart``, or, when
+    the output came through an output tool, as that tool's return with
+    ``outcome='retried'``, as does a tool's ``ModelRetry``. A history loaded from
+    storage converts the deprecated ``RetryPromptPart`` to one of those, but one
+    built or unpickled in memory still carries it until PydanticAI 3 removes it.
     """
-    return isinstance(part, RetryFeedbackPart) or (
+    return isinstance(part, RetryFeedbackPart | RetryPromptPart) or (
         isinstance(part, ToolReturnPart) and part.outcome == "retried"
     )
 
