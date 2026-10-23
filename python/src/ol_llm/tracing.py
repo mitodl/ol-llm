@@ -519,6 +519,20 @@ def get_tracing_config() -> TracingConfig:
     return _state().config
 
 
+def opik_client() -> opik.Opik:
+    """Return the SDK's global client, with the tracing configuration settled first.
+
+    Settling the configuration registers the Keycloak hook, which the SDK reads only
+    when it builds its client, so every SDK call outside a traced run (prompt sync,
+    datasets, experiments) gets the same token as the runs.
+
+    :returns: the client.
+    :rtype: opik.Opik
+    """
+    get_tracing_config()
+    return opik.get_global_client()
+
+
 def enabled() -> bool:
     """Return whether runs are traced.
 

@@ -482,6 +482,112 @@ and `run_sync` over an agent built once both work there, since each thread's eve
 its own provider clients. Threads do not inherit the caller's Opik context, so each row's run
 is its own root trace.
 
+### Evaluation
+
+A use case whose output a learner or instructor sees keeps a golden dataset in Opik and runs
+an experiment on every prompt or model change; gates start advisory
+([lifecycle spec §4.2 and §5](https://github.com/mitodl/ol-infrastructure/blob/main/docs/plans/llm-opik-lifecycle-spec.md)).
+`ol_llm.evaluation` covers that path. It needs the `pydantic-ai` extra and the judge model's
+provider extra. Run it where the Opik SDK is installed whole (CI evaluation jobs, developer
+machines), not in a slimmed runtime image.
+
+Seed the dataset from a file in the repository. A JSON list of items, or an object of named
+lists such as learn-ai's `test_json/rag_evaluation.json`:
+
+```sh
+ol-llm-eval seed test_json/rag_evaluation.json --group syllabus \
+    --dataset syllabus-golden --project learn-ai   # prints "syllabus-golden v1"
+```
+
+or `seed_dataset("syllabus-golden", load_items(path, group="syllabus"),
+project_name="learn-ai")`. Seeding again adds only items whose content the dataset does not
+already hold, as a new version, so the job can run on every change to the file. Items deleted
+from the file stay in Opik, where the dataset is curated. Fields Opik keeps for itself (`id`,
+`description`, `source`, and the like) are refused.
+
+
+Run the experiment with the managed prompts the task uses, so Opik links their versions:
+
+```python
+from opik.evaluation.metrics import AnswerRelevance, Hallucination
+
+from ol_llm.evaluation import (
+    Threshold,
+    ValidatorMetric,
+    check_thresholds,
+    evaluate,
+    judge_model,
+)
+
+prompt = ol_llm.get_prompt(
+    "syllabus", project_name="learn-ai", default=SYLLABUS_PROMPT, environment="ci"
+)
+judge = judge_model("learn-ai", "openai:gpt-4o-mini")
+
+
+def task(item: dict) -> dict:
+    result = ol_llm.complete_sync(
+        SYLLABUS, item["question"], instructions=prompt.format(), prompt=prompt
+    )
+    return {"output": result.output, "context": [...]}
+
+
+result = evaluate(
+    task,
+    dataset="syllabus-golden",
+    dataset_version="v3",
+    project_name="learn-ai",
+    prompts=[prompt],
+    metrics=[
+        Hallucination(model=judge),
+        AnswerRelevance(model=judge),
+        ValidatorMetric("cites_course", lambda output: "8.01" in output),
+    ],
+    scoring_key_mapping={"input": "question"},
+)
+check_thresholds(
+    result,
+    [
+        Threshold(metric="hallucination_metric", maximum=0.2),
+        Threshold(metric="answer_relevance_metric", minimum=0.7),
+        Threshold(metric="cites_course", minimum=1.0),
+    ],
+)
+```
+
+`evaluate` refuses an embedded default prompt, since it has no version to link, and tags the
+experiment `app:` and `env:`. `dataset_version` pins what the gate runs against; the latest
+version when omitted.
+
+Opik aborts the whole run when a task raises. `evaluate` catches an `LLMError` from the task
+instead (a content filter, retries spent): the item's output becomes
+`{"ol_llm_error": "<error class>"}`, visible on its trace, a `ValidatorMetric` scores it 0.0,
+and every other metric gives it a failed score, which `check_thresholds` counts as unscored. A
+judge metric's own `LLMError` is a failed score too. Any other exception still aborts the run.
+
+`judge_model(app, model)` gives an Opik judge metric that takes `model=` a model that calls
+through `complete`, under the `eval-judge` use case in the app's project: the judge is
+routed, retried, traced, and costed like any other call. Its model must be in the catalog; an
+uncataloged id raises. It should not be the model under test. `SycEval` needs it as
+`rebuttal_model=` too, or it calls a LiteLLM model for the rebuttal; Opik's dataset-item
+evaluators (`LLMJudge`) take only a model name and cannot use it.
+
+`ValidatorMetric(name, check)` makes a deterministic check a metric, scored 1.0 on a pass and
+0.0 otherwise. The check names the item and output fields it takes as parameters and returns
+a bool, or a list of problems (empty for a pass), which becomes the score's reason. The
+translation plugins' SRT structure and placeholder checks are the kind of validator this is
+for.
+
+`check_thresholds` compares each metric's mean to its `Threshold`. A metric fails when any
+item went unscored, since its scoring raised or never ran. A validator that must pass on every
+item is `minimum=1.0`. The default `mode="advisory"` logs a miss and returns the report;
+`mode="blocking"` raises `EvaluationGateError`. From a separate CI step, by experiment id:
+
+```sh
+ol-llm-eval check "$EXPERIMENT_ID" --threshold 'hallucination_metric<=0.2' \
+    --threshold 'cites_course>=1'   # add --mode blocking to fail the job on a miss
+```
+
 ### Tracing
 
 Tracing reads the variables the Opik SDK reads, so the SDK and the span exporter always send
@@ -550,9 +656,12 @@ override-dependencies = [
 ]
 ```
 
-Drop `openai` from that list if the application uses the `openai` extra. Opik's evaluation
-metrics need litellm, so the overrides belong in runtime images, not in an environment that
-runs evaluations. CI checks this exact list on every change (`python/smoke/`).
+Drop `openai` from that list if the application uses the `openai` extra. The overrides belong
+in runtime images, not in an environment that runs evaluations: `opik.evaluate` imports
+litellm and openai whenever a task or metric raises something other than the `LLMError`
+that `ol_llm.evaluation.evaluate` catches. Opik's judge metrics on
+`ol_llm.evaluation.judge_model` do not need litellm, and the smoke test scores one, and an
+item whose task raised an `LLMError`, in the slimmed install. CI checks this exact list on every change (`python/smoke/`).
 
 Applications that cap how new a dependency may be (`exclude-newer` in uv) should exempt this
 package so releases are usable the day they ship:
