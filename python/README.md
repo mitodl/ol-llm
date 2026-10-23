@@ -261,7 +261,10 @@ The CI jobs use `ol_llm.create_prompt(name, template, project_name=...)`, which 
 only when the text or template type changed, and `ol_llm.promote_prompt(name, version="v7",
 environment="production", project_name=...)`, which moves one label and leaves the version's
 other labels in place. Opik seeds only `development`, `staging`, and `production`; create `ci`
-and `qa` once per instance before promoting to them.
+and `qa` once per instance before promoting to them. `ol_llm.fetch_prompt(name,
+project_name=..., version="v7")` (or `environment="production"`) reads one version back, text
+or chat, with no embedded default, cache, or fallback, and returns `None` when Opik has no such
+version or label, so a CI job can refuse a pointer to a version that does not exist.
 
 ### Embeddings
 
@@ -599,6 +602,25 @@ item is `minimum=1.0`. The default `mode="advisory"` logs a miss and returns the
 ol-llm-eval check "$EXPERIMENT_ID" --threshold 'hallucination_metric<=0.2' \
     --threshold 'cites_course>=1'   # add --mode blocking to fail the job on a miss
 ```
+
+A `Threshold` can also take a `tolerance`: how far the mean may move the wrong way from a
+baseline experiment's mean, passed to `check_thresholds` as `baselines={metric: mean}`. A
+threshold with a `minimum` is higher-is-better and one with only a `maximum` lower-is-better; a
+tolerance with no bound needs `direction="higher"` or `"lower"`. With no baseline such a
+threshold is `not compared` (its `status`), which neither passes nor fails. `score_report` is
+`check_thresholds` without the raise or the log.
+
+A use case's gate is declared in its repository as TOML (pinned prompt and dataset versions,
+judge model, thresholds, mode) and run with `ol-llm-eval gate`, which finds the baseline,
+writes a Markdown report, and exits 0 on a pass or an advisory miss, 1 on a blocking miss, and
+2 when the gate cannot run or evaluated nothing, in either mode:
+
+```sh
+ol-llm-eval gate evaluation/feedback-summary.gate.toml --change pr-123 --report report.md
+```
+
+[`docs/evaluation-gate.md`](../docs/evaluation-gate.md) has the declaration format and the
+reusable workflow that runs it on pull requests.
 
 ### Tracing
 

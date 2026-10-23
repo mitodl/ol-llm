@@ -63,6 +63,7 @@ from ol_llm.prompts import (
     TemplateType,
     TextTemplate,
     create_prompt,
+    fetch_prompt,
     get_prompt,
     promote_prompt,
 )
@@ -165,6 +166,7 @@ __all__ = [
     "degraded_metadata",
     "embed",
     "embed_sync",
+    "fetch_prompt",
     "get_prompt",
     "get_settings",
     "load_catalog",
