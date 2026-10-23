@@ -53,8 +53,11 @@ from pydantic_ai.exceptions import (
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
+    ModelRequestPart,
     ModelResponse,
+    RetryFeedbackPart,
     RetryPromptPart,
+    ToolReturnPart,
 )
 from pydantic_ai.models import (
     Model,
@@ -662,6 +665,21 @@ class PolicyModel(WrapperModel):
             await stream_cm.__aexit__(None, None, None)
 
 
+def _asks_for_a_retry(part: ModelRequestPart) -> bool:
+    """Whether a request part sends the model's last response back to it.
+
+    A response the run cannot use (invalid output, output an output validator
+    refused, or no output at all) comes back as a ``RetryFeedbackPart``, or, when
+    the output came through an output tool, as that tool's return with
+    ``outcome='retried'``, as does a tool's ``ModelRetry``. A history loaded from
+    storage converts the deprecated ``RetryPromptPart`` to one of those, but one
+    built or unpickled in memory still carries it until PydanticAI 3 removes it.
+    """
+    return isinstance(part, RetryFeedbackPart | RetryPromptPart) or (
+        isinstance(part, ToolReturnPart) and part.outcome == "retried"
+    )
+
+
 @dataclass(init=False)
 class PolicyFallbackModel(FallbackModel):
     """A fallback chain of ``PolicyModel``s that raises the primary's error.
@@ -709,7 +727,7 @@ class PolicyFallbackModel(FallbackModel):
         """Return the chain a request runs on, read from the run's own history."""
         last = messages[-1] if messages else None
         if not isinstance(last, ModelRequest) or not any(
-            isinstance(part, RetryPromptPart) for part in last.parts
+            _asks_for_a_retry(part) for part in last.parts
         ):
             return self
         answered_by = answering_model(messages)

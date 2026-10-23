@@ -28,17 +28,25 @@ from ol_llm.models import (
 )
 from ol_llm.testing import policy_model, tracing_disabled
 from pydantic import BaseModel
-from pydantic_ai import Agent, DeferredToolRequests, ToolOutput
+from pydantic_ai import Agent, DeferredToolRequests, ModelRetry, ToolOutput
 from pydantic_ai.capabilities import RaiseContentFilterError, Toolset
 from pydantic_ai.exceptions import (
     ContentFilterError,
     FallbackExceptionGroup,
     ModelAPIError,
     ModelHTTPError,
+    PydanticAIDeprecationWarning,
     UnexpectedModelBehavior,
     UsageLimitExceeded,
 )
-from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    RetryPromptPart,
+    TextPart,
+    ToolCallPart,
+)
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.output import NativeOutput, OutputSpec
@@ -624,6 +632,92 @@ def test_a_retry_falls_back_only_past_the_model_that_gave_it(stream: bool) -> No
     assert len(primary.calls) == 3
     assert len(fallback.calls) == 4
     assert len(second.calls) == 1
+
+
+class ToolCalling:
+    """A fallback that calls a tool on its first request, then on every later one.
+
+    :param tool: the function tool to call, or ``None`` for the run's output tool.
+    """
+
+    def __init__(self, tool: str | None) -> None:
+        self.tool = tool
+        self.calls: list[list[ModelMessage]] = []
+
+    def __call__(self, messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        self.calls.append(messages)
+        if self.tool is None:
+            [output_tool] = info.output_tools
+            text = "" if len(self.calls) == 1 else "from fallback"
+            return ModelResponse(parts=[ToolCallPart(output_tool.name, {"text": text})])
+        if len(self.calls) == 1:
+            return ModelResponse(parts=[ToolCallPart(self.tool, {"query": "x"})])
+        return ModelResponse(parts=[TextPart("from fallback")])
+
+
+def test_a_tools_model_retry_is_retried_on_the_model_that_gave_it() -> None:
+    primary = Scripted(*always(lambda: http_error(503), 3), answer="from primary")
+    fallback = ToolCalling("lookup")
+    looked_up: list[str] = []
+    models = {
+        PRIMARY: FunctionModel(primary),
+        FALLBACK: FunctionModel(fallback, model_name="fallback"),
+    }
+    with override_models(models):
+        agent = build_agent(SUMMARY_WITH_FALLBACK)
+
+        @agent.tool_plain
+        def lookup(query: str) -> str:
+            looked_up.append(query)
+            if len(looked_up) == 1:
+                msg = "try again"
+                raise ModelRetry(msg)
+            return "found"
+
+        output = agent.run_sync("hi").output
+
+    assert output == "from fallback"
+    assert (len(primary.calls), len(fallback.calls)) == (3, 2)
+
+
+def test_an_output_tools_retry_is_retried_on_the_model_that_gave_it() -> None:
+    primary = Scripted(*always(lambda: http_error(503), 3), answer="from primary")
+    fallback = ToolCalling(None)
+    models = {
+        PRIMARY: FunctionModel(primary),
+        FALLBACK: FunctionModel(fallback, model_name="fallback"),
+    }
+
+    def not_empty(summary: Summary) -> Summary:
+        if not summary.text:
+            msg = "empty"
+            raise ModelRetry(msg)
+        return summary
+
+    with override_models(models):
+        agent = build_agent(SUMMARY_WITH_FALLBACK, output_type=ToolOutput(Summary))
+        agent.output_validator(not_empty)
+        output = agent.run_sync("hi").output
+
+    assert output == Summary(text="from fallback")
+    assert (len(primary.calls), len(fallback.calls)) == (3, 2)
+
+
+def test_a_legacy_retry_part_built_in_memory_is_retried_on_the_model_that_gave_it() -> (
+    None
+):
+    primary = Scripted(*always(lambda: http_error(503), 3), answer="from primary")
+    fallback = Scripted("first", answer="from fallback")
+    with override_models(fallback_models(primary, fallback)):
+        agent = build_agent(SUMMARY_WITH_FALLBACK)
+        history = agent.run_sync("hi").all_messages()
+        with pytest.warns(PydanticAIDeprecationWarning, match="RetryPromptPart"):
+            legacy = RetryPromptPart(content="Say it again.")
+        history.append(ModelRequest(parts=[legacy]))
+        output = agent.run_sync(message_history=history).output
+
+    assert output == "from fallback"
+    assert (len(primary.calls), len(fallback.calls)) == (3, 2)
 
 
 @pytest.mark.parametrize(
