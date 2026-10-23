@@ -44,7 +44,8 @@ Failures are classified by type and status, never by message text:
 | HTTP 429 | `LLMRateLimited` (carries `retry_after`) | yes | yes |
 | HTTP 408, 500, 502, 503, 504, 529 | `LLMUnavailable` | yes | yes |
 | a timeout, a dropped connection, a broken response | `LLMUnavailable` | yes | yes |
-| any other HTTP status; any other transport error | `LLMRejected` (carries `status_code`, none for a transport error) | no | no |
+| HTTP 424 inside a stream (Bedrock's `modelStreamErrorException`) | `LLMUnavailable` | yes | yes |
+| any other HTTP status, including a 424 outside a stream; any other transport error | `LLMRejected` (carries `status_code`, none for a transport error) | no | no |
 | the provider's content filter | `LLMContentFiltered` | no | no |
 | invalid output once output retries are spent | `LLMInvalidOutput` | no | no |
 | a run's usage limit | `LLMBudgetExceeded` | no | no |
@@ -64,8 +65,9 @@ map the error class to their own text.
 Backoff is exponential with jitter, starting at 0.5 s. On the request profile the backoff
 budget is a total, and a `Retry-After` longer than what remains ends the call at once with
 `LLMRateLimited`. On the batch profile each wait is capped, and a longer `Retry-After` waits
-the cap and tries again. A stream is retried while it opens; a failure after the first chunk
-reaches the caller as `LLMUnavailable`.
+the cap and tries again. A stream is retried and falls back until its first event; a failure
+after that reaches the caller with no retry or fallback, classified as above (a throttle
+mid-stream is `LLMRateLimited`).
 
 Invalid output is retried on the model that produced it, `output_retries` times (default 1).
 The retry falls back only if that model is rate limited or unavailable, and then only to the
