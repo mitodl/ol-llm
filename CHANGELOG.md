@@ -18,13 +18,14 @@ All notable changes to ol-llm are recorded here. The format follows
 
 ### Changed
 
-- Every provider extra requires `pydantic-ai-slim>=2.59` (was 2.52), and the `harness` extra requires `pydantic-ai-harness>=0.59,<0.60`. A consumer locked to an older pydantic-ai-slim has to move up (#26).
-- The `anthropic` extra caps `anthropic<2`, since no released PydanticAI can send a request with anthropic 2 (https://github.com/pydantic/pydantic-ai/issues/10923) (#26).
+- Every provider extra requires `pydantic-ai-slim>=2.60` (was 2.52), and the `harness` extra requires `pydantic-ai-harness>=0.60,<0.61`. A consumer locked to an older pydantic-ai-slim has to move up (#26, #28).
+- On Bedrock, pydantic-ai-slim 2.60 sends a Claude request that sets no `max_tokens` with the model's maximum output (64,000 for Claude Haiku 4.5, 128,000 for Sonnet 5) through `ConverseStream`. Bedrock reserves that much tokens-per-minute quota when the request starts, so set `max_tokens` through `model_settings`. The role needs `bedrock:InvokeModelWithResponseStream`, and the policy timeout bounds the gap between chunks (#28).
 - A failure after a stream's first event keeps its own error class instead of becoming `LLMUnavailable`, so a Bedrock throttle in the middle of a stream raises `LLMRateLimited` (#26).
 - A 424 that Bedrock raises inside a stream is retried and falls back while it is the stream's first event, per spec §6.3. A 424 outside a stream is still `LLMRejected` (#26).
 
 ### Fixed
 
+- The `anthropic` extra works with anthropic 2.x. Under 0.0.4 an install that paired anthropic 2 with pydantic-ai-slim older than 2.60 failed every Anthropic request with `TypeError`, and 0.0.5 requires 2.60, which supports it (#28).
 - A finished worker thread's event loop is released again under pydantic-ai-slim 2.59 (#26).
 - A model that lists `timeout` in `unsupported_settings` (Bedrock) is no longer sent one, so pydantic-ai-slim 2.58 and later do not raise `UnsupportedSettingWarning` on every Bedrock request. Bedrock's timeout is its boto3 client's, as before (#26).
 
