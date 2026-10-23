@@ -81,7 +81,7 @@ from ol_llm.tracing import (
 
 if TYPE_CHECKING:
     from ol_llm.embeddings import EmbedResult, embed, embed_sync
-    from ol_llm.models import build_agent, build_model, usage_limits
+    from ol_llm.models import agent_over, build_agent, build_model, usage_limits
     from ol_llm.runs import (
         LLMResult,
         LLMStream,
@@ -100,6 +100,7 @@ _PYDANTIC_AI_EXPORTS = {
     "EmbedResult": "ol_llm.embeddings",
     "embed": "ol_llm.embeddings",
     "embed_sync": "ol_llm.embeddings",
+    "agent_over": "ol_llm.models",
     "build_agent": "ol_llm.models",
     "build_model": "ol_llm.models",
     "usage_limits": "ol_llm.models",
@@ -150,6 +151,7 @@ __all__ = [
     "TraceFields",
     "TracingConfig",
     "UseCase",
+    "agent_over",
     "build_agent",
     "build_model",
     "celery_rate_limit",

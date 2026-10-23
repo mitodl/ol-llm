@@ -45,7 +45,11 @@ subclasses (`LLMRateLimited`, `LLMUnavailable`, `LLMRejected`, ...) with the pro
 exception as the cause. Build agents once, not per request: each build creates new provider
 clients. An agent built once can run on any thread or event loop (`run_sync` from a thread pool,
 `asyncio.run` per task); its model keeps one set of provider clients per event loop, released
-with the thread that ran the loop.
+with the thread that ran the loop. A call site that needs a new agent per run (per-run
+instructions, output schema, or validators) builds the model once with `ol_llm.build_model` and
+each agent over it with `ol_llm.agent_over(model, ...)`, which takes the agent arguments
+`build_agent` does (`settings` belongs to `build_model`). Agents over one model share its
+provider clients.
 
 Set `OL_LLM_ENVIRONMENT`, or call `ol_llm.configure(ol_llm.Settings(environment=...))` at
 startup. Provider credentials are each SDK's own (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, the AWS
@@ -95,7 +99,7 @@ result = ol_llm.complete_sync(
 result.output  # a Summary
 
 
-# A forced tool call: the model gets one tool and no text output, so it has to call it.
+# A tool call: the model gets one tool and no text output (see below for forcing it).
 class Rubric(BaseModel):
     score: int
     rationale: str
@@ -111,6 +115,41 @@ result = ol_llm.complete_sync(
 )
 result.output  # a Rubric
 ```
+
+`model_settings` apply to every request, e.g. `max_tokens`. The timeout and the provider user id
+fields are the library's, and setting them raises `ValueError`. PydanticAI leaves a
+`ToolOutput`'s tool unforced on a request that would think, since forcing a tool turns thinking
+off (Claude models that think by default); naming the tool in `tool_choice` forces it. PydanticAI
+raises `UserError` for a forced `tool_choice` where the model cannot take one: with extended
+thinking turned on, and on the models whose profile rejects forcing (Claude Opus 5.5, Sonnet
+5.5, and the 5.1 generation in PydanticAI 2.52).
+`output_validators` run on the output once it matches the type, and one that raises PydanticAI's
+`ModelRetry` sends the output back to the model with its message, within the use case's
+`output_retries`:
+
+```python
+from pydantic_ai import ModelRetry
+
+
+def score_in_range(rubric: Rubric) -> Rubric:
+    if not 0 <= rubric.score <= 10:
+        raise ModelRetry("score must be between 0 and 10")
+    return rubric
+
+
+result = ol_llm.complete_sync(
+    GRADING,
+    submission,
+    output_type=ToolOutput(Rubric, name="record_grade"),
+    model_settings={"max_tokens": 4000, "tool_choice": ["record_grade"]},
+    output_validators=[score_in_range],
+)
+```
+
+`build_agent` and `agent_over` take both too. A `tool_choice` that forces the agent's function
+tools and leaves out every output tool would make every request call a function tool, so a run
+with that choice raises `ValueError`. The check reads the choice the request uses, so a run's
+`model_settings` can lift an agent's.
 
 `complete` runs a tool-less agent over the use case's model through `run`, so the timeout,
 retries, fallback, trace, errors, and `LLMResult` are the same. The model is built on the first
@@ -141,7 +180,10 @@ when the block ends. A block that reads the whole stream without calling `result
 the trace. The run's trace stays current for the whole block, so the model spans land in it. A
 failure before the first chunk is retried and falls back as in `run` and raises on entry; a
 failure after it raises `LLMUnavailable` (or another `LLMError`) where the stream is read, and
-is not retried.
+is not retried. Invalid output is not retried either: an output validator's `ModelRetry` raises
+`LLMInvalidOutput`. Validators also run on each partial output (`stream_text(delta=False)`,
+`stream_output()`) with `ctx.partial_output` set, so one that checks for a complete answer
+should return a partial one unchanged.
 
 ### Prompts
 
@@ -186,7 +228,10 @@ With tracing off (`OPIK_TRACK_DISABLE=true`) `get_prompt` returns the embedded d
 unmarked, so local development needs no Opik.
 
 Passing the prompt to `complete`, `run`, or `run_stream` links its version to the run's trace and puts `prompt_name` and
-`prompt_version` on the result and in the trace metadata. A call site that is not built on
+`prompt_version` on the result and in the trace metadata. A run that renders several managed
+prompts, e.g. the instructions and a user message template, passes them as a list,
+`prompt=[system, update]`: every version is linked, an embedded default among them marks the
+run degraded, and the first names the result and the trace metadata. A call site that is not built on
 PydanticAI gets the link by calling `get_prompt` inside its own `@opik.track`, and marks a
 fallback itself with `degraded_metadata(prompt.degraded_reasons)`.
 

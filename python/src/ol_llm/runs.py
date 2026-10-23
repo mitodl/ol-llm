@@ -41,8 +41,9 @@ from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
 from pydantic_ai.output import OutputSpec
-from pydantic_ai.result import StreamedRunResult
+from pydantic_ai.result import OutputValidatorFunc, StreamedRunResult
 from pydantic_ai.run import AgentRunResult
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RunUsage
 
 from ol_llm.attribution import (
@@ -72,6 +73,9 @@ from ol_llm.tracing import enabled
 OutputT = TypeVar("OutputT")
 DepsT = TypeVar("DepsT")
 
+Prompts = ManagedPrompt[Any] | Sequence[ManagedPrompt[Any]] | None
+"""The managed prompt a run used, or several; the first names the run."""
+
 
 def _root_input(user_prompt: str | None) -> None:
     """Stand in for a traced function, so a stream's trace input matches ``run``'s."""
@@ -98,7 +102,7 @@ class LLMResult(Generic[OutputT]):
     :param usage: token and request usage for the run.
     :param degraded: whether any degraded reason applies.
     :param degraded_reasons: why the result is degraded.
-    :param prompt_name: the managed prompt used, when there is one.
+    :param prompt_name: the managed prompt used, the first when there are several.
     :param prompt_version: that prompt's version.
     :param new_messages: the messages this run added, for the next turn's history.
     """
@@ -145,8 +149,8 @@ class _Run(TracedCall, Generic[OutputT]):
         reasons: list[DegradedReason] = []
         if model != self.use_case.model:
             reasons.append("fallback_model")
-        if self.prompt is not None:
-            reasons.extend(self.prompt.degraded_reasons)
+        for prompt in self.prompts:
+            reasons.extend(prompt.degraded_reasons)
         output = result.output
         if self.postprocess is not None:
             processed = self.postprocess(output)
@@ -160,14 +164,15 @@ class _Run(TracedCall, Generic[OutputT]):
             opik_context.update_current_trace(
                 metadata=dict(degraded_metadata([*marked, *degraded_reasons]))
             )
+        named = self.prompts[0] if self.prompts else None
         return LLMResult(
             output=output,
             model=model,
             usage=result.usage,
             degraded=bool(degraded_reasons),
             degraded_reasons=degraded_reasons,
-            prompt_name=self.prompt.name if self.prompt else None,
-            prompt_version=self.prompt.version if self.prompt else None,
+            prompt_name=named.name if named else None,
+            prompt_version=named.version if named else None,
             new_messages=new_messages,
         )
 
@@ -254,20 +259,30 @@ def _start(
     agent: Agent[Any, OutputT],
     attribution: Attribution,
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None,
-    prompt: ManagedPrompt[Any] | None = None,
+    prompt: Prompts,
 ) -> _Run[OutputT]:
     if not isinstance(agent.model, Model):
         msg = f"{agent!r} has no model from ol_llm.build_model"
         raise TypeError(msg)
     use_case = call_site(agent.model)
+    prompts = (
+        ()
+        if prompt is None
+        else (prompt,)
+        if isinstance(prompt, ManagedPrompt)
+        else tuple(prompt)
+    )
     return _Run(
         use_case=use_case,
         attribution=attribution,
         fields=TracedCall.fields_for(
-            use_case, attribution, prompt, model_tags=catalog_tags(agent.model)
+            use_case,
+            attribution,
+            prompts[0] if prompts else None,
+            model_tags=catalog_tags(agent.model),
         ),
         traced=enabled(),
-        prompt=prompt,
+        prompts=prompts,
         postprocess=postprocess,
     )
 
@@ -280,7 +295,7 @@ async def run(  # noqa: PLR0913
     attribution: Attribution = NO_ATTRIBUTION,
     message_history: Sequence[ModelMessage] | None = None,
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None = None,
-    prompt: ManagedPrompt[Any] | None = None,
+    prompt: Prompts = None,
 ) -> LLMResult[OutputT]:
     """Run an agent from ``build_agent`` under a traced root.
 
@@ -293,8 +308,10 @@ async def run(  # noqa: PLR0913
         the output to use and any degraded reasons. An exception it raises reaches
         the caller unchanged.
     :param prompt: the managed prompt the agent's instructions came from, from
-        ``get_prompt``. The run links its version to the trace and puts its name
-        and version on the result; an embedded default used because Opik was
+        ``get_prompt``, or a sequence of every prompt the run used (e.g. the
+        instructions' and a user message template's). The run links each version
+        to the trace and puts the first prompt's name and version on the result
+        and in the trace metadata; an embedded default used because Opik was
         unreachable marks the result and trace ``embedded_prompt``.
     :returns: the result.
     :rtype: LLMResult
@@ -331,7 +348,7 @@ def run_sync(  # noqa: PLR0913
     attribution: Attribution = NO_ATTRIBUTION,
     message_history: Sequence[ModelMessage] | None = None,
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None = None,
-    prompt: ManagedPrompt[Any] | None = None,
+    prompt: Prompts = None,
 ) -> LLMResult[OutputT]:
     """Run an agent synchronously, for Celery tasks and Dagster assets.
 
@@ -372,7 +389,7 @@ async def run_stream(  # noqa: PLR0913
     attribution: Attribution = NO_ATTRIBUTION,
     message_history: Sequence[ModelMessage] | None = None,
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None = None,
-    prompt: ManagedPrompt[Any] | None = None,
+    prompt: Prompts = None,
 ) -> AsyncGenerator[LLMStream[OutputT]]:
     """Stream a run of an agent from ``build_agent`` under a traced root.
 
@@ -382,7 +399,9 @@ async def run_stream(  # noqa: PLR0913
     and raises on entry; a failure after it reaches the caller. Invalid output is
     not retried: PydanticAI's ``run_stream`` keeps the first output that matches
     the output type, so the use case's ``output_retries`` do not apply and the
-    caller gets ``LLMInvalidOutput``. When the block ends with the stream read, the
+    caller gets ``LLMInvalidOutput``. That includes an output validator's
+    ``ModelRetry``, on the complete output or on a partial one, which validators
+    see with ``ctx.partial_output`` set. When the block ends with the stream read, the
     result is built if ``result`` was not called.
 
     :returns: the stream.
@@ -423,15 +442,22 @@ async def run_stream(  # noqa: PLR0913
             raise callers
 
 
-def _completion(
+def _completion(  # noqa: PLR0913
     use_case: UseCase,
     messages: Sequence[ModelMessage] | str,
+    *,
     output_type: OutputSpec[Any],
     instructions: str | None,
+    model_settings: ModelSettings | None,
+    output_validators: Sequence[OutputValidatorFunc[None, Any]],
 ) -> tuple[Agent[None, Any], str | None, Sequence[ModelMessage] | None]:
     """Return the agent, user prompt, and history a single call runs with."""
     agent = agent_over(
-        shared_model(use_case), output_type=output_type, instructions=instructions
+        shared_model(use_case),
+        output_type=output_type,
+        instructions=instructions,
+        model_settings=model_settings,
+        output_validators=output_validators,
     )
     if isinstance(messages, str):
         return agent, messages, None
@@ -445,9 +471,11 @@ async def complete(
     messages: Sequence[ModelMessage] | str,
     *,
     instructions: str | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, str]] = (),
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[str], PostProcessed[str]] | None = None,
-    prompt: ManagedPrompt[Any] | None = None,
+    prompt: Prompts = None,
 ) -> LLMResult[str]: ...
 @overload
 async def complete(
@@ -456,9 +484,11 @@ async def complete(
     *,
     output_type: OutputSpec[OutputT],
     instructions: str | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, OutputT]] = (),
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None = None,
-    prompt: ManagedPrompt[Any] | None = None,
+    prompt: Prompts = None,
 ) -> LLMResult[OutputT]: ...
 async def complete(  # noqa: PLR0913
     use_case: UseCase,
@@ -466,15 +496,18 @@ async def complete(  # noqa: PLR0913
     *,
     output_type: OutputSpec[Any] = str,
     instructions: str | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, Any]] = (),
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[Any], PostProcessed[Any]] | None = None,
-    prompt: ManagedPrompt[Any] | None = None,
+    prompt: Prompts = None,
 ) -> LLMResult[Any]:
     """Make one model call for a use case, with no agent to build.
 
     The same as ``run`` over ``build_agent(use_case, output_type=...,
-    instructions=...)``: the same model, policy, trace, and errors. The model is
-    built once per use case and reused.
+    instructions=..., model_settings=..., output_validators=...)``: the same
+    model, policy, trace, and errors. The model is built once per use case and
+    reused.
 
     :param use_case: the call site.
     :param messages: the user's message, or the conversation so far ending in the
@@ -482,18 +515,30 @@ async def complete(  # noqa: PLR0913
     :param output_type: the output spec, ``str`` for free text; ``ToolOutput``
         names the tool the model is made to call.
     :param instructions: the instructions.
+    :param model_settings: settings for the request, e.g. ``max_tokens``, or a
+        ``tool_choice`` naming the output tool to force it; see ``agent_over``.
+    :param output_validators: called on the output, in order; one that raises
+        ``ModelRetry`` sends the output back to the model, within the use case's
+        ``output_retries``.
     :param attribution: the per-call attribution fields.
     :param postprocess: as for ``run``.
-    :param prompt: the managed prompt ``instructions`` came from, as for ``run``.
+    :param prompt: the managed prompt ``instructions`` came from, or every prompt
+        the call used, as for ``run``.
     :returns: the result.
     :rtype: LLMResult
     :raises LLMError: on a model failure, invalid output, a content filter, or an
         exceeded usage limit.
-    :raises ValueError: if ``NativeOutput`` is asked of a model that lacks it, or
-        ``build_model`` rejects the use case.
+    :raises ValueError: if ``NativeOutput`` is asked of a model that lacks it,
+        ``model_settings`` sets what the library owns, or ``build_model`` rejects
+        the use case.
     """
     agent, user_prompt, history = _completion(
-        use_case, messages, output_type, instructions
+        use_case,
+        messages,
+        output_type=output_type,
+        instructions=instructions,
+        model_settings=model_settings,
+        output_validators=output_validators,
     )
     return await run(
         agent,
@@ -511,9 +556,11 @@ def complete_sync(
     messages: Sequence[ModelMessage] | str,
     *,
     instructions: str | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, str]] = (),
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[str], PostProcessed[str]] | None = None,
-    prompt: ManagedPrompt[Any] | None = None,
+    prompt: Prompts = None,
 ) -> LLMResult[str]: ...
 @overload
 def complete_sync(
@@ -522,9 +569,11 @@ def complete_sync(
     *,
     output_type: OutputSpec[OutputT],
     instructions: str | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, OutputT]] = (),
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None = None,
-    prompt: ManagedPrompt[Any] | None = None,
+    prompt: Prompts = None,
 ) -> LLMResult[OutputT]: ...
 def complete_sync(  # noqa: PLR0913
     use_case: UseCase,
@@ -532,9 +581,11 @@ def complete_sync(  # noqa: PLR0913
     *,
     output_type: OutputSpec[Any] = str,
     instructions: str | None = None,
+    model_settings: ModelSettings | None = None,
+    output_validators: Sequence[OutputValidatorFunc[None, Any]] = (),
     attribution: Attribution = NO_ATTRIBUTION,
     postprocess: Callable[[Any], PostProcessed[Any]] | None = None,
-    prompt: ManagedPrompt[Any] | None = None,
+    prompt: Prompts = None,
 ) -> LLMResult[Any]:
     """Make one model call synchronously, for Celery tasks and Dagster assets.
 
@@ -545,7 +596,12 @@ def complete_sync(  # noqa: PLR0913
     :rtype: LLMResult
     """
     agent, user_prompt, history = _completion(
-        use_case, messages, output_type, instructions
+        use_case,
+        messages,
+        output_type=output_type,
+        instructions=instructions,
+        model_settings=model_settings,
+        output_validators=output_validators,
     )
     return run_sync(
         agent,

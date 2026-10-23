@@ -4,6 +4,7 @@ import threading
 import weakref
 from collections.abc import Callable
 from dataclasses import replace
+from typing import Any
 
 import opik
 import pytest
@@ -18,11 +19,12 @@ from ol_llm import (
     TextTemplate,
     UseCase,
     get_prompt,
+    models,
     run,
     run_sync,
     tracing,
 )
-from ol_llm.models import build_agent, override_models
+from ol_llm.models import agent_over, build_agent, build_model, override_models
 from ol_llm.testing import tracing_disabled
 from ol_llm.tracing import PROJECT_ATTRIBUTE, TracingConfig, configure_tracing
 from opentelemetry.sdk.trace import TracerProvider
@@ -580,6 +582,39 @@ def test_a_dropped_loops_clients_log_no_errors_on_a_later_loop(
     assert [r.getMessage() for r in caplog.records if r.name == "asyncio"] == []
 
 
+def test_agents_over_one_model_share_its_provider_clients(
+    real_client: UseCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    providers: list[str] = []
+    provider_factory = models.provider_factory
+
+    def counting(*args: Any) -> Callable[[str], Any]:  # noqa: ANN401
+        factory = provider_factory(*args)
+
+        def build(provider: str) -> Any:  # noqa: ANN401
+            providers.append(provider)
+            return factory(provider)
+
+        return build
+
+    monkeypatch.setattr(models, "provider_factory", counting)
+    model = build_model(real_client)
+
+    async def two_agents() -> list[int]:
+        built = []
+        for instructions in ("Summarize.", "Translate."):
+            await run(agent_over(model, instructions=instructions), "hi")
+            built.append(len(providers))
+        return built
+
+    first, second = asyncio.run(two_agents())
+    build_agent(real_client)
+
+    assert first == second
+    # build_agent builds a new model, so the count would have grown.
+    assert len(providers) > second
+
+
 @pytest.mark.parametrize("real_client", [(GEMINI,)], indirect=True, ids=["google"])
 def test_run_stream_works_under_successive_event_loops(real_client: UseCase) -> None:
     agent = build_agent(real_client)
@@ -680,6 +715,47 @@ def test_a_nested_run_names_its_prompt_on_the_callers_trace(
     assert trace.metadata is not None
     assert trace.metadata["prompt_name"] == "summary"
     assert trace.metadata["prompt_version"] == "v1"
+
+
+@pytest.mark.parametrize("sync", [False, True])
+def test_every_prompt_is_linked_and_an_embedded_one_marks_the_run(
+    prompt_library: PromptLibrary,
+    sync: bool,  # noqa: FBT001
+) -> None:
+    for name in ("summary.system", "summary.user"):
+        prompt_library.add(name, "Summarize.", environments=("production",))
+    system, user = (
+        get_prompt(
+            name,
+            project_name="mit-learn",
+            default=TextTemplate(template="Summarize."),
+            environment="production",
+        )
+        for name in ("summary.system", "summary.user")
+    )
+    embedded = ManagedPrompt(
+        name="summary.example",
+        template=TextTemplate(template="For example:", version="v2"),
+        source="embedded",
+        degraded_reasons=("embedded_prompt",),
+    )
+    agent = agent_for(SUMMARY, replying("ok"), instructions=system.format())
+    prompts = [system, user, embedded]
+
+    with opik.record_traces_locally() as storage:
+        if sync:
+            result = run_sync(agent, "hi", prompt=prompts)
+        else:
+            result = asyncio.run(run(agent, "hi", prompt=prompts))
+        [trace] = storage.trace_trees
+
+    assert (result.prompt_name, result.prompt_version) == ("summary.system", "v1")
+    assert result.degraded_reasons == ("embedded_prompt",)
+    assert trace.metadata is not None
+    assert trace.metadata["prompt_name"] == "summary.system"
+    assert trace.metadata["degraded_reason"] == "embedded_prompt"
+    linked = [p["name"] for p in trace.metadata["opik_prompts"]]
+    assert linked == ["summary.system", "summary.user"]
 
 
 def test_without_a_prompt_the_result_names_none() -> None:
