@@ -126,7 +126,7 @@ jobs:
           GATE: ${{ inputs.gate }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          printf '### Evaluation gate `%s` did not report\n\nThe job failed before the gate wrote its report; [the job log](%s) says why. A gate that did not run fails the check.\n' "$GATE" "$RUN_URL" > "$REPORT"
+          printf "### Evaluation gate \`%s\` did not report\n\nThe job failed before the gate wrote its report; [the job log](%s) says why. A gate that did not run fails the check.\n" "$GATE" "$RUN_URL" > "$REPORT"
       - name: Job summary
         if: ${{ !cancelled() }}
         run: cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
