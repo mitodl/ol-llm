@@ -28,5 +28,7 @@ uv run prek run --all-files                     # the same hooks CI runs
 - `opik` is pinned exactly. Bumping it means the smoke test must still pass with the overrides
   in `python/smoke/pyproject.toml`, which are the overrides consumers copy from the README.
 - Do not add litellm as a dependency.
-- A release is a version bump in `python/pyproject.toml`, the only place the version lives;
-  the publish workflow does the rest on merge.
+- A change a consumer would notice adds a fragment with `uv run scriv create --edit`
+  (`changelog.d/README.md`). Never edit `CHANGELOG.md` directly outside a release.
+- A release bumps the version in `python/pyproject.toml`, the only place the version lives,
+  and runs `uv run scriv collect`; the publish workflow does the rest on merge.
