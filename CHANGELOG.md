@@ -31,6 +31,7 @@ All notable changes to ol-llm are recorded here. The format follows
 
 ### Security
 
+- Requires `certifi>=2026.10.19`. Earlier releases bundle emSign roots whose intermediate CA keys are compromised (GHSA-6q48-6c7w-9gw2), so requests and httpx could trust a forged certificate. ol-llm does not import certifi; the floor reaches every app that installs it (#29).
 - The `harness` extra moves off pydantic-ai-harness 0.52, whose pin held pydantic-ai-slim at 2.52.0, to a release whose pydantic-ai-slim carries the fix for GHSA-6fqq-452j-qhrp (#23, #26).
 
 <a id='changelog-0.0.4'></a>
