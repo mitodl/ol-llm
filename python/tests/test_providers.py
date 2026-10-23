@@ -6,9 +6,11 @@ what arrives.
 """
 
 import asyncio
+import gc
 import json
 import threading
 import time
+import weakref
 from collections.abc import Generator, Iterator
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -18,7 +20,7 @@ from typing import Any
 import ol_llm.catalog as catalog_module
 import pytest
 from botocore.exceptions import EventStreamError
-from ol_llm import LLMRejected, LLMUnavailable, UseCase
+from ol_llm import LLMRateLimited, LLMRejected, LLMUnavailable, UseCase, run_sync
 from ol_llm.attribution import USE_CASE_HEADER
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.embeddings import PolicyEmbeddingModel, build_embedder
@@ -292,6 +294,23 @@ def test_one_retry_layer_per_provider(  # noqa: PLR0913, PLR0917
     assert len(mock_provider.requests) == attempts
 
 
+# Bedrock's timeout is the boto3 client's, so it gets no timeout setting; the hang
+# case above shows the client still enforces it.
+@pytest.mark.usefixtures("provider_env")
+@pytest.mark.filterwarnings("error::pydantic_ai.UnsupportedSettingWarning")
+@pytest.mark.parametrize("model_id", MOCKED_MODELS)
+def test_requests_send_no_setting_the_model_ignores(
+    mock_provider: MockProvider, monkeypatch: pytest.MonkeyPatch, model_id: str
+) -> None:
+    point_at(mock_provider, model_id, monkeypatch)
+    mock_provider.mode = "rejected"
+
+    with pytest.raises(LLMRejected):
+        build_agent(use_case(model_id)).run_sync("hi", model_settings={"timeout": 9})
+
+    assert len(mock_provider.requests) == 1
+
+
 MOCKED_EMBEDDING_MODELS = [
     "openai:text-embedding-3-large",
     "bedrock:amazon.titan-embed-text-v2:0",
@@ -416,9 +435,65 @@ def test_bedrock_stream_gives_up_after_its_retries(
 ) -> None:
     agent, opened = stream_bedrock(monkeypatch, [THROTTLED])
 
+    with pytest.raises(LLMRateLimited):
+        asyncio.run(consume(agent))
+    assert len(opened) == 3
+
+
+@pytest.mark.usefixtures("provider_env")
+def test_bedrock_stream_error_is_retried_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream_error = EventStreamError(
+        {"Error": {"Code": "modelStreamErrorException", "Message": "retry"}},
+        "ConverseStream",
+    )
+    agent, opened = stream_bedrock(monkeypatch, [stream_error])
+
     with pytest.raises(LLMUnavailable):
         asyncio.run(consume(agent))
     assert len(opened) == 3
+
+
+@pytest.mark.usefixtures("provider_env")
+def test_bedrock_throttle_after_the_first_chunk_is_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    agent, opened = stream_bedrock(monkeypatch, [*ANSWER[:2], THROTTLED])
+
+    with pytest.raises(LLMRateLimited):
+        asyncio.run(consume(agent))
+    assert len(opened) == 1
+
+
+# An agent refreshes its model's HTTP client at the start of every run, and a
+# provider that made its own client (Google, Mistral) records the loop it ran on.
+@pytest.mark.usefixtures("provider_env")
+@pytest.mark.parametrize("model_id", MOCKED_MODELS)
+def test_a_finished_threads_loop_is_released_by_every_provider(
+    mock_provider: MockProvider, monkeypatch: pytest.MonkeyPatch, model_id: str
+) -> None:
+    point_at(mock_provider, model_id, monkeypatch)
+    mock_provider.mode = "rejected"
+    agent = build_agent(use_case(model_id))
+    loops: list[weakref.ref[asyncio.AbstractEventLoop]] = []
+    errors: list[BaseException] = []
+
+    def call() -> None:
+        try:
+            run_sync(agent, "hi")
+        except LLMRejected:
+            loops.append(weakref.ref(asyncio.get_event_loop()))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=call)
+    thread.start()
+    thread.join()
+    gc.collect()
+
+    assert errors == []
+    assert loops[0]() is None
 
 
 @pytest.mark.usefixtures("provider_env")

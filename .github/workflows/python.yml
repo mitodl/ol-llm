@@ -35,6 +35,34 @@ jobs:
       - name: Test
         run: uv run pytest python/tests
 
+  newest-dependencies:
+    # Consumers resolve their own versions, which run ahead of uv.lock. The
+    # harness extra pins slim exactly and would hold it at the lock's version,
+    # and the tests use neither it nor the memory extra.
+    name: test (newest dependencies, Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The ends of the test matrix's range.
+        python-version: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.20"
+          python-version: ${{ matrix.python-version }}
+      - name: Install the newest releases the extras allow
+        run: |
+          uv venv "$RUNNER_TEMP/newest"
+          uv pip install --python "$RUNNER_TEMP/newest" \
+            "./python[anthropic,bedrock,google,mistral,openai,pydantic-ai]" "pytest>=8.4"
+          uv pip list --python "$RUNNER_TEMP/newest"
+      - name: Test
+        run: '"$RUNNER_TEMP/newest/bin/python" -m pytest python/tests'
+
   base-install:
     # The base package must work with no extras: PydanticAI and the memory and
     # harness clients are opt-in, and nothing in the base may import them.

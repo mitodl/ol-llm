@@ -94,7 +94,15 @@ _NO_DEPS: type[None] = type(None)
 DepsT = TypeVar("DepsT")
 
 RETRYABLE_STATUSES = frozenset({408, 500, 502, 503, 504, 529})
-"""HTTP statuses that mean the provider is unavailable (spec §3.2 rule 2)."""
+"""HTTP statuses that mean the provider is unavailable (spec §6.3)."""
+
+IN_STREAM_RETRYABLE_STATUSES = frozenset({424})
+"""Statuses that mean the provider is unavailable only when reported inside a stream.
+
+PydanticAI gives Bedrock's in-stream modelStreamErrorException status 424, and
+Bedrock says to retry it. Before a stream opens, Bedrock's 424 is a
+ModelErrorException, which it gives no retry advice for, so it stays rejected.
+"""
 
 RATE_LIMITED_STATUS = 429
 INITIAL_BACKOFF_SECONDS = 0.5
@@ -216,7 +224,9 @@ def classify_failure(  # noqa: PLR0911
             return LLMRateLimited(
                 message, use_case=use_case, model=model, retry_after=exc.retry_after
             )
-        if exc.status_code in RETRYABLE_STATUSES:
+        if exc.status_code in RETRYABLE_STATUSES or (
+            exc.in_stream and exc.status_code in IN_STREAM_RETRYABLE_STATUSES
+        ):
             return LLMUnavailable(message, use_case=use_case, model=model)
         return LLMRejected(
             message, use_case=use_case, model=model, status_code=exc.status_code
@@ -536,6 +546,16 @@ class PolicyModel(WrapperModel):
         """Exit the running loop's provider model."""
         return await self._loop_model().__aexit__(exc_type, exc_val, exc_tb)
 
+    def _refresh_http_client(self) -> None:
+        """Refresh the running loop's provider model, which is the one requests use.
+
+        An agent calls this at the start of every run. ``WrapperModel`` would refresh
+        ``wrapped``, whose provider then records the run's loop as the one its client
+        is used on and keeps it alive as long as the model, which ``shared_model``
+        keeps for the life of the process.
+        """
+        self._loop_model()._refresh_http_client()  # noqa: SLF001
+
     async def count_tokens(
         self,
         messages: list[ModelMessage],
@@ -563,6 +583,12 @@ class PolicyModel(WrapperModel):
         )
 
     def _with_timeout(self, model_settings: ModelSettings | None) -> ModelSettings:
+        if "timeout" in self.wrapped.unsupported_settings:
+            # Bedrock: the timeout is the boto3 client's (_bedrock_client), and a
+            # timeout setting would only draw a warning on every request.
+            settings = ModelSettings(**(model_settings or {}))
+            settings.pop("timeout", None)
+            return settings
         timeout = ModelSettings(timeout=self.policy.timeout_seconds)
         return merge_model_settings(model_settings, timeout) or timeout
 
