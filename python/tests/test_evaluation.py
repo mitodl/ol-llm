@@ -16,10 +16,12 @@ from ol_llm.errors import LLMContentFiltered
 from ol_llm.evaluation import (
     JUDGE_USE_CASE,
     LLM_ERROR_FIELD,
+    MAX_EXPERIMENT_ITEMS,
     EvaluationGateError,
     JudgeModel,
     Threshold,
     ValidatorMetric,
+    check_experiment,
     check_thresholds,
     evaluate,
     judge_model,
@@ -724,6 +726,16 @@ def test_an_unscored_item_fails_its_metric() -> None:
     assert not hallucination.passed
 
 
+def test_an_item_with_two_scores_of_one_name_is_refused() -> None:
+    result = scored(
+        [score("placeholders", 1.0), score("placeholders", 1.0)],
+        [score("placeholders", 0.0, failed=True)],
+    )
+
+    with pytest.raises(ValueError, match="two scores named 'placeholders'"):
+        check_thresholds(result, THRESHOLDS)
+
+
 def test_a_metric_with_no_scores_fails() -> None:
     report = check_thresholds(scored([score("placeholders", 1.0)]), THRESHOLDS)
 
@@ -799,7 +811,7 @@ def test_the_check_command_fails_only_when_blocking(
         SimpleNamespace(feedback_scores=[]),
     ]
     client.experiments["exp-1"] = SimpleNamespace(
-        name="summary-ci", get_items=lambda: items
+        name="summary-ci", get_items=lambda max_results: items[:max_results]
     )
 
     argv = ["check", "exp-1", "--threshold", "placeholders>=1", "--mode", mode]
@@ -812,12 +824,44 @@ def test_the_check_command_fails_only_when_blocking(
     assert not caplog.records
 
 
+def test_a_null_experiment_score_counts_as_unscored(client: FakeClient) -> None:
+    items = [
+        SimpleNamespace(feedback_scores=[{"name": "placeholders", "value": 1.0}]),
+        SimpleNamespace(feedback_scores=[{"name": "placeholders", "value": None}]),
+    ]
+    client.experiments["exp-1"] = SimpleNamespace(
+        name="summary-ci", get_items=lambda max_results: items[:max_results]
+    )
+
+    [outcome] = check_experiment(
+        "exp-1", [Threshold(metric="placeholders", minimum=1.0)]
+    ).outcomes
+
+    assert (outcome.mean, outcome.scored, outcome.unscored) == (1.0, 1, 1)
+    assert not outcome.passed
+
+
+def test_an_experiment_past_the_sdks_item_limit_is_refused(
+    client: FakeClient,
+) -> None:
+    item = SimpleNamespace(feedback_scores=[{"name": "placeholders", "value": 1.0}])
+    items = [item] * (MAX_EXPERIMENT_ITEMS + 5)
+    client.experiments["exp-1"] = SimpleNamespace(
+        name="summary-ci", get_items=lambda max_results: items[:max_results]
+    )
+
+    with pytest.raises(ValueError, match="more than 10000 items"):
+        check_experiment(
+            "exp-1", [Threshold(metric="placeholders", minimum=1.0)], mode="blocking"
+        )
+
+
 def test_the_check_command_passes_a_met_threshold(
     client: FakeClient, capsys: pytest.CaptureFixture[str]
 ) -> None:
     items = [SimpleNamespace(feedback_scores=[{"name": "placeholders", "value": 1.0}])]
     client.experiments["exp-1"] = SimpleNamespace(
-        name="summary-ci", get_items=lambda: items
+        name="summary-ci", get_items=lambda max_results: items[:max_results]
     )
 
     argv = ["check", "exp-1", "--threshold", "placeholders>=1", "--mode", "blocking"]

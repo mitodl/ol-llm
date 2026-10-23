@@ -80,6 +80,9 @@ LLM_ERROR_FIELD = "ol_llm_error"
 """The output field ``evaluate`` records, as the error's class name, for an item
 whose task raised an ``LLMError``. It shows on the item's trace in Opik."""
 
+MAX_EXPERIMENT_ITEMS = 10_000
+"""The most experiment items the Opik SDK reads (``Experiment.get_items``)."""
+
 Verdict = bool | Sequence[str]
 """What a validator returns: whether the output passed, or the problems it found,
 where none means it passed."""
@@ -760,18 +763,20 @@ def check_thresholds(
     :returns: the report.
     :rtype: GateReport
     :raises EvaluationGateError: in blocking mode, if a threshold was not met.
+    :raises ValueError: if an item has two scores of the same name.
     """
-    scores: dict[str, list[float]] = {}
-    for test_result in result.test_results:
-        for score in test_result.score_results:
-            if not score.scoring_failed:
-                scores.setdefault(score.name, []).append(score.value)
+    items = [
+        _item_scores(
+            (score.name, None if score.scoring_failed else score.value)
+            for score in test_result.score_results
+        )
+        for test_result in result.test_results
+    ]
     return _enforce(
         _report(
             experiment=result.experiment_name or result.experiment_id,
             url=result.experiment_url,
-            items=len(result.test_results),
-            scores=scores,
+            items=items,
             thresholds=thresholds,
             mode=mode,
         )
@@ -788,8 +793,8 @@ def check_experiment(
 
     For a CI step separate from the one that ran the experiment. Opik keeps only
     the scores that succeeded, so an item whose scoring failed counts as
-    unscored, as in ``check_thresholds``. Reads the first 10,000 items, the SDK's
-    default limit.
+    unscored, as in ``check_thresholds``. The SDK reads at most 10,000 items, so
+    a larger experiment is refused rather than judged on part of it.
 
     :param experiment_id: the experiment's id, from ``EvaluationResult``.
     :param thresholds: the use case's thresholds.
@@ -797,6 +802,8 @@ def check_experiment(
     :returns: the report.
     :rtype: GateReport
     :raises EvaluationGateError: in blocking mode, if a threshold was not met.
+    :raises ValueError: if the experiment has more than 10,000 items, or an item
+        has two scores of the same name.
     """
     return _enforce(_experiment_report(experiment_id, thresholds, mode=mode))
 
@@ -805,39 +812,62 @@ def _experiment_report(
     experiment_id: str, thresholds: Sequence[Threshold], *, mode: GateMode
 ) -> GateReport:
     experiment = tracing.opik_client().get_experiment_by_id(experiment_id)
-    items = experiment.get_items()
-    scores: dict[str, list[float]] = {}
-    for item in items:
-        for score in item.feedback_scores:
-            scores.setdefault(score["name"], []).append(score["value"])
+    # One past the SDK's cap, which max_results=None does not lift.
+    found = experiment.get_items(max_results=MAX_EXPERIMENT_ITEMS + 1)
+    if len(found) > MAX_EXPERIMENT_ITEMS:
+        msg = (
+            f"Experiment {experiment_id} has more than {MAX_EXPERIMENT_ITEMS} items, "
+            "more than the Opik SDK reads"
+        )
+        raise ValueError(msg)
+    # Opik sends a null value for a score it has no value for.
+    items = [
+        _item_scores((score["name"], score["value"]) for score in item.feedback_scores)
+        for item in found
+    ]
     return _report(
         experiment=experiment.name or experiment_id,
         url=None,
-        items=len(items),
-        scores=scores,
+        items=items,
         thresholds=thresholds,
         mode=mode,
     )
 
 
-def _report(  # noqa: PLR0913
+def _item_scores(scores: Iterable[tuple[str, float | None]]) -> dict[str, float | None]:
+    """Return one item's scores by name, ``None`` for one that failed.
+
+    :raises ValueError: if two scores share a name, since then the item's score
+        for that metric is ambiguous.
+    """
+    by_name: dict[str, float | None] = {}
+    for name, value in scores:
+        if name in by_name:
+            msg = f"An item has two scores named {name!r}"
+            raise ValueError(msg)
+        by_name[name] = value
+    return by_name
+
+
+def _report(
     *,
     experiment: str,
     url: str | None,
-    items: int,
-    scores: Mapping[str, Sequence[float]],
+    items: Sequence[Mapping[str, float | None]],
     thresholds: Sequence[Threshold],
     mode: GateMode,
 ) -> GateReport:
     outcomes = []
     for threshold in thresholds:
-        values = scores.get(threshold.metric, ())
+        values = [
+            value for item in items if (value := item.get(threshold.metric)) is not None
+        ]
         outcomes.append(
             MetricOutcome(
                 threshold=threshold,
                 mean=sum(values) / len(values) if values else None,
                 scored=len(values),
-                unscored=max(items - len(values), 0),
+                unscored=len(items) - len(values),
             )
         )
     return GateReport(
