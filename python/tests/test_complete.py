@@ -39,9 +39,9 @@ from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
-    RetryPromptPart,
     TextPart,
     ToolCallPart,
+    ToolReturnPart,
 )
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
@@ -231,8 +231,9 @@ def test_an_output_validator_sends_bad_output_back_to_the_model(
     retry = sent[1][-1]
     assert isinstance(retry, ModelRequest)
     [part] = retry.parts
-    assert isinstance(part, RetryPromptPart)
-    assert part.content == "The summary was empty."
+    # Output from an output tool goes back as that tool's return.
+    assert isinstance(part, ToolReturnPart)
+    assert (part.outcome, part.content) == ("retried", "The summary was empty.")
 
 
 def test_output_still_invalid_after_its_retries_raises_llm_invalid_output() -> None:
