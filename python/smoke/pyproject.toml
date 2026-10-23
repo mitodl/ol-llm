@@ -10,7 +10,6 @@ requires-python = ">=3.11"
 dependencies = ["ol-llm[pydantic-ai]"]
 
 [tool.uv]
-constraint-dependencies = ["certifi>=2026.10.19"]  # eMudhra CA compromise: never resolve a certifi that trusts the compromised CAs
 package = false
 override-dependencies = [
     "boto3-stubs; sys_platform == 'never'",

@@ -8,7 +8,6 @@ resolution-markers = [
 ]
 
 [manifest]
-constraints = [{ name = "certifi", specifier = ">=2026.10.19" }]
 overrides = [
     { name = "boto3-stubs", marker = "sys_platform == 'never'" },
     { name = "click", marker = "sys_platform == 'never'" },
@@ -762,6 +761,7 @@ name = "ol-llm"
 version = "0.0.4"
 source = { editable = "../" }
 dependencies = [
+    { name = "certifi" },
     { name = "httpx" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
@@ -777,6 +777,7 @@ pydantic-ai = [
 
 [package.metadata]
 requires-dist = [
+    { name = "certifi", specifier = ">=2026.10.19" },
     { name = "hindsight-client", marker = "extra == 'memory'", specifier = ">=0.10,<0.11" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.38" },
