@@ -29,9 +29,10 @@ range, fails when the model is built. The resolved values go on the trace as
 
 `TIMEOUT_SECONDS` bounds one attempt; on a stream it bounds the gap between chunks, as it does
 on a Bedrock Claude request that sets no `max_tokens`, which PydanticAI streams behind the
-scenes. The worst case for one call that is not streamed is `(MAX_RETRIES + 1) ×
-TIMEOUT_SECONDS` plus backoff, and that again for each fallback model, so worker time limits
-(Celery, arq, Dagster) have to sit above it. A streamed call has no such bound.
+scenes. The worst case for one call that is not streamed, by the caller or behind the scenes,
+is `(MAX_RETRIES + 1) × TIMEOUT_SECONDS` plus backoff, and that again for each fallback model,
+so worker time limits (Celery, arq, Dagster) have to sit above it. A streamed call has no such
+bound.
 
 ## One retry layer
 

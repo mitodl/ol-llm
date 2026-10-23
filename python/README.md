@@ -125,13 +125,15 @@ thinking turned on, and on the models whose profile rejects forcing (Claude Opus
 5.5, and the 5.1 generation in PydanticAI 2.52).
 
 Set `max_tokens` on a Bedrock Claude model, through `model_settings` here or on the agent.
-Without it PydanticAI sends the model's maximum output, and Bedrock takes that much of the
-account's tokens-per-minute quota when each request starts, releasing the unused part only as
-the response is generated
+Without it PydanticAI sends the model's maximum output as `maxTokens` (64,000 for Claude Haiku
+4.5, 128,000 for Sonnet 5), and Bedrock takes that much of the account's tokens-per-minute
+quota when each request starts, settling to the real usage only as the request runs
 ([token burndown](https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-token-burndown.html)),
 so concurrent requests are throttled long before their real usage reaches the quota.
-PydanticAI also streams such a request behind the scenes, so the policy timeout bounds the gap
-between chunks rather than the whole request.
+PydanticAI also sends such a request through `ConverseStream`, so the role needs
+`bedrock:InvokeModelWithResponseStream` (without it the call is an `LLMRejected` 403 and does
+not fall back), and the policy timeout bounds the gap between chunks rather than the whole
+request.
 
 `output_validators` run on the output once it matches the type, and one that raises PydanticAI's
 `ModelRetry` sends the output back to the model with its message, within the use case's
