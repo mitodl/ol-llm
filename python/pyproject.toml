@@ -25,6 +25,10 @@ classifiers = [
 # release that starts importing a dropped package eagerly would break them at
 # import time. The smoke project in python/smoke/ catches that on every bump.
 dependencies = [
+    # Not imported here; requests and httpx verify TLS against it. Before
+    # 2026.10.19 it trusts emSign intermediates whose keys are compromised
+    # (GHSA-6q48-6c7w-9gw2), and a floor here reaches every consuming app.
+    "certifi>=2026.10.19",
     "httpx>=0.28",
     "opentelemetry-exporter-otlp-proto-http>=1.38",
     "opentelemetry-sdk>=1.38",
