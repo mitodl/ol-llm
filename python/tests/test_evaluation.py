@@ -12,7 +12,7 @@ import pytest
 from conftest import PromptLibrary
 from ol_llm import TextTemplate, UseCase, get_prompt, tracing
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
-from ol_llm.errors import LLMContentFiltered
+from ol_llm.errors import LLMContentFiltered, LLMUnavailable
 from ol_llm.evaluation import (
     JUDGE_USE_CASE,
     LLM_ERROR_FIELD,
@@ -34,7 +34,7 @@ from ol_llm.prompts import ManagedPrompt
 from opik.api_objects.dataset.dataset_item import DatasetItem
 from opik.evaluation import test_case, test_result
 from opik.evaluation.evaluation_result import EvaluationResult
-from opik.evaluation.metrics import Hallucination
+from opik.evaluation.metrics import BaseMetric, Hallucination
 from opik.evaluation.metrics.score_result import ScoreResult
 from opik.exceptions import ScoreMethodMissingArguments
 from pydantic_ai.exceptions import ModelHTTPError
@@ -461,6 +461,46 @@ def test_a_judge_llm_error_is_a_failed_score(
         assert judged.scoring_failed
         assert judged.reason == "the judge raised LLMRejected"
         assert scores["nonempty"].value == 1.0
+
+
+class SpanJudge(BaseMetric):
+    """A judge that reads the task span, which Opik scores on a separate path."""
+
+    def __init__(self) -> None:
+        super().__init__(name="span_judge", track=False)
+
+    def score(
+        self,
+        input: str,  # noqa: A002
+        task_span: object,
+        **_: object,
+    ) -> ScoreResult:
+        if input == FILTERED:
+            msg = "judge down"
+            raise LLMUnavailable(msg, use_case=JUDGE_USE_CASE, model=JUDGE)
+        return ScoreResult(name=self.name, value=float(task_span is not None))
+
+
+@ON_OPIKS_ENGINE
+def test_a_span_reading_judges_llm_error_is_a_failed_score(
+    production_prompt: ManagedPrompt[TextTemplate],
+) -> None:
+    seed_dataset("rag-golden", RAG, project_name=APP)
+    result = evaluate(
+        lambda _item: {"output": "x"},
+        dataset="rag-golden",
+        project_name=APP,
+        metrics=[SpanJudge()],
+        prompts=[production_prompt],
+        scoring_key_mapping={"input": "question"},
+        task_threads=1,
+    )
+
+    scores = by_question(result)
+    assert scores[RAG[0]["question"]]["span_judge"].value == 1.0
+    judged = scores[FILTERED]["span_judge"]
+    assert judged.scoring_failed
+    assert judged.reason == "the judge raised LLMUnavailable"
 
 
 @ON_OPIKS_ENGINE

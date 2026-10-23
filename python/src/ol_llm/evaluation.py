@@ -469,7 +469,7 @@ def _guard_task(
     return guarded
 
 
-class _FailsAfterLLMError(BaseMetric):
+class _MetricOnLLMError(BaseMetric):
     """A metric that reports a failed score for an item an ``LLMError`` cut short.
 
     Wraps every metric ``evaluate`` runs except ``ValidatorMetric``, which scores
@@ -512,14 +512,27 @@ class _FailsAfterLLMError(BaseMetric):
         )
 
 
+class _SpanMetricOnLLMError(_MetricOnLLMError):
+    """``_MetricOnLLMError`` for a metric that reads the task span.
+
+    Opik passes ``task_span`` only to a metric whose ``score`` names it.
+    """
+
+    def score(
+        self,
+        task_span: Any = None,  # noqa: ANN401
+        **inputs: Any,  # noqa: ANN401
+    ) -> score_result.ScoreResult | list[score_result.ScoreResult]:
+        """Score the item with the metric and its task span."""
+        return super().score(task_span=task_span, **inputs)
+
+
 def _guard_metric(metric: BaseMetric) -> BaseMetric:
     if isinstance(metric, ValidatorMetric):
         return metric
-    # Opik passes the task span only to a metric whose score names it, which a
-    # wrapper would hide.
     if "task_span" in inspect.signature(metric.score).parameters:
-        return metric
-    return _FailsAfterLLMError(metric)
+        return _SpanMetricOnLLMError(metric)
+    return _MetricOnLLMError(metric)
 
 
 def evaluate(  # noqa: PLR0913
