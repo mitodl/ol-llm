@@ -776,7 +776,6 @@ pydantic-ai = [
 
 [package.metadata]
 requires-dist = [
-    { name = "anthropic", marker = "extra == 'anthropic'", specifier = "<2" },
     { name = "hindsight-client", marker = "extra == 'memory'", specifier = ">=0.10,<0.11" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.38" },
