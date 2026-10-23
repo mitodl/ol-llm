@@ -1,5 +1,8 @@
 import json
+import re
 import sys
+import textwrap
+import tomllib
 import uuid
 from collections.abc import Callable, Generator
 from datetime import UTC, datetime, timedelta
@@ -7,11 +10,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import ol_llm.gate as gate_module
 import opik
 import pydantic
 import pytest
 from conftest import PromptLibrary
 from ol_llm import fetch_prompt, tracing
+from ol_llm.errors import LLMError, LLMRejected
 from ol_llm.evaluation import Threshold, ValidatorMetric, main
 from ol_llm.gate import (
     BASELINE_TAG,
@@ -23,6 +28,8 @@ from ol_llm.gate import (
     load_suite,
     run_gate,
 )
+from ol_llm.settings import Settings
+from ol_llm.tracing import TracingConfig
 from opik.api_objects.dataset.dataset_item import DatasetItem
 from opik.evaluation import test_case, test_result
 from opik.evaluation.evaluation_result import EvaluationResult
@@ -62,6 +69,7 @@ minimum = 1.0
 [[thresholds]]
 metric = "brevity"
 tolerance = 0.1
+direction = "higher"
 """
 
 
@@ -94,11 +102,24 @@ class FakeExperiments:
     def __init__(self) -> None:
         self.stored: list[ExperimentPublic] = []
         self.updates: list[tuple[str, dict[str, Any]]] = []
+        self.queries: list[list[dict[str, str]]] = []
 
     def find_experiments(
-        self, *, page: int, size: int, dataset_id: str
+        self, *, page: int, size: int, dataset_id: str, filters: str
     ) -> SimpleNamespace:
-        matching = [e for e in self.stored if e.dataset_id == dataset_id]
+        """Filter on tags with ``=`` as Opik does, newest first as its id order is."""
+        self.queries.append(json.loads(filters))
+        tags = {f["value"] for f in json.loads(filters) if f["field"] == "tags"}
+        assert all(f["operator"] == "=" for f in json.loads(filters))
+        matching = sorted(
+            (
+                e
+                for e in self.stored
+                if e.dataset_id == dataset_id and tags <= set(e.tags or [])
+            ),
+            key=lambda e: e.created_at,
+            reverse=True,
+        )
         return SimpleNamespace(content=matching[(page - 1) * size : page * size])
 
     def update_experiment(self, experiment_id: str, **fields: Any) -> None:  # noqa: ANN401
@@ -142,32 +163,35 @@ def runs(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
 
     def fake_evaluate(**kwargs: Any) -> EvaluationResult:  # noqa: ANN401
         calls.append(kwargs)
-        results = []
-        for i, item in enumerate(kwargs["dataset"]):
-            output = kwargs["task"](item)
-            inputs = {**item, **output}
-            results.append(
-                test_result.TestResult(
-                    test_case=test_case.TestCase(
-                        trace_id=f"t{i}", dataset_item_id=f"i{i}", task_output=output
-                    ),
-                    score_results=[
-                        m.score(**inputs) for m in kwargs["scoring_metrics"]
-                    ],
-                    trial_id=0,
-                )
-            )
-        return EvaluationResult(
-            experiment_id=f"exp-{len(calls)}",
-            dataset_id=f"ds-{DATASET}",
-            experiment_name=kwargs["experiment_name"],
-            test_results=results,
-            experiment_url=f"https://opik.example/exp-{len(calls)}",
-            trial_count=1,
-        )
+        return fake_result(kwargs, number=len(calls))
 
     monkeypatch.setattr(opik, "evaluate", fake_evaluate)
     return calls
+
+
+def fake_result(kwargs: dict[str, Any], *, number: int = 1) -> EvaluationResult:
+    """Score each item with the task and metrics ``opik.evaluate`` was given."""
+    results = []
+    for i, item in enumerate(kwargs["dataset"]):
+        output = kwargs["task"](item)
+        inputs = {**item, **output}
+        results.append(
+            test_result.TestResult(
+                test_case=test_case.TestCase(
+                    trace_id=f"t{i}", dataset_item_id=f"i{i}", task_output=output
+                ),
+                score_results=[m.score(**inputs) for m in kwargs["scoring_metrics"]],
+                trial_id=0,
+            )
+        )
+    return EvaluationResult(
+        experiment_id=f"exp-{number}",
+        dataset_id=f"ds-{DATASET}",
+        experiment_name=kwargs["experiment_name"],
+        test_results=results,
+        experiment_url=f"https://opik.example/exp-{number}",
+        trial_count=1,
+    )
 
 
 @pytest.fixture
@@ -214,7 +238,7 @@ def declaration(**changes: Any) -> GateDeclaration:  # noqa: ANN401
         "dataset": {"name": DATASET, "version": "v1"},
         "thresholds": [
             {"metric": "placeholders", "minimum": 1.0},
-            {"metric": "brevity", "tolerance": 0.1},
+            {"metric": "brevity", "tolerance": 0.1, "direction": "higher"},
         ],
     }
     return GateDeclaration.model_validate(data | changes)
@@ -265,6 +289,15 @@ def experiment(  # noqa: PLR0913
 # The declaration
 
 
+def test_the_documented_declarations_are_valid() -> None:
+    doc = (WORKFLOW.parents[2] / "docs" / "evaluation-gate.md").read_text()
+    [example] = re.findall(r"```toml\n(.*?)```", doc, flags=re.DOTALL)
+    docstring = (gate_module.__doc__ or "").split("::\n", 1)[1].split("``suite``")[0]
+
+    for text in (example, textwrap.dedent(docstring)):
+        assert GateDeclaration.model_validate(tomllib.loads(text)).thresholds
+
+
 def test_a_declaration_loads_from_toml(tmp_path: Path) -> None:
     path = tmp_path / "gate.toml"
     path.write_text(GATE_TOML + "\n[dataset.extra]\n", encoding="utf-8")
@@ -282,7 +315,7 @@ def test_a_declaration_loads_from_toml(tmp_path: Path) -> None:
     assert loaded.dataset.file == tmp_path / "golden.json"
     assert loaded.thresholds == [
         Threshold(metric="placeholders", minimum=1.0),
-        Threshold(metric="brevity", tolerance=0.1),
+        Threshold(metric="brevity", tolerance=0.1, direction="higher"),
     ]
 
 
@@ -294,6 +327,10 @@ def test_a_declaration_loads_from_toml(tmp_path: Path) -> None:
         ({"dataset": {"name": DATASET, "version": "latest"}}, "should match pattern"),
         ({"thresholds": []}, "at least 1 item"),
         ({"thresholds": [{"metric": "brevity"}]}, "a minimum, a maximum, or a"),
+        (
+            {"thresholds": [{"metric": "hallucination_metric", "tolerance": 0.05}]},
+            'needs direction = "higher" or "lower"',
+        ),
         (
             {
                 "thresholds": [
@@ -346,10 +383,17 @@ def test_a_gate_runs_the_pinned_versions_and_tags_the_change(
     }
     assert outcome.report.passed
     assert not outcome.failed
+    assert outcome.exit_status == 0
     assert outcome.prompt_versions == {USE_CASE: "v2"}
     assert outcome.baseline is None
     assert "no default-branch run" in (outcome.baseline_note or "")
     assert not client.rest_client.experiments.updates
+    # brevity has only a tolerance, so with no baseline its 0.5 is not compared.
+    _, brevity = outcome.report.outcomes
+    assert brevity.status == "not compared"
+    markdown = outcome.markdown()
+    assert "no threshold missed, 1 not compared (advisory)" in markdown
+    assert "| 2 of 2 | not compared |" in markdown
 
 
 @pytest.mark.usefixtures("prompts")
@@ -446,6 +490,92 @@ def test_the_judge_is_built_through_the_library(client: FakeClient) -> None:
     assert (judge.use_case.app, judge.use_case.name) == (APP, "eval-judge")
 
 
+@pytest.mark.usefixtures("prompts")
+def test_an_uncataloged_judge_cannot_run(client: FakeClient) -> None:
+    seeded(client)
+
+    with pytest.raises(GateConfigurationError, match="not in the model catalog"):
+        run_gate(
+            declaration(judge_model="openai:gpt-9-judge"), suite=suite, change="pr-1"
+        )
+
+
+@pytest.mark.usefixtures("client", "prompts")
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [(None, "No such file"), ('{"a": []}', "pick one with group")],
+)
+def test_a_golden_file_that_cannot_be_read_cannot_run(
+    tmp_path: Path, content: str | None, message: str
+) -> None:
+    golden = tmp_path / "golden.json"
+    if content is not None:
+        golden.write_text(content)
+    pin = {"name": DATASET, "version": "v1", "file": str(golden)}
+
+    with pytest.raises(GateConfigurationError, match=message):
+        run_gate(declaration(dataset=pin), suite=suite, change="pr-1")
+
+
+def failing_suite(error: Callable[[str], LLMError]) -> Callable[[GateContext], Suite]:
+    def build(context: GateContext) -> Suite:
+        built = suite(context)
+
+        def task(item: dict[str, Any]) -> dict[str, Any]:
+            raise error(item["text"])
+
+        return Suite(task=task, metrics=built.metrics)
+
+    return build
+
+
+@pytest.mark.usefixtures("prompts", "runs")
+@pytest.mark.parametrize("mode", ["advisory", "blocking"])
+def test_a_gate_whose_every_task_raised_could_not_run(
+    client: FakeClient, mode: str
+) -> None:
+    seeded(client)
+
+    # evaluate's guard turns each LLMError into an output naming it.
+    outcome = run_gate(
+        declaration(mode=mode),
+        suite=failing_suite(
+            lambda text: LLMRejected(
+                text, use_case=USE_CASE, model="bedrock:m", status_code=401
+            )
+        ),
+        change="main",
+        record_baseline=True,
+    )
+
+    assert outcome.not_run == (
+        "the task raised an LLMError on every item (LLMRejected x2); the job log "
+        "has each one."
+    )
+    assert outcome.exit_status == GATE_ERROR_STATUS
+    assert not client.rest_client.experiments.updates
+    assert not outcome.recorded_baseline
+    assert outcome.markdown().startswith(
+        f"### Evaluation gate `{USE_CASE}`: could not run ({mode})"
+    )
+    assert "Advisory" not in outcome.markdown()
+
+
+@pytest.mark.usefixtures("prompts", "runs")
+def test_a_metric_that_scored_no_item_could_not_run(client: FakeClient) -> None:
+    seeded(client)
+
+    def unscored(context: GateContext) -> Suite:
+        built = suite(context)
+        return Suite(task=built.task, metrics=built.metrics[:1])
+
+    outcome = run_gate(declaration(), suite=unscored, change="pr-1")
+
+    assert outcome.not_run is not None
+    assert "no item has a score for ['brevity']" in outcome.not_run
+    assert outcome.exit_status == GATE_ERROR_STATUS
+
+
 # Baselines
 
 
@@ -480,6 +610,12 @@ def test_a_tolerance_is_measured_from_the_newest_baseline(
 
     assert outcome.baseline is not None
     assert outcome.baseline.experiment_id == newest.id
+    assert client.rest_client.experiments.queries == [
+        [
+            {"field": "tags", "operator": "=", "value": f"gate:{USE_CASE}"},
+            {"field": "tags", "operator": "=", "value": BASELINE_TAG},
+        ]
+    ]
     assert outcome.baseline.prompt_versions == {USE_CASE: "v1"}
     # "v2: {great}" is short enough; "v2: {lectures}" is not, so brevity is 0.5,
     # more than 0.1 below the baseline's 1.0.
@@ -667,3 +803,27 @@ def test_fetch_prompt_takes_one_selector() -> None:
         fetch_prompt("text", project_name=APP)
     with pytest.raises(ValueError, match="exactly one"):
         fetch_prompt("text", project_name=APP, version="v1", environment="production")
+
+
+# The workflow
+
+WORKFLOW = Path(__file__).parents[2] / ".github" / "workflows" / "evaluation-gate.yml"
+ENV_LINE = re.compile(r"^ +([A-Z][A-Z0-9_]*): (\S+)", re.MULTILINE)
+
+
+def test_the_workflow_sets_what_the_library_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate step's environment names the variables ol-llm reads, by name."""
+    monkeypatch.delenv("OPIK_API_KEY", raising=False)
+    step = WORKFLOW.read_text().split("- name: Run the gate\n", 1)[1]
+    step = step.split("\n      - ", 1)[0]
+    env = {name: "set" for name, _ in ENV_LINE.findall(step)}
+    env["OL_LLM_ENVIRONMENT"] = dict(ENV_LINE.findall(step))["OL_LLM_ENVIRONMENT"]
+
+    keycloak = TracingConfig.from_env(env).keycloak
+
+    assert keycloak is not None
+    assert keycloak.client_secret == "set"  # noqa: S105
+    assert Settings.from_env(env).environment == "ci"
+    assert {"OPIK_URL_OVERRIDE", "OPIK_WORKSPACE"} <= env.keys()

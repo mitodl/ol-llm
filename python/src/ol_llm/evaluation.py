@@ -38,6 +38,7 @@ import functools
 import inspect
 import json
 import logging
+import math
 import re
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -637,16 +638,19 @@ class Threshold:
     ``tolerance`` bounds the mean against a baseline, the last default-branch
     experiment for the production prompt version (spec §5.1 item 5): the mean may
     fall at most that far below it, or for a metric where lower is better, rise at
-    most that far above it. With no baseline only the fixed bounds apply.
+    most that far above it. With no baseline the tolerance is not compared, and
+    only the fixed bounds apply.
 
     :param metric: the score's name.
     :param minimum: the lowest mean that passes.
     :param maximum: the highest mean that passes.
     :param tolerance: how far the mean may move the wrong way from the baseline.
-    :param direction: which way is better, for ``tolerance``. Defaults to
-        ``lower`` for a threshold with only a ``maximum``, else ``higher``.
+    :param direction: which way is better, for ``tolerance``. Required with a
+        tolerance and no bound; otherwise ``lower`` for a threshold with only a
+        ``maximum`` and ``higher`` for any other.
     :raises ValueError: if no bound or tolerance is set, the minimum is above the
-        maximum, or the tolerance is negative.
+        maximum, the tolerance is negative, or a tolerance with no bound has no
+        direction.
     """
 
     metric: str
@@ -657,7 +661,8 @@ class Threshold:
 
     def __post_init__(self) -> None:
         """Reject a threshold that bounds nothing or nothing could pass."""
-        if self.minimum is None and self.maximum is None and self.tolerance is None:
+        unbounded = self.minimum is None and self.maximum is None
+        if unbounded and self.tolerance is None:
             msg = (
                 f"Threshold for {self.metric!r} needs a minimum, a maximum, or a "
                 "tolerance"
@@ -672,6 +677,13 @@ class Threshold:
             raise ValueError(msg)
         if self.tolerance is not None and self.tolerance < 0:
             msg = f"Threshold for {self.metric!r} has a negative tolerance"
+            raise ValueError(msg)
+        if unbounded and self.direction is None:
+            # Guessing would pass a regression on a metric where lower is better.
+            msg = (
+                f"Threshold for {self.metric!r} has a tolerance and no bound, so it "
+                'needs direction = "higher" or "lower" (which way is better)'
+            )
             raise ValueError(msg)
 
     @property
@@ -713,6 +725,11 @@ class Threshold:
         return " and ".join(parts)
 
 
+OutcomeStatus = Literal["pass", "fail", "not compared"]
+"""How a metric did: ``not compared`` is a tolerance-only threshold with no
+baseline, which neither passes nor fails."""
+
+
 @dataclass(frozen=True, kw_only=True)
 class MetricOutcome:
     """How one metric did against its threshold.
@@ -732,29 +749,45 @@ class MetricOutcome:
     baseline: float | None = None
 
     @property
-    def passed(self) -> bool:
-        """Whether every item was scored and the mean is within the bounds."""
-        if self.mean is None or self.unscored:
-            return False
-        low, high = self.threshold.minimum, self.threshold.maximum
-        bounded = (low is None or self.mean >= low) and (
-            high is None or self.mean <= high
-        )
-        return bounded and self._within_tolerance(self.mean)
+    def status(self) -> OutcomeStatus:
+        """Whether the metric passed, failed, or could not be compared.
 
-    def _within_tolerance(self, mean: float) -> bool:
-        tolerance = self.threshold.tolerance
-        if tolerance is None or self.baseline is None:
-            return True
+        ``fail`` when an item is unscored, the mean is not a number, or it is
+        outside a bound or the tolerance; ``not compared`` for a tolerance-only
+        threshold with no baseline; else ``pass``.
+        """
+        threshold, mean = self.threshold, self.mean
+        if mean is None or math.isnan(mean) or self.unscored:
+            return "fail"
+        low, high = threshold.minimum, threshold.maximum
+        if (low is not None and mean < low) or (high is not None and mean > high):
+            return "fail"
+        if threshold.tolerance is None:
+            return "pass"
+        if self.baseline is None:
+            return "not compared" if low is None and high is None else "pass"
         # Within float error of the edge counts: 0.8 - 0.1 is 0.7000000000000001.
-        allowed = tolerance + _FLOAT_SLACK
-        if self.threshold.better == "higher":
-            return mean >= self.baseline - allowed
-        return mean <= self.baseline + allowed
+        allowed = threshold.tolerance + _FLOAT_SLACK
+        within = (
+            mean >= self.baseline - allowed
+            if threshold.better == "higher"
+            else mean <= self.baseline + allowed
+        )
+        return "pass" if within else "fail"
+
+    @property
+    def passed(self) -> bool:
+        """Whether the metric met its threshold, bounds and baseline both."""
+        return self.status == "pass"
+
+    @property
+    def failed(self) -> bool:
+        """Whether the metric missed its threshold."""
+        return self.status == "fail"
 
     def describe(self) -> str:
         """Return one report line."""
-        status = "PASS" if self.passed else "FAIL"
+        status = self.status.upper()
         mean = "no scores" if self.mean is None else f"mean {self.mean:.2f}"
         counts = f"{self.scored} scored"
         if self.unscored:
@@ -788,21 +821,27 @@ class GateReport:
 
     @property
     def passed(self) -> bool:
-        """Whether every threshold was met."""
-        return all(outcome.passed for outcome in self.outcomes)
+        """Whether no threshold was missed; a ``not compared`` one is no miss."""
+        return not any(outcome.failed for outcome in self.outcomes)
 
     def describe(self) -> str:
         """Return the report as text, one line per threshold."""
         heading = f"Experiment {self.experiment}" + (
             f" ({self.url})" if self.url else ""
         )
-        missed = sum(not outcome.passed for outcome in self.outcomes)
-        if not missed:
-            verdict = "All thresholds met."
-        elif self.mode == "advisory":
+        missed = sum(outcome.failed for outcome in self.outcomes)
+        uncompared = sum(o.status == "not compared" for o in self.outcomes)
+        if missed and self.mode == "advisory":
             verdict = f"{missed} threshold(s) not met; advisory, so not failing."
-        else:
+        elif missed:
             verdict = f"{missed} threshold(s) not met."
+        elif uncompared:
+            verdict = (
+                f"No threshold missed; {uncompared} not compared, for want of a "
+                "baseline."
+            )
+        else:
+            verdict = "All thresholds met."
         lines = [heading, *(o.describe() for o in self.outcomes), verdict]
         return "\n".join(lines)
 
@@ -828,7 +867,7 @@ def check_thresholds(
 ) -> GateReport:
     """Compare an experiment's scores to its thresholds, and enforce the mode.
 
-    ``score_report`` without the enforcement.
+    ``score_report``, then a blocking miss raises and an advisory one is logged.
 
     :param result: what ``evaluate`` returned.
     :param thresholds: the use case's thresholds.

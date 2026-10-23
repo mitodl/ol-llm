@@ -24,6 +24,7 @@ the owning team reviews like code (spec §5.1 item 3)::
     [[thresholds]]
     metric = "answer_relevance_metric"
     tolerance = 0.05                    # at most 0.05 below the baseline
+    direction = "higher"
 
 ``suite`` names a callable, ``module:attribute``, that takes a ``GateContext`` and
 returns a ``Suite``: the task under test and its metrics. The module is imported
@@ -48,14 +49,16 @@ Needs the ``pydantic-ai`` extra, the provider extras for the task's and judge's
 models, and opik installed whole (see ``ol_llm.evaluation``).
 """
 
+import json
 import logging
 import pkgutil
 import sys
 import tomllib
-from collections.abc import Callable, Mapping, Sequence
+from collections import Counter
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any
 
 import httpx
 import opik
@@ -68,6 +71,7 @@ from opik.rest_api.types import ExperimentPublic
 
 from ol_llm import tracing
 from ol_llm.evaluation import (
+    LLM_ERROR_FIELD,
     GateMode,
     GateReport,
     JudgeModel,
@@ -81,7 +85,7 @@ from ol_llm.evaluation import (
 from ol_llm.prompts import ManagedPrompt, fetch_prompt
 
 if TYPE_CHECKING:
-    from datetime import datetime
+    from opik.evaluation.evaluation_result import EvaluationResult
 
 log = logging.getLogger(__name__)
 
@@ -258,6 +262,9 @@ class GateOutcome:
     :param baseline: the baseline, when one was found.
     :param baseline_note: why there is none, when there is none.
     :param recorded_baseline: whether this run is now a baseline.
+    :param not_run: why the experiment evaluated nothing, when it did not: every
+        task raised, or a thresholded metric scored no item. The gate then
+        cannot vouch for the change in either mode.
     """
 
     declaration: GateDeclaration
@@ -268,25 +275,40 @@ class GateOutcome:
     baseline: Baseline | None
     baseline_note: str | None = None
     recorded_baseline: bool = False
+    not_run: str | None = None
 
     @property
     def failed(self) -> bool:
         """Whether the check fails: a blocking gate that missed a threshold."""
         return self.declaration.mode == "blocking" and not self.report.passed
 
+    @property
+    def exit_status(self) -> int:
+        """What ``ol-llm-eval gate`` exits with for this outcome."""
+        if self.not_run is not None:
+            return GATE_ERROR_STATUS
+        return 1 if self.failed else 0
+
     def describe(self) -> str:
         """Return the report as text, with what it ran against."""
-        return "\n".join([self.report.describe(), *self._context_lines()])
+        lines = [self.report.describe(), *self._context_lines()]
+        if self.not_run is not None:
+            lines.append(f"The gate could not run: {self.not_run}")
+        return "\n".join(lines)
 
     def markdown(self) -> str:
         """Return the report as Markdown, for the pull request and job summary."""
         declaration, report = self.declaration, self.report
-        missed = sum(not o.passed for o in report.outcomes)
-        verdict = (
-            "all thresholds met"
-            if not missed
-            else f"{missed} of {len(report.outcomes)} thresholds not met"
-        )
+        missed = sum(o.failed for o in report.outcomes)
+        uncompared = sum(o.status == "not compared" for o in report.outcomes)
+        if self.not_run is not None:
+            verdict = "could not run"
+        elif missed:
+            verdict = f"{missed} of {len(report.outcomes)} thresholds not met"
+        elif uncompared:
+            verdict = f"no threshold missed, {uncompared} not compared"
+        else:
+            verdict = "all thresholds met"
         experiment = (
             f"[{report.experiment}]({report.url})" if report.url else report.experiment
         )
@@ -309,18 +331,31 @@ class GateOutcome:
             "| Metric | Mean | Needs | Baseline | Scored | Result |",
             "| --- | --- | --- | --- | --- | --- |",
         ]
+        if self.not_run is not None:
+            lines[2:2] = [
+                (
+                    f"It evaluated nothing: {self.not_run} A gate that could not "
+                    "run fails the check in either mode."
+                ),
+                "",
+            ]
         for outcome in report.outcomes:
             mean = "none" if outcome.mean is None else f"{outcome.mean:.2f}"
             baseline = "" if outcome.baseline is None else f"{outcome.baseline:.2f}"
             total = outcome.scored + outcome.unscored
-            result = "pass" if outcome.passed else "fail"
+            result = outcome.status
             lines.append(
                 f"| `{outcome.threshold.metric}` | {mean} | "
                 f"{outcome.threshold.describe()} | {baseline} | "
                 f"{outcome.scored} of {total} | {result} |"
             )
         lines.extend(["", *self._context_lines(markdown=True)])
-        if missed and declaration.mode == "advisory":
+        if uncompared:
+            lines.append(
+                "A threshold with only a tolerance is not compared until there is "
+                "a baseline."
+            )
+        if missed and self.not_run is None and declaration.mode == "advisory":
             lines.append(
                 "Advisory: this gate reports and does not fail the check. The use "
                 'case\'s owner makes it blocking by setting `mode = "blocking"` in '
@@ -393,7 +428,7 @@ def run_gate(
     :param change: what is under review, e.g. ``pr-123``; the experiment is
         tagged ``change:<change>``.
     :param record_baseline: make this run a baseline once it finishes, as CI does
-        on the default branch.
+        on the default branch, unless it evaluated nothing.
     :returns: the outcome. A blocking miss does not raise; see
         ``GateOutcome.failed``.
     :rtype: GateOutcome
@@ -411,11 +446,12 @@ def run_gate(
         name: _pinned_prompt(declaration, name, version)
         for name, version in declaration.prompts.items()
     }
-    judge = (
-        None
-        if declaration.judge_model is None
-        else judge_model(declaration.app, declaration.judge_model)
-    )
+    judge = None
+    if declaration.judge_model is not None:
+        try:
+            judge = judge_model(declaration.app, declaration.judge_model)
+        except ValueError as exc:
+            raise GateConfigurationError(str(exc)) from exc
     built = suite(
         GateContext(
             app=declaration.app,
@@ -444,7 +480,12 @@ def run_gate(
         task_threads=built.task_threads,
         experiment_tags=[_gate_tag(declaration), f"change:{change}"],
     )
-    if record_baseline:
+    # A run that evaluated nothing must not become the baseline either.
+    not_run = _not_run(
+        result, score_report(result, declaration.thresholds, mode=declaration.mode)
+    )
+    recorded = record_baseline and not_run is None
+    if recorded:
         tracing.opik_client().rest_client.experiments.update_experiment(
             result.experiment_id, tags_to_add=[BASELINE_TAG]
         )
@@ -465,8 +506,36 @@ def run_gate(
         prompt_versions={name: p.version or "" for name, p in prompts.items()},
         baseline=baseline,
         baseline_note=note,
-        recorded_baseline=record_baseline,
+        recorded_baseline=recorded,
+        not_run=not_run,
     )
+
+
+def _not_run(result: "EvaluationResult", report: GateReport) -> str | None:
+    """Say why an experiment evaluated nothing, or return ``None`` if it did."""
+    items = result.test_results
+    if not items:
+        return "the dataset version has no items."
+    errors = Counter(
+        str(output[LLM_ERROR_FIELD])
+        for item in items
+        if LLM_ERROR_FIELD in (output := item.test_case.task_output or {})
+    )
+    if errors.total() == len(items):
+        # As in a batch, every row failing the same way is a configuration
+        # problem (credentials, model access, a gateway route), not the prompt.
+        counts = ", ".join(f"{name} x{n}" for name, n in errors.most_common())
+        return (
+            f"the task raised an LLMError on every item ({counts}); the job log "
+            "has each one."
+        )
+    if unscored := [o.threshold.metric for o in report.outcomes if not o.scored]:
+        return (
+            f"no item has a score for {unscored}: the metric failed on every item "
+            "(e.g. its judge raised each time), or the suite produces no score of "
+            "that name."
+        )
+    return None
 
 
 def _gate_tag(declaration: GateDeclaration) -> str:
@@ -479,9 +548,12 @@ def _check_dataset(declaration: GateDeclaration) -> None:
     existing = _get_dataset(pin.name, app)
     if pin.file is not None:
         before = None if existing is None else existing.get_current_version_name()
-        existing = seed_dataset(
-            pin.name, load_items(pin.file, group=pin.group), project_name=app
-        )
+        try:
+            items = load_items(pin.file, group=pin.group)
+            existing = seed_dataset(pin.name, items, project_name=app)
+        except (OSError, ValueError) as exc:
+            msg = f"Could not seed dataset {pin.name!r} from {pin.file}: {exc}"
+            raise GateConfigurationError(msg) from exc
         after = existing.get_current_version_name()
         if after not in (before, pin.version):
             msg = (
@@ -559,57 +631,66 @@ def find_baseline(
         for p in production.values()
         if p.opik_prompt is not None
     }
-    required_tags = {_gate_tag(declaration), BASELINE_TAG}
-    candidates = [
-        experiment
-        for experiment in _dataset_experiments(dataset_id)
-        if experiment.id is not None
-        and experiment.created_at is not None
-        and experiment.id != exclude
-        and required_tags <= set(experiment.tags or [])
-        and wanted <= {v.prompt_version_id for v in experiment.prompt_versions or []}
-        and experiment.dataset_version_summary is not None
-        and experiment.dataset_version_summary.version_name
-        == declaration.dataset.version
-    ]
     versions = _versions(
         {name: prompt.version or "" for name, prompt in production.items()}
     )
-    if not candidates:
-        return None, (
-            f"no default-branch run of this gate on dataset "
-            f"{declaration.dataset.version} with production {versions} yet. The "
-            "next one records it."
-        )
-    newest = max(candidates, key=lambda e: cast("datetime", e.created_at))
-    experiment_id = cast("str", newest.id)
-    return (
-        Baseline(
-            experiment_id=experiment_id,
-            name=newest.name,
-            url=_experiment_url(dataset_id, experiment_id),
-            prompt_versions={n: p.version or "" for n, p in production.items()},
-            means={s.name: s.value for s in newest.feedback_scores or []},
-        ),
-        None,
+    for experiment in _baseline_experiments(dataset_id, declaration):
+        if (
+            experiment.id is not None
+            and experiment.id != exclude
+            and wanted
+            <= {v.prompt_version_id for v in experiment.prompt_versions or []}
+            and experiment.dataset_version_summary is not None
+            and experiment.dataset_version_summary.version_name
+            == declaration.dataset.version
+        ):
+            return (
+                Baseline(
+                    experiment_id=experiment.id,
+                    name=experiment.name,
+                    url=_experiment_url(dataset_id, experiment.id),
+                    prompt_versions={n: p.version or "" for n, p in production.items()},
+                    means={s.name: s.value for s in experiment.feedback_scores or []},
+                ),
+                None,
+            )
+    return None, (
+        f"no default-branch run of this gate on dataset "
+        f"{declaration.dataset.version} with production {versions} yet. The "
+        "next one records it."
     )
 
 
-def _dataset_experiments(dataset_id: str) -> list[ExperimentPublic]:
-    """Every experiment on a dataset, as Opik summarizes them."""
+def _baseline_experiments(
+    dataset_id: str, declaration: GateDeclaration
+) -> Iterator[ExperimentPublic]:
+    """Yield the gate's baseline experiments on a dataset, newest first.
+
+    Opik filters on both tags (``=`` on a list is membership) and returns
+    experiments by id, descending, when no sorting is given; ids are UUIDv7, so
+    that is newest first. Checked against the Opik backend at 2.2.81 and 2.2.103
+    (``ExperimentDAO.FIND``, ``FilterQueryBuilder``).
+    """
+    tags = [_gate_tag(declaration), BASELINE_TAG]
+    filters = json.dumps(
+        [{"field": "tags", "operator": "=", "value": tag} for tag in tags]
+    )
     rest = tracing.opik_client().rest_client
-    found: list[ExperimentPublic] = []
     page = 1
     while True:
         content = (
             rest.experiments.find_experiments(
-                page=page, size=_PAGE_SIZE, dataset_id=dataset_id
+                page=page, size=_PAGE_SIZE, dataset_id=dataset_id, filters=filters
             ).content
             or []
         )
-        found.extend(content)
+        for experiment in content:
+            # Checked here too, so a backend that ignored the filter cannot hand
+            # back a pull request's run as the baseline.
+            if set(tags) <= set(experiment.tags or []):
+                yield experiment
         if len(content) < _PAGE_SIZE:
-            return found
+            return
         page += 1
 
 
@@ -637,7 +718,7 @@ def gate_command(
     :param report: where to write the Markdown report, if anywhere. A gate that
         cannot run or crashes writes that, so the pull request shows it.
     :returns: 0 on a pass or an advisory miss, 1 on a blocking miss, and
-        ``GATE_ERROR_STATUS`` when the gate cannot run.
+        ``GATE_ERROR_STATUS`` when the gate cannot run or evaluated nothing.
     :rtype: int
     """
     try:
@@ -664,7 +745,7 @@ def gate_command(
         raise
     sys.stdout.write(f"{outcome.describe()}\n")
     _write(report, outcome.markdown())
-    return 1 if outcome.failed else 0
+    return outcome.exit_status
 
 
 def _cannot_run(path: Path, exc: Exception, report: Path | None) -> int:

@@ -40,10 +40,10 @@ on:
         type: string
         default: us-east-1
     secrets:
-      OPIK_CLIENT_ID:
+      OPIK_KEYCLOAK_CLIENT_ID:
         description: The Keycloak client the gate authenticates to Opik as.
         required: true
-      OPIK_CLIENT_SECRET:
+      OPIK_KEYCLOAK_CLIENT_SECRET:
         description: That client's secret.
         required: true
       ANTHROPIC_API_KEY:
@@ -77,9 +77,9 @@ jobs:
           version: "0.12.20"
       - name: Credentials are available
         env:
-          OPIK_CLIENT_ID: ${{ secrets.OPIK_CLIENT_ID }}
+          OPIK_KEYCLOAK_CLIENT_ID: ${{ secrets.OPIK_KEYCLOAK_CLIENT_ID }}
         run: |
-          if [ -z "$OPIK_CLIENT_ID" ]; then
+          if [ -z "$OPIK_KEYCLOAK_CLIENT_ID" ]; then
             echo "::error::No Opik credentials. Pull requests from forks get no secrets, so the gate cannot run for them."
             exit 1
           fi
@@ -100,26 +100,38 @@ jobs:
         env:
           GATE: ${{ inputs.gate }}
           CHANGE: ${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.sha }}
-          # A run on the default branch outside a pull request is the baseline later
-          # pull requests are measured from.
-          RECORD_BASELINE: ${{ github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch }}
+          # A push, manual run, or schedule on the default branch is the baseline
+          # later pull requests are measured from. A schedule always runs on the
+          # default branch, and its payload carries no repository to compare with.
+          RECORD_BASELINE: ${{ github.event_name == 'schedule' || (contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name) && github.ref_name == github.event.repository.default_branch) }}
           OL_LLM_ENVIRONMENT: ci
           OPIK_URL_OVERRIDE: ${{ inputs.opik-url }}
           OPIK_WORKSPACE: ${{ inputs.opik-workspace }}
-          OL_LLM_TOKEN_URL: ${{ inputs.keycloak-token-url }}
-          OL_LLM_CLIENT_ID: ${{ secrets.OPIK_CLIENT_ID }}
-          OL_LLM_CLIENT_SECRET: ${{ secrets.OPIK_CLIENT_SECRET }}
+          OPIK_KEYCLOAK_TOKEN_URL: ${{ inputs.keycloak-token-url }}
+          OPIK_KEYCLOAK_CLIENT_ID: ${{ secrets.OPIK_KEYCLOAK_CLIENT_ID }}
+          OPIK_KEYCLOAK_CLIENT_SECRET: ${{ secrets.OPIK_KEYCLOAK_CLIENT_SECRET }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           flags=(--change "$CHANGE" --report "$REPORT")
           if [ "$RECORD_BASELINE" = true ]; then flags+=(--record-baseline); fi
           uv run --frozen ol-llm-eval gate "$GATE" "${flags[@]}"
+      # A job that fails before the gate writes its report still replaces the
+      # comment, so an earlier run's result does not stay up as this one's. A
+      # cancelled run (superseded by a newer push) posts nothing, so it cannot
+      # overwrite the newer run's comment.
+      - name: Report a job that failed before the gate reported
+        if: ${{ !cancelled() && hashFiles('evaluation-gate-report.md') == '' }}
+        env:
+          GATE: ${{ inputs.gate }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          printf '### Evaluation gate `%s` did not report\n\nThe job failed before the gate wrote its report; [the job log](%s) says why. A gate that did not run fails the check.\n' "$GATE" "$RUN_URL" > "$REPORT"
       - name: Job summary
-        if: always() && hashFiles('evaluation-gate-report.md') != ''
+        if: ${{ !cancelled() }}
         run: cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
       - uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
-        if: always() && github.event_name == 'pull_request' && hashFiles('evaluation-gate-report.md') != ''
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
         with:
           header: evaluation-gate-${{ inputs.gate }}
           path: ${{ env.REPORT }}

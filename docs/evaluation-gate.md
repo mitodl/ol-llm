@@ -33,6 +33,7 @@ minimum = 1.0
 [[thresholds]]                           # a judged metric may drop 0.05 below the baseline
 metric = "answer_relevance_metric"
 tolerance = 0.05
+direction = "higher"                     # required with a tolerance and no bound
 
 [[thresholds]]                           # lower is better, so a maximum and a rise
 metric = "hallucination_metric"
@@ -46,9 +47,17 @@ production version unchanged.
 
 A threshold takes a `minimum`, a `maximum`, a `tolerance`, or a combination. `tolerance` is
 measured from the baseline in the direction that is worse: down for a metric where higher is
-better, up for one where lower is better. A threshold with only a `maximum` is lower-is-better;
-set `direction = "lower"` or `"higher"` to say so explicitly. Any item left unscored fails its
-metric.
+better, up for one where lower is better. A threshold with a `minimum` is higher-is-better and
+one with only a `maximum` is lower-is-better; a tolerance with no bound must say which with
+`direction = "higher"` or `"lower"`, since guessing wrong would pass a regression. Any item
+left unscored fails its metric, and so does a mean that is not a number.
+
+Until there is a baseline, a tolerance-only threshold is reported as `not compared`, which is
+neither a pass nor a miss.
+
+`[prompts]` duplicates the pointer file the promotion job reads (lifecycle spec §2.3 item 2),
+and ol-llm does not define that file's format yet. Until it does, a pull request that promotes
+a prompt changes both, and nothing checks that they agree.
 
 ## The suite
 
@@ -102,18 +111,21 @@ ol-llm-eval gate evaluation/feedback-summary.gate.toml --change pr-123 --report 
 It fetches the pinned prompt versions and checks the dataset holds the pinned version
 (seeding `file` first), runs one experiment tagged `gate:<use_case>` and `change:<change>`,
 compares it with the thresholds and the baseline, and writes the report. It exits 0 on a pass
-or an advisory miss, 1 on a blocking miss, and 2 when the gate cannot run: a missing dataset,
-dataset version, or prompt version, a declaration that does not parse, a suite that does not
-import. A gate that cannot run fails in either mode and says what to change.
+or an advisory miss, 1 on a blocking miss, and 2 when the gate cannot run, in either mode,
+saying what to change: a missing dataset, dataset version, or prompt version, a golden file
+that cannot be read or seeded, a judge model the catalog does not list, a declaration that
+does not parse, a suite that does not import. It also exits 2 when the experiment ran but
+evaluated nothing: the dataset version has no items, the task raised an `LLMError` on every
+item (credentials, model access, a gateway route), or a thresholded metric scored no item.
 
 ## Baselines
 
 The baseline is the newest run of the gate made with `--record-baseline`, on the pinned
 dataset version, that ran every prompt's `production`-labeled version. The workflow records
-one on every run on the default branch outside a pull request (a push or a manual run), so a
-use case gets its first baseline from a manual run of the workflow on the default branch.
-Until then, and after the dataset pin changes, only the fixed bounds apply and the report says
-there is no baseline.
+one on a push, a manual run, or a scheduled run on the default branch, so a use case gets its
+first baseline from a manual run of the workflow on the default branch. Until then, and after
+the dataset pin changes, only the fixed bounds apply and the report says there is no
+baseline.
 
 The spec defines the baseline as the last experiment for the production version. Pull
 requests also run that version (any model or configuration change does), so taking any such
@@ -152,8 +164,8 @@ jobs:
       keycloak-token-url: ${{ vars.OPIK_KEYCLOAK_TOKEN_URL }}
       aws-role-arn: ${{ vars.EVALUATION_AWS_ROLE_ARN }}
     secrets:
-      OPIK_CLIENT_ID: ${{ secrets.OPIK_EVALUATION_CLIENT_ID }}
-      OPIK_CLIENT_SECRET: ${{ secrets.OPIK_EVALUATION_CLIENT_SECRET }}
+      OPIK_KEYCLOAK_CLIENT_ID: ${{ secrets.OPIK_EVALUATION_CLIENT_ID }}
+      OPIK_KEYCLOAK_CLIENT_SECRET: ${{ secrets.OPIK_EVALUATION_CLIENT_SECRET }}
 ```
 
 The `paths` filter is what decides which changes require an evaluation (spec §5.1 item 1).
@@ -161,7 +173,9 @@ The job installs the calling project with `uv sync --frozen`, so ol-llm, its pro
 and the suite's code come from the caller's lockfile; opik must be installed whole there, not
 with the slimming overrides (see `ol_llm.evaluation`). Experiments are recorded with
 `environment=ci`. Pull requests from forks get no secrets, so the job fails for them rather
-than passing unevaluated.
+than passing unevaluated. A job that fails before the gate reports (a failed install, missing
+credentials) replaces the pull request comment with a link to its log, so an earlier run's
+result does not stay up; a run cancelled by a newer push posts nothing.
 
 The job needs Opik reachable from GitHub's runners and a Keycloak client of its own
 (spec §1.2 item 3).
