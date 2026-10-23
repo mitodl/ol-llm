@@ -12,6 +12,7 @@ dev = [
     "ol-llm[anthropic,bedrock,google,harness,memory,mistral,openai,pydantic-ai]",
     "pytest>=8.4",
     "ruff>=0.15",
+    "scriv>=1.8",
 ]
 
 [tool.uv]
@@ -26,6 +27,14 @@ exclude = ["python/smoke"]
 
 [tool.uv.sources]
 ol-llm = { workspace = true }
+
+[tool.scriv]
+# Run from the repository root: `uv run scriv create` adds a fragment to
+# changelog.d/, and the release runs `uv run scriv collect`.
+format = "md"
+md_header_level = "2"
+entry_title_template = "[{{ version }}] - {{ date.strftime('%Y-%m-%d') }}"
+version = "literal: python/pyproject.toml: project.version"
 
 [tool.ruff]
 target-version = "py311"

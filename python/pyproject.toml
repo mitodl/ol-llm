@@ -1,6 +1,6 @@
 [project]
 name = "ol-llm"
-version = "0.0.4"
+version = "0.0.5"
 description = "Shared library for LLM calls at MIT Open Learning, with Opik tracing, prompt management, and evaluation built in"
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -70,6 +70,7 @@ ol-llm-eval = "ol_llm.evaluation:main"
 Homepage = "https://github.com/mitodl/ol-llm"
 Repository = "https://github.com/mitodl/ol-llm"
 Issues = "https://github.com/mitodl/ol-llm/issues"
+Changelog = "https://github.com/mitodl/ol-llm/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]
