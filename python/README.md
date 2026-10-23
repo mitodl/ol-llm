@@ -123,6 +123,16 @@ off (Claude models that think by default); naming the tool in `tool_choice` forc
 raises `UserError` for a forced `tool_choice` where the model cannot take one: with extended
 thinking turned on, and on the models whose profile rejects forcing (Claude Opus 5.5, Sonnet
 5.5, and the 5.1 generation in PydanticAI 2.52).
+
+Set `max_tokens` on a Bedrock Claude model, through `model_settings` here or on the agent.
+Without it PydanticAI sends the model's maximum output, and Bedrock takes that much of the
+account's tokens-per-minute quota when each request starts, releasing the unused part only as
+the response is generated
+([token burndown](https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-token-burndown.html)),
+so concurrent requests are throttled long before their real usage reaches the quota.
+PydanticAI also streams such a request behind the scenes, so the policy timeout bounds the gap
+between chunks rather than the whole request.
+
 `output_validators` run on the output once it matches the type, and one that raises PydanticAI's
 `ModelRetry` sends the output back to the model with its message, within the use case's
 `output_retries`:
