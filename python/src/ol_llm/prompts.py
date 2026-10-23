@@ -395,6 +395,50 @@ def promote_prompt(
     )
 
 
+def fetch_prompt(
+    name: str,
+    *,
+    project_name: str,
+    version: str | None = None,
+    environment: str | None = None,
+) -> ManagedPrompt[Any] | None:
+    """Fetch one version of a prompt from Opik, text or chat, for a CI job.
+
+    Unlike ``get_prompt`` it needs no embedded default, since it reads the
+    structure from Opik, and it neither caches nor falls back: a CI job that
+    cannot reach Opik should fail.
+
+    :param name: the prompt's name.
+    :param project_name: the app's Opik project.
+    :param version: the version, e.g. ``v7``.
+    :param environment: the label to resolve, e.g. ``production``.
+    :returns: the prompt, or ``None`` when Opik has no such prompt, version, or
+        label.
+    :rtype: ManagedPrompt | None
+    :raises ValueError: unless exactly one of ``version`` and ``environment`` is
+        given.
+    """
+    if (version is None) == (environment is None):
+        msg = "Pass exactly one of version and environment"
+        raise ValueError(msg)
+    detail = (
+        tracing.opik_client()
+        .get_prompts_client()
+        .get_prompt(
+            name=name,
+            version=version,
+            environment=environment,
+            project_name=project_name,
+        )
+    )
+    if detail is None:
+        return None
+    fetched = _prompt_from_detail(name, detail, project_name)
+    return ManagedPrompt(
+        name=name, template=_template(fetched), source="opik", opik_prompt=fetched
+    )
+
+
 @dataclass(frozen=True, kw_only=True)
 class _Lookup:
     name: str

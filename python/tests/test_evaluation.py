@@ -803,10 +803,66 @@ def test_parse_refuses_a_malformed_threshold(text: str) -> None:
 
 
 def test_a_threshold_needs_a_satisfiable_bound() -> None:
-    with pytest.raises(ValueError, match="minimum or a maximum"):
+    with pytest.raises(ValueError, match="a minimum, a maximum, or a tolerance"):
         Threshold(metric="placeholders")
     with pytest.raises(ValueError, match="above its maximum"):
         Threshold(metric="placeholders", minimum=0.9, maximum=0.1)
+    with pytest.raises(ValueError, match="negative tolerance"):
+        Threshold(metric="placeholders", tolerance=-0.1)
+
+
+@pytest.mark.parametrize(
+    ("threshold", "better"),
+    [
+        (Threshold(metric="m", tolerance=0.1), "higher"),
+        (Threshold(metric="m", minimum=0.5, tolerance=0.1), "higher"),
+        (Threshold(metric="m", maximum=0.5, tolerance=0.1), "lower"),
+        (Threshold(metric="m", tolerance=0.1, direction="lower"), "lower"),
+        (Threshold(metric="m", maximum=0.5, direction="higher"), "higher"),
+    ],
+)
+def test_a_threshold_knows_which_way_is_better(
+    threshold: Threshold, better: str
+) -> None:
+    assert threshold.better == better
+
+
+@pytest.mark.parametrize(
+    ("threshold", "values", "passed"),
+    [
+        # Higher is better: at most 0.1 below the baseline of 0.8.
+        (Threshold(metric="m", tolerance=0.1), [0.7, 0.7], True),
+        (Threshold(metric="m", tolerance=0.1), [0.6, 0.7], False),
+        # Lower is better: at most 0.1 above the baseline of 0.8.
+        (Threshold(metric="m", maximum=1.0, tolerance=0.1), [0.9, 0.9], True),
+        (Threshold(metric="m", maximum=1.0, tolerance=0.1), [1.0, 0.9], False),
+        # The fixed bound still applies within the tolerance.
+        (Threshold(metric="m", minimum=0.75, tolerance=0.1), [0.7, 0.7], False),
+    ],
+)
+def test_a_tolerance_is_measured_from_the_baseline(
+    threshold: Threshold,
+    values: list[float],
+    passed: bool,  # noqa: FBT001
+) -> None:
+    result = scored(*([score("m", v)] for v in values))
+
+    [outcome] = check_thresholds(result, [threshold], baselines={"m": 0.8}).outcomes
+
+    assert outcome.baseline == 0.8
+    assert outcome.passed is passed
+
+
+def test_without_a_baseline_only_the_fixed_bounds_apply() -> None:
+    result = scored([score("m", 0.1)])
+    thresholds = [Threshold(metric="m", tolerance=0.1)]
+
+    [outcome] = check_thresholds(result, thresholds, baselines={"other": 1.0}).outcomes
+
+    assert outcome.passed
+    assert outcome.describe() == (
+        "PASS m: mean 0.10, needs at most 0.10 below baseline (1 scored, no baseline)"
+    )
 
 
 # The command

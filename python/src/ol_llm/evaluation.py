@@ -76,9 +76,14 @@ JUDGE_USE_CASE = "eval-judge"
 GateMode = Literal["advisory", "blocking"]
 """Advisory reports and does not fail; blocking fails the check (spec §5.1)."""
 
+Direction = Literal["higher", "lower"]
+"""Which way a metric's mean is better."""
+
 LLM_ERROR_FIELD = "ol_llm_error"
 """The output field ``evaluate`` records, as the error's class name, for an item
 whose task raised an ``LLMError``. It shows on the item's trace in Opik."""
+
+_FLOAT_SLACK = 1e-9
 
 MAX_EXPERIMENT_ITEMS = 10_000
 """The most experiment items the Opik SDK reads (``Experiment.get_items``)."""
@@ -547,6 +552,7 @@ def evaluate(  # noqa: PLR0913
     experiment_config: Mapping[str, Any] | None = None,
     scoring_key_mapping: Mapping[str, str] | None = None,
     task_threads: int = 16,
+    experiment_tags: Sequence[str] = (),
 ) -> EvaluationResult:
     """Run an experiment on a dataset, linked to the prompt versions under test.
 
@@ -579,6 +585,7 @@ def evaluate(  # noqa: PLR0913
     :param scoring_key_mapping: metric input name to item or output field, e.g.
         ``{"input": "question"}``.
     :param task_threads: items run at once; 1 runs them in this thread.
+    :param experiment_tags: tags beside the app and environment ones.
     :returns: Opik's result, with the experiment's id and URL.
     :rtype: EvaluationResult
     :raises ValueError: if ``prompts`` is empty or holds an embedded default,
@@ -605,7 +612,11 @@ def evaluate(  # noqa: PLR0913
         experiment_config={"environment": environment, **(experiment_config or {})},
         prompts=[p.opik_prompt for p in prompts if p.opik_prompt is not None],
         scoring_key_mapping=dict(scoring_key_mapping or {}),
-        experiment_tags=[f"app:{project_name}", f"env:{environment}"],
+        experiment_tags=[
+            f"app:{project_name}",
+            f"env:{environment}",
+            *experiment_tags,
+        ],
         task_threads=task_threads,
     )
     tracing.flush()
@@ -623,21 +634,34 @@ class Threshold:
     ``minimum=1.0``. A judge metric where higher is worse, such as Opik's
     ``Hallucination``, takes a ``maximum``.
 
+    ``tolerance`` bounds the mean against a baseline, the last default-branch
+    experiment for the production prompt version (spec §5.1 item 5): the mean may
+    fall at most that far below it, or for a metric where lower is better, rise at
+    most that far above it. With no baseline only the fixed bounds apply.
+
     :param metric: the score's name.
     :param minimum: the lowest mean that passes.
     :param maximum: the highest mean that passes.
-    :raises ValueError: if neither bound is set, or the minimum is above the
-        maximum.
+    :param tolerance: how far the mean may move the wrong way from the baseline.
+    :param direction: which way is better, for ``tolerance``. Defaults to
+        ``lower`` for a threshold with only a ``maximum``, else ``higher``.
+    :raises ValueError: if no bound or tolerance is set, the minimum is above the
+        maximum, or the tolerance is negative.
     """
 
     metric: str
     minimum: float | None = None
     maximum: float | None = None
+    tolerance: float | None = None
+    direction: Direction | None = None
 
     def __post_init__(self) -> None:
         """Reject a threshold that bounds nothing or nothing could pass."""
-        if self.minimum is None and self.maximum is None:
-            msg = f"Threshold for {self.metric!r} needs a minimum or a maximum"
+        if self.minimum is None and self.maximum is None and self.tolerance is None:
+            msg = (
+                f"Threshold for {self.metric!r} needs a minimum, a maximum, or a "
+                "tolerance"
+            )
             raise ValueError(msg)
         if (
             self.minimum is not None
@@ -646,6 +670,18 @@ class Threshold:
         ):
             msg = f"Threshold for {self.metric!r} has its minimum above its maximum"
             raise ValueError(msg)
+        if self.tolerance is not None and self.tolerance < 0:
+            msg = f"Threshold for {self.metric!r} has a negative tolerance"
+            raise ValueError(msg)
+
+    @property
+    def better(self) -> Direction:
+        """Which way is better: ``direction``, or what the bounds imply."""
+        if self.direction is not None:
+            return self.direction
+        if self.maximum is not None and self.minimum is None:
+            return "lower"
+        return "higher"
 
     @classmethod
     def parse(cls, text: str) -> "Threshold":
@@ -671,6 +707,9 @@ class Threshold:
             parts.append(f">= {self.minimum:.2f}")
         if self.maximum is not None:
             parts.append(f"<= {self.maximum:.2f}")
+        if self.tolerance is not None:
+            way = "below" if self.better == "higher" else "above"
+            parts.append(f"at most {self.tolerance:.2f} {way} baseline")
         return " and ".join(parts)
 
 
@@ -682,12 +721,15 @@ class MetricOutcome:
     :param mean: the mean of the scored items, ``None`` when none was scored.
     :param scored: items with a score.
     :param unscored: items without one, because scoring failed or never ran.
+    :param baseline: the baseline experiment's mean, when there is one and it
+        scored the metric.
     """
 
     threshold: Threshold
     mean: float | None
     scored: int
     unscored: int
+    baseline: float | None = None
 
     @property
     def passed(self) -> bool:
@@ -695,7 +737,20 @@ class MetricOutcome:
         if self.mean is None or self.unscored:
             return False
         low, high = self.threshold.minimum, self.threshold.maximum
-        return (low is None or self.mean >= low) and (high is None or self.mean <= high)
+        bounded = (low is None or self.mean >= low) and (
+            high is None or self.mean <= high
+        )
+        return bounded and self._within_tolerance(self.mean)
+
+    def _within_tolerance(self, mean: float) -> bool:
+        tolerance = self.threshold.tolerance
+        if tolerance is None or self.baseline is None:
+            return True
+        # Within float error of the edge counts: 0.8 - 0.1 is 0.7000000000000001.
+        allowed = tolerance + _FLOAT_SLACK
+        if self.threshold.better == "higher":
+            return mean >= self.baseline - allowed
+        return mean <= self.baseline + allowed
 
     def describe(self) -> str:
         """Return one report line."""
@@ -704,6 +759,12 @@ class MetricOutcome:
         counts = f"{self.scored} scored"
         if self.unscored:
             counts += f", {self.unscored} unscored"
+        if self.threshold.tolerance is not None:
+            counts += (
+                ", no baseline"
+                if self.baseline is None
+                else f", baseline {self.baseline:.2f}"
+            )
         return (
             f"{status} {self.threshold.metric}: {mean}, needs "
             f"{self.threshold.describe()} ({counts})"
@@ -763,6 +824,31 @@ def check_thresholds(
     thresholds: Sequence[Threshold],
     *,
     mode: GateMode = "advisory",
+    baselines: Mapping[str, float] | None = None,
+) -> GateReport:
+    """Compare an experiment's scores to its thresholds, and enforce the mode.
+
+    ``score_report`` without the enforcement.
+
+    :param result: what ``evaluate`` returned.
+    :param thresholds: the use case's thresholds.
+    :param mode: ``advisory`` logs a miss as a warning; ``blocking`` raises.
+    :param baselines: the baseline experiment's mean per metric, which a
+        threshold's ``tolerance`` is measured from.
+    :returns: the report.
+    :rtype: GateReport
+    :raises EvaluationGateError: in blocking mode, if a threshold was not met.
+    :raises ValueError: if an item has two scores of the same name.
+    """
+    return _enforce(score_report(result, thresholds, mode=mode, baselines=baselines))
+
+
+def score_report(
+    result: EvaluationResult,
+    thresholds: Sequence[Threshold],
+    *,
+    mode: GateMode = "advisory",
+    baselines: Mapping[str, float] | None = None,
 ) -> GateReport:
     """Compare an experiment's scores to its thresholds.
 
@@ -772,10 +858,11 @@ def check_thresholds(
 
     :param result: what ``evaluate`` returned.
     :param thresholds: the use case's thresholds.
-    :param mode: ``advisory`` logs a miss as a warning; ``blocking`` raises.
+    :param mode: recorded on the report; nothing is raised or logged.
+    :param baselines: the baseline experiment's mean per metric, which a
+        threshold's ``tolerance`` is measured from.
     :returns: the report.
     :rtype: GateReport
-    :raises EvaluationGateError: in blocking mode, if a threshold was not met.
     :raises ValueError: if an item has two scores of the same name.
     """
     items = [
@@ -785,14 +872,13 @@ def check_thresholds(
         )
         for test_result in result.test_results
     ]
-    return _enforce(
-        _report(
-            experiment=result.experiment_name or result.experiment_id,
-            url=result.experiment_url,
-            items=items,
-            thresholds=thresholds,
-            mode=mode,
-        )
+    return _report(
+        experiment=result.experiment_name or result.experiment_id,
+        url=result.experiment_url,
+        items=items,
+        thresholds=thresholds,
+        mode=mode,
+        baselines=baselines,
     )
 
 
@@ -862,13 +948,14 @@ def _item_scores(scores: Iterable[tuple[str, float | None]]) -> dict[str, float 
     return by_name
 
 
-def _report(
+def _report(  # noqa: PLR0913
     *,
     experiment: str,
     url: str | None,
     items: Sequence[Mapping[str, float | None]],
     thresholds: Sequence[Threshold],
     mode: GateMode,
+    baselines: Mapping[str, float] | None = None,
 ) -> GateReport:
     outcomes = []
     for threshold in thresholds:
@@ -881,6 +968,7 @@ def _report(
                 mean=sum(values) / len(values) if values else None,
                 scored=len(values),
                 unscored=len(items) - len(values),
+                baseline=(baselines or {}).get(threshold.metric),
             )
         )
     return GateReport(
@@ -902,7 +990,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     ``seed`` adds a file's golden items to a dataset and prints its version.
     ``check`` prints an experiment's scores against thresholds and exits 1 on a
-    miss only with ``--mode blocking``.
+    miss only with ``--mode blocking``. ``gate`` runs a declared gate (see
+    ``ol_llm.gate``): it exits 1 on a blocking miss, and 2 when the gate cannot
+    run, in either mode.
 
     :param argv: the arguments; ``sys.argv[1:]`` when omitted.
     :returns: the exit status.
@@ -934,7 +1024,30 @@ def main(argv: Sequence[str] | None = None) -> int:
         default="advisory",
         help="blocking exits 1 when a threshold is not met",
     )
+    gate = commands.add_parser("gate", help="run a use case's declared gate")
+    gate.add_argument("declaration", type=Path, help="the gate's TOML file")
+    gate.add_argument(
+        "--change",
+        default="local",
+        help="what is under review, e.g. pr-123; tags the experiment",
+    )
+    gate.add_argument(
+        "--record-baseline",
+        action="store_true",
+        help="make this run the baseline for later changes (the default branch)",
+    )
+    gate.add_argument("--report", type=Path, help="write the report as Markdown here")
     args = parser.parse_args(argv)
+    if args.command == "gate":
+        # Imported here: ol_llm.gate imports this module.
+        from ol_llm.gate import gate_command  # noqa: PLC0415
+
+        return gate_command(
+            args.declaration,
+            change=args.change,
+            record_baseline=args.record_baseline,
+            report=args.report,
+        )
     if args.command == "seed":
         dataset = seed_dataset(
             args.dataset,

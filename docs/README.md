@@ -10,3 +10,4 @@ and move here as each is implemented:
   ([`llm-usage-policies-spec.md`](https://github.com/mitodl/ol-infrastructure/blob/main/docs/plans/llm-usage-policies-spec.md) §2.2)
 - the entry points of the call contract (spec §6.6)
 - prompt fetch semantics ([`llm-opik-lifecycle-spec.md`](https://github.com/mitodl/ol-infrastructure/blob/main/docs/plans/llm-opik-lifecycle-spec.md) §3)
+- [evaluation gates](evaluation-gate.md) (lifecycle spec §5.1)
