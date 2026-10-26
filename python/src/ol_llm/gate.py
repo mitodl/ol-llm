@@ -64,6 +64,7 @@ import httpx
 import opik
 import pydantic
 from opik import url_helpers
+from opik.api_objects.dataset.dataset_item import DatasetItem
 from opik.evaluation.metrics import BaseMetric
 from opik.exceptions import DatasetVersionNotFound
 from opik.rest_api.core import ApiError
@@ -543,25 +544,18 @@ def _gate_tag(declaration: GateDeclaration) -> str:
 
 
 def _check_dataset(declaration: GateDeclaration) -> None:
-    """Seed the declared file, then check the dataset holds the pinned version."""
+    """Seed the declared file, then check the pinned version holds its items."""
     pin, app = declaration.dataset, declaration.app
-    existing = _get_dataset(pin.name, app)
-    if pin.file is not None:
-        before = None if existing is None else existing.get_current_version_name()
+    items = None
+    if pin.file is None:
+        existing = _get_dataset(pin.name, app)
+    else:
         try:
             items = load_items(pin.file, group=pin.group)
             existing = seed_dataset(pin.name, items, project_name=app)
         except (OSError, ValueError) as exc:
             msg = f"Could not seed dataset {pin.name!r} from {pin.file}: {exc}"
             raise GateConfigurationError(msg) from exc
-        after = existing.get_current_version_name()
-        if after not in (before, pin.version):
-            msg = (
-                f"Seeding {pin.file} added items to dataset {pin.name!r} as {after}, "
-                f"and the gate pins {pin.version}. Set dataset.version = "
-                f'"{after}" in the gate to evaluate them.'
-            )
-            raise GateConfigurationError(msg)
     if existing is None:
         msg = (
             f"Opik project {app!r} has no dataset {pin.name!r}. Create it with "
@@ -570,15 +564,27 @@ def _check_dataset(declaration: GateDeclaration) -> None:
             "version it reports."
         )
         raise GateConfigurationError(msg)
+    latest = existing.get_current_version_name()
     try:
-        existing.get_version_view(pin.version)
+        pinned = existing.get_version_view(pin.version)
     except DatasetVersionNotFound as exc:
-        latest = existing.get_current_version_name()
         msg = (
             f"Dataset {pin.name!r} has no version {pin.version}; its latest is "
             f"{latest}. Pin a version that exists."
         )
         raise GateConfigurationError(msg) from exc
+    if items is None:
+        return
+    # Checked on every run, not only when seeding adds a version: a retry seeds
+    # nothing new, and would otherwise evaluate a stale pin without the new items.
+    held = {DatasetItem(**item).content_hash() for item in pinned.get_items()}
+    if missing := {DatasetItem(**item).content_hash() for item in items} - held:
+        msg = (
+            f"Dataset {pin.name!r} {pin.version} lacks {len(missing)} of the items in "
+            f"{pin.file}, and seeding put them in {latest}. Set dataset.version = "
+            f'"{latest}" in the gate to evaluate them.'
+        )
+        raise GateConfigurationError(msg)
 
 
 def _get_dataset(name: str, project_name: str) -> opik.Dataset | None:

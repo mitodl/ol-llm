@@ -91,11 +91,19 @@ class FakeDataset:
     def get_current_version_name(self) -> str | None:
         return f"v{len(self.versions)}" if self.versions else None
 
-    def get_version_view(self, version_name: str) -> list[dict[str, Any]]:
+    def get_version_view(self, version_name: str) -> "FakeVersion":
         number = int(version_name.removeprefix("v"))
         if not 0 < number <= len(self.versions):
             raise DatasetVersionNotFound(version_name)
-        return list(self.versions[number - 1].values())
+        return FakeVersion(self.versions[number - 1].values())
+
+
+class FakeVersion(list[dict[str, Any]]):
+    """A version view: ``opik.evaluate`` iterates it, and ``get_items`` lists it."""
+
+    def get_items(self) -> list[dict[str, Any]]:
+        """Each item's data plus its ``id``, as the SDK returns them."""
+        return [{**item, "id": str(uuid.uuid4())} for item in self]
 
 
 class FakeExperiments:
@@ -448,6 +456,38 @@ def test_seeding_new_items_under_an_old_pin_fails(
     with pytest.raises(GateConfigurationError, match=r'dataset\.version = "v2"'):
         run_gate(declaration(dataset=pin), suite=suite, change="pr-12")
     assert not runs
+
+
+@pytest.mark.usefixtures("prompts")
+def test_a_retry_under_the_old_pin_still_fails(
+    client: FakeClient, tmp_path: Path, runs: list[dict[str, Any]]
+) -> None:
+    # The first run seeds v2 and fails; the retry seeds nothing new, so v1 stays
+    # the pin it rejected.
+    seeded(client)
+    golden = tmp_path / "golden.json"
+    golden.write_text(json.dumps([*GOLDEN, {"text": "{x}", "expected": "{x}"}]))
+    pin = {"name": DATASET, "version": "v1", "file": str(golden)}
+
+    for _ in range(2):
+        with pytest.raises(GateConfigurationError, match="v1 lacks 1 of the items"):
+            run_gate(declaration(dataset=pin), suite=suite, change="pr-12")
+    assert not runs
+
+
+@pytest.mark.usefixtures("prompts")
+def test_an_old_pin_holding_every_file_item_runs(
+    client: FakeClient, tmp_path: Path, runs: list[dict[str, Any]]
+) -> None:
+    # Another branch seeded v2; this branch's file only has v1's items.
+    seeded(client).insert([{"text": "{x}", "expected": "{x}"}])
+    golden = tmp_path / "golden.json"
+    golden.write_text(json.dumps(GOLDEN))
+    pin = {"name": DATASET, "version": "v1", "file": str(golden)}
+
+    run_gate(declaration(dataset=pin), suite=suite, change="pr-12")
+
+    assert [len(call["dataset"]) for call in runs] == [2]
 
 
 @pytest.mark.usefixtures("prompts")

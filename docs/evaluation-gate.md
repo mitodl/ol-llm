@@ -108,15 +108,17 @@ model under test.
 ol-llm-eval gate evaluation/feedback-summary.gate.toml --change pr-123 --report report.md
 ```
 
-It fetches the pinned prompt versions and checks the dataset holds the pinned version
-(seeding `file` first), runs one experiment tagged `gate:<use_case>` and `change:<change>`,
-compares it with the thresholds and the baseline, and writes the report. It exits 0 on a pass
-or an advisory miss, 1 on a blocking miss, and 2 when the gate cannot run, in either mode,
-saying what to change: a missing dataset, dataset version, or prompt version, a golden file
-that cannot be read or seeded, a judge model the catalog does not list, a declaration that
-does not parse, a suite that does not import. It also exits 2 when the experiment ran but
-evaluated nothing: the dataset version has no items, the task raised an `LLMError` on every
-item (credentials, model access, a gateway route), or a thresholded metric scored no item.
+It fetches the pinned prompt versions, seeds `file` when there is one, and checks the dataset
+has the pinned version and that the version holds every item in `file`. It then runs one
+experiment tagged `gate:<use_case>` and `change:<change>`, compares it with the thresholds and
+the baseline, and writes the report. It exits 0 on a pass or an advisory miss, 1 on a blocking
+miss, and 2 when the gate cannot run, in either mode, saying what to change: a missing dataset,
+dataset version, or prompt version, a pinned dataset version without every item in `file`, a
+golden file that cannot be read or seeded, a judge model the catalog does not list, a
+declaration that does not parse, a suite that does not import. It also exits 2 when the
+experiment ran but evaluated nothing: the dataset version has no items, the task raised an
+`LLMError` on every item (credentials, model access, a gateway route), or a thresholded metric
+scored no item.
 
 ## Baselines
 
