@@ -648,9 +648,9 @@ class Threshold:
     :param direction: which way is better, for ``tolerance``. Required with a
         tolerance and no bound; otherwise ``lower`` for a threshold with only a
         ``maximum`` and ``higher`` for any other.
-    :raises ValueError: if no bound or tolerance is set, the minimum is above the
-        maximum, the tolerance is negative, or a tolerance with no bound has no
-        direction.
+    :raises ValueError: if no bound or tolerance is set, a bound or the tolerance
+        is not a finite number, the minimum is above the maximum, the tolerance is
+        negative, or a tolerance with no bound has no direction.
     """
 
     metric: str
@@ -666,6 +666,14 @@ class Threshold:
             msg = (
                 f"Threshold for {self.metric!r} needs a minimum, a maximum, or a "
                 "tolerance"
+            )
+            raise ValueError(msg)
+        limits = (self.minimum, self.maximum, self.tolerance)
+        if not all(math.isfinite(limit) for limit in limits if limit is not None):
+            # A NaN bound compares false both ways, so a mean would never miss it.
+            msg = (
+                f"Threshold for {self.metric!r} has a bound or tolerance that is not "
+                "a finite number"
             )
             raise ValueError(msg)
         if (

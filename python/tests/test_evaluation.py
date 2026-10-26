@@ -797,7 +797,9 @@ def test_parse_a_threshold(text: str, threshold: Threshold) -> None:
     assert Threshold.parse(text) == threshold
 
 
-@pytest.mark.parametrize("text", ["placeholders=1", "placeholders>=", ">=1"])
+@pytest.mark.parametrize(
+    "text", ["placeholders=1", "placeholders>=", ">=1", "placeholders>=nan"]
+)
 def test_parse_refuses_a_malformed_threshold(text: str) -> None:
     with pytest.raises(ValueError):  # noqa: PT011
         Threshold.parse(text)
@@ -810,6 +812,23 @@ def test_a_threshold_needs_a_satisfiable_bound() -> None:
         Threshold(metric="placeholders", minimum=0.9, maximum=0.1)
     with pytest.raises(ValueError, match="negative tolerance"):
         Threshold(metric="placeholders", tolerance=-0.1, direction="higher")
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        {"minimum": math.nan},
+        {"maximum": math.nan},
+        {"minimum": -math.inf},
+        {"minimum": 0.5, "tolerance": math.nan},
+    ],
+)
+def test_a_threshold_refuses_a_bound_that_is_not_finite(
+    limits: dict[str, float],
+) -> None:
+    # A NaN minimum would pass any finite mean, since mean < nan is false.
+    with pytest.raises(ValueError, match="not a finite number"):
+        Threshold(metric="placeholders", **limits)
 
 
 def test_a_tolerance_with_no_bound_needs_a_direction() -> None:

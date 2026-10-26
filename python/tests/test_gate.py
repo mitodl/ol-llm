@@ -328,6 +328,10 @@ def test_a_declaration_loads_from_toml(tmp_path: Path) -> None:
         ({"thresholds": []}, "at least 1 item"),
         ({"thresholds": [{"metric": "brevity"}]}, "a minimum, a maximum, or a"),
         (
+            {"thresholds": [{"metric": "brevity", "minimum": float("nan")}]},
+            "not a finite number",
+        ),
+        (
             {"thresholds": [{"metric": "hallucination_metric", "tolerance": 0.05}]},
             'needs direction = "higher" or "lower"',
         ),
