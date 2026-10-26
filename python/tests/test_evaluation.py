@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
@@ -796,17 +797,122 @@ def test_parse_a_threshold(text: str, threshold: Threshold) -> None:
     assert Threshold.parse(text) == threshold
 
 
-@pytest.mark.parametrize("text", ["placeholders=1", "placeholders>=", ">=1"])
+@pytest.mark.parametrize(
+    "text", ["placeholders=1", "placeholders>=", ">=1", "placeholders>=nan"]
+)
 def test_parse_refuses_a_malformed_threshold(text: str) -> None:
     with pytest.raises(ValueError):  # noqa: PT011
         Threshold.parse(text)
 
 
 def test_a_threshold_needs_a_satisfiable_bound() -> None:
-    with pytest.raises(ValueError, match="minimum or a maximum"):
+    with pytest.raises(ValueError, match="a minimum, a maximum, or a tolerance"):
         Threshold(metric="placeholders")
     with pytest.raises(ValueError, match="above its maximum"):
         Threshold(metric="placeholders", minimum=0.9, maximum=0.1)
+    with pytest.raises(ValueError, match="negative tolerance"):
+        Threshold(metric="placeholders", tolerance=-0.1, direction="higher")
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        {"minimum": math.nan},
+        {"maximum": math.nan},
+        {"minimum": -math.inf},
+        {"minimum": 0.5, "tolerance": math.nan},
+    ],
+)
+def test_a_threshold_refuses_a_bound_that_is_not_finite(
+    limits: dict[str, float],
+) -> None:
+    # A NaN minimum would pass any finite mean, since mean < nan is false.
+    with pytest.raises(ValueError, match="not a finite number"):
+        Threshold(metric="placeholders", **limits)
+
+
+def test_a_tolerance_with_no_bound_needs_a_direction() -> None:
+    # Guessing "higher" would pass a rise in hallucination_metric.
+    with pytest.raises(ValueError, match='needs direction = "higher" or "lower"'):
+        Threshold(metric="hallucination_metric", tolerance=0.05)
+
+
+@pytest.mark.parametrize(
+    ("threshold", "better"),
+    [
+        (Threshold(metric="m", tolerance=0.1, direction="higher"), "higher"),
+        (Threshold(metric="m", minimum=0.5, tolerance=0.1), "higher"),
+        (Threshold(metric="m", maximum=0.5, tolerance=0.1), "lower"),
+        (Threshold(metric="m", tolerance=0.1, direction="lower"), "lower"),
+        (Threshold(metric="m", maximum=0.5, direction="higher"), "higher"),
+    ],
+)
+def test_a_threshold_knows_which_way_is_better(
+    threshold: Threshold, better: str
+) -> None:
+    assert threshold.better == better
+
+
+HIGHER = Threshold(metric="m", tolerance=0.1, direction="higher")
+
+
+@pytest.mark.parametrize(
+    ("threshold", "values", "status"),
+    [
+        # Higher is better: at most 0.1 below the baseline of 0.8.
+        (HIGHER, [0.7, 0.7], "pass"),
+        (HIGHER, [0.6, 0.7], "fail"),
+        # Lower is better: at most 0.1 above the baseline of 0.8.
+        (Threshold(metric="m", maximum=1.0, tolerance=0.1), [0.9, 0.9], "pass"),
+        (Threshold(metric="m", maximum=1.0, tolerance=0.1), [1.0, 0.9], "fail"),
+        # The fixed bound still applies within the tolerance.
+        (Threshold(metric="m", minimum=0.75, tolerance=0.1), [0.7, 0.7], "fail"),
+        # A mean that is not a number never passes.
+        (HIGHER, [math.nan], "fail"),
+    ],
+)
+def test_a_tolerance_is_measured_from_the_baseline(
+    threshold: Threshold, values: list[float], status: str
+) -> None:
+    result = scored(*([score("m", v)] for v in values))
+
+    [outcome] = check_thresholds(result, [threshold], baselines={"m": 0.8}).outcomes
+
+    assert outcome.baseline == 0.8
+    assert outcome.status == status
+
+
+@pytest.mark.parametrize("value", [0.0, math.nan])
+def test_a_tolerance_with_no_baseline_is_not_compared(value: float) -> None:
+    result = scored([score("m", value)])
+
+    report = check_thresholds(result, [HIGHER], baselines={"other": 1.0})
+
+    [outcome] = report.outcomes
+    if math.isnan(value):
+        assert outcome.status == "fail"
+        assert not report.passed
+        return
+    assert outcome.status == "not compared"
+    assert not outcome.passed
+    assert not outcome.failed
+    assert report.passed
+    assert outcome.describe() == (
+        "NOT COMPARED m: mean 0.00, needs at most 0.10 below baseline "
+        "(1 scored, no baseline)"
+    )
+    assert report.describe().endswith(
+        "No threshold missed; 1 not compared, for want of a baseline."
+    )
+
+
+def test_without_a_baseline_the_fixed_bounds_still_apply() -> None:
+    threshold = Threshold(metric="m", minimum=0.5, tolerance=0.1)
+
+    [low] = check_thresholds(scored([score("m", 0.4)]), [threshold]).outcomes
+    [high] = check_thresholds(scored([score("m", 0.6)]), [threshold]).outcomes
+
+    assert (low.status, high.status) == ("fail", "pass")
 
 
 # The command

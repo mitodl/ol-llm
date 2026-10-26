@@ -1,0 +1,137 @@
+# Reusable: runs one use case's evaluation gate (`ol-llm-eval gate`) in the calling
+# repository's own uv environment, posts the report on the pull request, and fails
+# the check on a blocking miss or a gate that cannot run. docs/evaluation-gate.md
+# has the declaration format and a caller to copy.
+name: evaluation gate
+
+on:
+  workflow_call:
+    inputs:
+      gate:
+        description: The gate declaration (TOML), relative to working-directory.
+        required: true
+        type: string
+      working-directory:
+        description: The uv project that installs ol-llm and the suite's code.
+        type: string
+        default: "."
+      uv-sync-args:
+        description: Arguments added to `uv sync --frozen`, e.g. "--extra eval".
+        type: string
+        default: ""
+      opik-url:
+        description: The Opik API URL, ending in /api.
+        required: true
+        type: string
+      opik-workspace:
+        description: The Opik workspace.
+        type: string
+        default: default
+      keycloak-token-url:
+        description: The token endpoint of the realm that issues Opik tokens.
+        required: true
+        type: string
+      aws-role-arn:
+        description: A role to assume through GitHub OIDC, for Bedrock models.
+        type: string
+        default: ""
+      aws-region:
+        description: The region for the assumed role.
+        type: string
+        default: us-east-1
+    secrets:
+      OPIK_KEYCLOAK_CLIENT_ID:
+        description: The Keycloak client the gate authenticates to Opik as.
+        required: true
+      OPIK_KEYCLOAK_CLIENT_SECRET:
+        description: That client's secret.
+        required: true
+      ANTHROPIC_API_KEY:
+        required: false
+      OPENAI_API_KEY:
+        required: false
+
+permissions: {}
+
+jobs:
+  gate:
+    name: evaluation gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      pull-requests: write # the report comment
+      id-token: write # aws-role-arn
+    concurrency:
+      group: evaluation-gate-${{ github.workflow }}-${{ inputs.gate }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    env:
+      # In the workspace, where hashFiles can see it.
+      REPORT: ${{ github.workspace }}/evaluation-gate-report.md
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.20"
+      - name: Credentials are available
+        env:
+          OPIK_KEYCLOAK_CLIENT_ID: ${{ secrets.OPIK_KEYCLOAK_CLIENT_ID }}
+        run: |
+          if [ -z "$OPIK_KEYCLOAK_CLIENT_ID" ]; then
+            echo "::error::No Opik credentials. Pull requests from forks get no secrets, so the gate cannot run for them."
+            exit 1
+          fi
+      - uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        if: inputs.aws-role-arn != ''
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+      - name: Install
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          UV_SYNC_ARGS: ${{ inputs.uv-sync-args }}
+        run: |
+          read -ra args <<< "$UV_SYNC_ARGS"
+          uv sync --frozen "${args[@]}"
+      - name: Run the gate
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          GATE: ${{ inputs.gate }}
+          CHANGE: ${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+          # A push, manual run, or schedule on the default branch is the baseline
+          # later pull requests are measured from. A schedule always runs on the
+          # default branch, and its payload carries no repository to compare with.
+          RECORD_BASELINE: ${{ github.event_name == 'schedule' || (contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name) && github.ref_name == github.event.repository.default_branch) }}
+          OL_LLM_ENVIRONMENT: ci
+          OPIK_URL_OVERRIDE: ${{ inputs.opik-url }}
+          OPIK_WORKSPACE: ${{ inputs.opik-workspace }}
+          OPIK_KEYCLOAK_TOKEN_URL: ${{ inputs.keycloak-token-url }}
+          OPIK_KEYCLOAK_CLIENT_ID: ${{ secrets.OPIK_KEYCLOAK_CLIENT_ID }}
+          OPIK_KEYCLOAK_CLIENT_SECRET: ${{ secrets.OPIK_KEYCLOAK_CLIENT_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          flags=(--change "$CHANGE" --report "$REPORT")
+          if [ "$RECORD_BASELINE" = true ]; then flags+=(--record-baseline); fi
+          uv run --frozen ol-llm-eval gate "$GATE" "${flags[@]}"
+      # A job that fails before the gate writes its report still replaces the
+      # comment, so an earlier run's result does not stay up as this one's. A
+      # cancelled run (superseded by a newer push) posts nothing, so it cannot
+      # overwrite the newer run's comment.
+      - name: Report a job that failed before the gate reported
+        if: ${{ !cancelled() && hashFiles('evaluation-gate-report.md') == '' }}
+        env:
+          GATE: ${{ inputs.gate }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          printf "### Evaluation gate \`%s\` did not report\n\nThe job failed before the gate wrote its report; [the job log](%s) says why. A gate that did not run fails the check.\n" "$GATE" "$RUN_URL" > "$REPORT"
+      - name: Job summary
+        if: ${{ !cancelled() }}
+        run: cat "$REPORT" >> "$GITHUB_STEP_SUMMARY"
+      - uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        with:
+          header: evaluation-gate-${{ inputs.gate }}
+          path: ${{ env.REPORT }}
