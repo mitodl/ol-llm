@@ -6,6 +6,20 @@ All notable changes to ol-llm are recorded here. The format follows
 
 <!-- scriv-insert-here -->
 
+<a id='changelog-0.0.6'></a>
+## [0.0.6] - 2026-10-26
+
+### Added
+
+- `ol_llm.gate` and `ol-llm-eval gate`: run a use case's evaluation gate as its repository declares it in TOML (pinned prompt and dataset versions, judge model, thresholds, advisory or blocking). It exits 2 in either mode when the gate cannot run (a missing dataset, dataset version, or prompt version, a pinned dataset version without every item in the declared golden file, an unreadable golden file, an uncataloged judge) or ran but evaluated nothing (every task raised an `LLMError`, or a thresholded metric scored no item), with what to change. Tolerances are measured from the newest default-branch run on the production prompt version (#30).
+- `.github/workflows/evaluation-gate.yml`, a reusable workflow that runs a gate in the caller's uv environment and posts the report on the pull request; `docs/evaluation-gate.md` has a caller to copy (#30).
+- `fetch_prompt` fetches one prompt version or label from Opik, text or chat, with no embedded default (#30).
+- `Threshold` takes a `tolerance` and a `direction`, required with a tolerance and no bound. `MetricOutcome.status` is `pass`, `fail`, or `not compared` (a tolerance-only threshold with no baseline, which is not a miss), and a tolerance fails a mean that is not a number, as a bound already did. `check_thresholds` and the new `score_report` (which does not raise or log) take the baseline's means as `baselines`; `evaluate` takes extra `experiment_tags` (#30).
+
+### Changed
+
+- `Threshold` raises `ValueError` for a bound or tolerance that is not finite, and so does `ol-llm-eval check --threshold 'x>=nan'`. In 0.0.5 such a threshold failed or passed every mean (#30).
+
 <a id='changelog-0.0.5'></a>
 ## [0.0.5] - 2026-10-23
 
