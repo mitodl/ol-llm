@@ -10,7 +10,7 @@ from typing import Any
 import ol_llm.catalog as catalog_module
 import opik
 import pytest
-from conftest import PromptLibrary
+from conftest import PromptLibrary, preferring
 from ol_llm import TextTemplate, UseCase, get_prompt, tracing
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.errors import LLMContentFiltered, LLMUnavailable
@@ -18,14 +18,18 @@ from ol_llm.evaluation import (
     JUDGE_USE_CASE,
     LLM_ERROR_FIELD,
     MAX_EXPERIMENT_ITEMS,
+    PAIRWISE_METRIC,
     EvaluationGateError,
     JudgeModel,
+    MetricOutcome,
+    SkippedItem,
     Threshold,
     ValidatorMetric,
     check_experiment,
     check_thresholds,
     evaluate,
     judge_model,
+    judge_pairwise,
     load_items,
     main,
     seed_dataset,
@@ -33,6 +37,7 @@ from ol_llm.evaluation import (
 from ol_llm.models import PolicyModel, override_models, shared_model
 from ol_llm.prompts import ManagedPrompt
 from opik.api_objects.dataset.dataset_item import DatasetItem
+from opik.api_objects.experiment.experiment_item import ExperimentItemContent
 from opik.evaluation import test_case, test_result
 from opik.evaluation.evaluation_result import EvaluationResult
 from opik.evaluation.metrics import BaseMetric, Hallucination
@@ -90,6 +95,13 @@ class FakeClient:
         self._real = real
         self.datasets: dict[tuple[str, str], FakeDataset] = {}
         self.experiments: dict[str, Any] = {}
+        self.records: dict[str, SimpleNamespace] = {}
+        self.feedback_scores: list[dict[str, Any]] = []
+        self.rest_client = SimpleNamespace(
+            experiments=SimpleNamespace(
+                get_experiment_by_id=lambda id: self.records[id]  # noqa: A006
+            )
+        )
 
     def get_or_create_dataset(
         self, name: str, description: str | None, project_name: str
@@ -102,6 +114,9 @@ class FakeClient:
 
     def get_experiment_by_id(self, experiment_id: str) -> Any:  # noqa: ANN401
         return self.experiments[experiment_id]
+
+    def log_traces_feedback_scores(self, scores: list[dict[str, Any]]) -> None:
+        self.feedback_scores.extend(scores)
 
     def __getattr__(self, name: str) -> Any:  # noqa: ANN401
         return getattr(self._real(), name)
@@ -1014,3 +1029,325 @@ def test_the_check_command_passes_a_met_threshold(
 
     assert main(argv) == 0
     assert "All thresholds met." in capsys.readouterr().out
+
+
+# Pairwise
+
+
+def store_experiment(
+    client: FakeClient,
+    experiment_id: str,
+    outputs: dict[str, dict[str, Any]],
+    *,
+    dataset_version_id: str | None = "dv-1",
+) -> None:
+    """An experiment in Opik whose item for each dataset item id has an output."""
+    items = [
+        ExperimentItemContent(
+            id=f"{experiment_id}-{item_id}",
+            dataset_item_id=item_id,
+            trace_id=f"{experiment_id}-trace-{item_id}",
+            dataset_item_data={"question": f"Question {item_id}"},
+            evaluation_task_output=output,
+            feedback_scores=[],
+        )
+        for item_id, output in outputs.items()
+    ]
+    client.experiments[experiment_id] = SimpleNamespace(
+        name=experiment_id, get_items=lambda max_results: items[:max_results]
+    )
+    client.records[experiment_id] = SimpleNamespace(
+        dataset_id="ds-1", dataset_version_id=dataset_version_id
+    )
+
+
+def candidate_result(outputs: dict[str, dict[str, Any]]) -> EvaluationResult:
+    return EvaluationResult(
+        experiment_id="candidate",
+        dataset_id="ds-1",
+        experiment_name="summary pr-1",
+        test_results=[
+            test_result.TestResult(
+                test_case=test_case.TestCase(
+                    trace_id=f"candidate-trace-{item_id}",
+                    dataset_item_id=item_id,
+                    task_output=output,
+                    dataset_item_content={"question": f"Question {item_id}"},
+                ),
+                score_results=[],
+                trial_id=0,
+            )
+            for item_id, output in outputs.items()
+        ],
+        experiment_url=None,
+        trial_count=1,
+    )
+
+
+PAIRWISE_CRITERIA = "Prefer the answer that names the lecturer."
+LEWIN = {"output": "Prof. Lewin"}
+UNKNOWN = {"output": "Not sure"}
+
+
+def test_pairwise_judges_each_pair_in_both_orders(client: FakeClient) -> None:
+    store_experiment(
+        client,
+        "baseline",
+        {
+            "won": UNKNOWN,
+            "lost": LEWIN,
+            "tied": LEWIN,
+            "reference-only": LEWIN,
+            "reference-raised": {LLM_ERROR_FIELD: "LLMContentFiltered"},
+            "candidate-raised": LEWIN,
+        },
+    )
+    client.records["candidate"] = client.records["baseline"]
+    candidate = candidate_result(
+        {
+            "won": LEWIN,
+            "lost": UNKNOWN,
+            "tied": LEWIN,
+            "candidate-only": LEWIN,
+            "reference-raised": LEWIN,
+            "candidate-raised": {LLM_ERROR_FIELD: "LLMRejected"},
+        }
+    )
+    seen: list[str] = []
+
+    with (
+        override_models(preferring("Lewin", seen)),
+        opik.record_traces_locally() as storage,
+    ):
+        comparison = judge_pairwise(
+            candidate,
+            "baseline",
+            judge=judge_model(APP, JUDGE),
+            criteria=PAIRWISE_CRITERIA,
+            project_name=APP,
+        )
+        tracing.flush()
+        traces = storage.trace_trees
+
+    assert [
+        (v.dataset_item_id, v.outcome, v.orders_agreed) for v in comparison.verdicts
+    ] == [
+        ("won", "win", True),
+        ("lost", "loss", True),
+        ("tied", "tie", False),
+    ]
+    assert comparison.win_rate == 0.5
+    assert comparison.disagreements == 1
+    assert sorted(comparison.unpaired, key=lambda s: s.dataset_item_id) == [
+        SkippedItem(dataset_item_id="candidate-only", reason="only in the candidate"),
+        SkippedItem(dataset_item_id="reference-only", reason="only in the reference"),
+        SkippedItem(
+            dataset_item_id="reference-raised",
+            reason="the reference's task raised LLMContentFiltered",
+        ),
+    ]
+    assert comparison.unjudged == (
+        SkippedItem(
+            dataset_item_id="candidate-raised",
+            reason="the candidate's task raised LLMRejected",
+        ),
+    )
+    # Two calls per judged pair: the candidate's answer as A, then as B.
+    assert len(seen) == 6
+    won = [text for text in seen if "Question won" in text]
+    assert sorted(
+        text.index("Prof. Lewin") < text.index("Not sure") for text in won
+    ) == [
+        False,
+        True,
+    ]
+    assert len(traces) == 6
+    assert {trace.name for trace in traces} == {JUDGE_USE_CASE}
+    assert {trace.project_name for trace in traces} == {APP}
+
+    assert [
+        (s["id"], s["name"], s["value"], s["category_name"], s["project_name"])
+        for s in client.feedback_scores
+    ] == [
+        ("candidate-trace-won", PAIRWISE_METRIC, 1.0, "win", APP),
+        ("candidate-trace-lost", PAIRWISE_METRIC, 0.0, "loss", APP),
+        ("candidate-trace-tied", PAIRWISE_METRIC, 0.5, "tie", APP),
+    ]
+    tied = client.feedback_scores[2]["reason"]
+    assert tied.startswith("The two answer orders disagreed, so this is a tie.")
+    assert "Candidate as A: A is it" in tied
+    assert "Candidate as B: A is it" in tied
+
+
+def test_the_win_rate_is_a_thresholdable_outcome(client: FakeClient) -> None:
+    store_experiment(client, "baseline", {"a": UNKNOWN, "b": UNKNOWN, "c": LEWIN})
+    store_experiment(client, "candidate", {"a": LEWIN, "b": UNKNOWN, "c": UNKNOWN})
+    threshold = Threshold(metric=PAIRWISE_METRIC, minimum=0.45)
+
+    with override_models(preferring("Lewin")):
+        comparison = judge_pairwise(
+            "candidate",
+            "baseline",
+            judge=judge_model(APP, JUDGE),
+            criteria=PAIRWISE_CRITERIA,
+            project_name=APP,
+            threads=1,
+        )
+    outcome = comparison.outcome(threshold)
+
+    # A win, a tie, and a loss: (1 + 0.5 + 0) / 3.
+    assert outcome.mean == 0.5
+    assert outcome.passed
+    assert outcome.describe() == (
+        "PASS win_rate_vs_baseline: mean 0.50, needs >= 0.45 "
+        "(3 scored, 1 won, 1 tied, 1 lost)"
+    )
+    assert [s["id"] for s in client.feedback_scores] == [
+        "candidate-trace-a",
+        "candidate-trace-b",
+        "candidate-trace-c",
+    ]
+    assert comparison.describe() == (
+        "Judged 3 pair(s) in both answer orders: 1 won, 1 tied (1 because the "
+        "orders disagreed), 1 lost."
+    )
+
+
+def test_a_judge_error_leaves_its_pair_unjudged(client: FakeClient) -> None:
+    store_experiment(client, "baseline", {"a": UNKNOWN})
+    store_experiment(client, "candidate", {"a": LEWIN})
+
+    def refuse(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        raise ModelHTTPError(400, "gpt-4o-mini", body="no")
+
+    with override_models(FunctionModel(refuse)):
+        comparison = judge_pairwise(
+            "candidate",
+            "baseline",
+            judge=judge_model(APP, JUDGE),
+            criteria=PAIRWISE_CRITERIA,
+            project_name=APP,
+        )
+
+    assert comparison.verdicts == ()
+    assert comparison.unjudged == (
+        SkippedItem(dataset_item_id="a", reason="the judge raised LLMRejected"),
+    )
+    assert comparison.win_rate is None
+    assert not client.feedback_scores
+    outcome = comparison.outcome(Threshold(metric=PAIRWISE_METRIC, minimum=0.45))
+    assert (outcome.scored, outcome.unscored, outcome.status) == (0, 1, "fail")
+
+
+@pytest.mark.parametrize("version", ["dv-2", None])
+def test_pairwise_needs_one_dataset_version(
+    client: FakeClient, version: str | None
+) -> None:
+    store_experiment(client, "baseline", {"a": UNKNOWN})
+    store_experiment(client, "candidate", {"a": LEWIN}, dataset_version_id=version)
+
+    with pytest.raises(ValueError, match="same dataset version"):
+        judge_pairwise(
+            "candidate",
+            "baseline",
+            judge=judge_model(APP, JUDGE),
+            criteria=PAIRWISE_CRITERIA,
+            project_name=APP,
+        )
+
+
+def test_pairwise_refuses_two_trials_of_one_item(client: FakeClient) -> None:
+    store_experiment(client, "baseline", {"a": UNKNOWN})
+    client.records["candidate"] = client.records["baseline"]
+    twice = candidate_result({"a": LEWIN})
+    twice.test_results.extend(twice.test_results)
+
+    with pytest.raises(ValueError, match="one trial per item"):
+        judge_pairwise(
+            twice,
+            "baseline",
+            judge=judge_model(APP, JUDGE),
+            criteria=PAIRWISE_CRITERIA,
+            project_name=APP,
+        )
+
+
+def test_pairwise_names_a_candidate_answer_field_it_lacks(client: FakeClient) -> None:
+    store_experiment(client, "baseline", {"a": {"answer": "Prof. Lewin"}})
+    store_experiment(client, "candidate", {"a": UNKNOWN})
+
+    with pytest.raises(
+        ValueError,
+        match=r"candidate's answer to dataset item a has no \['answer'\]; it has "
+        r"\['output'\]",
+    ):
+        judge_pairwise(
+            "candidate",
+            "baseline",
+            judge=judge_model(APP, JUDGE),
+            criteria=PAIRWISE_CRITERIA,
+            project_name=APP,
+            answer_fields=["answer"],
+        )
+
+
+def test_pairwise_names_a_field_neither_experiment_has(client: FakeClient) -> None:
+    # Unpaired, every item would make the metric "not compared" and let a
+    # default-branch run record a baseline that still lacks the field.
+    store_experiment(client, "baseline", {"a": UNKNOWN})
+    store_experiment(client, "candidate", {"a": LEWIN})
+
+    with pytest.raises(ValueError, match=r"has no \['answer'\]"):
+        judge_pairwise(
+            "candidate",
+            "baseline",
+            judge=judge_model(APP, JUDGE),
+            criteria=PAIRWISE_CRITERIA,
+            project_name=APP,
+            answer_fields=["answer"],
+        )
+
+
+def test_a_reference_without_the_answer_fields_is_not_compared(
+    client: FakeClient,
+) -> None:
+    # The suite now returns "answer"; the reference ran before it did.
+    store_experiment(client, "baseline", {"a": UNKNOWN})
+    store_experiment(client, "candidate", {"a": {"answer": "Prof. Lewin"}})
+
+    comparison = judge_pairwise(
+        "candidate",
+        "baseline",
+        judge=judge_model(APP, JUDGE),
+        criteria=PAIRWISE_CRITERIA,
+        project_name=APP,
+        answer_fields=["answer"],
+    )
+
+    assert comparison.unpaired == (
+        SkippedItem(
+            dataset_item_id="a", reason="the reference's answer has no ['answer']"
+        ),
+    )
+    assert not client.feedback_scores
+    outcome = comparison.outcome(Threshold(metric=PAIRWISE_METRIC, minimum=0.45))
+    assert outcome.status == "not compared"
+    assert outcome.describe().endswith("(0 scored, no item paired, 1 unpaired)")
+
+
+def test_an_uncompared_outcome_neither_passes_nor_fails() -> None:
+    outcome = MetricOutcome(
+        threshold=Threshold(metric=PAIRWISE_METRIC, minimum=0.45),
+        mean=None,
+        scored=0,
+        unscored=0,
+        compared=False,
+        detail="no baseline",
+    )
+
+    assert outcome.status == "not compared"
+    assert not outcome.failed
+    assert outcome.describe() == (
+        "NOT COMPARED win_rate_vs_baseline: no scores, needs >= 0.45 "
+        "(0 scored, no baseline)"
+    )

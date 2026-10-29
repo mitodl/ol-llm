@@ -14,23 +14,26 @@ import ol_llm.gate as gate_module
 import opik
 import pydantic
 import pytest
-from conftest import PromptLibrary
+from conftest import PromptLibrary, preferring
 from ol_llm import fetch_prompt, tracing
 from ol_llm.errors import LLMError, LLMRejected
-from ol_llm.evaluation import Threshold, ValidatorMetric, main
+from ol_llm.evaluation import PAIRWISE_METRIC, Threshold, ValidatorMetric, main
 from ol_llm.gate import (
     BASELINE_TAG,
     GATE_ERROR_STATUS,
     GateConfigurationError,
     GateContext,
     GateDeclaration,
+    PairwiseDeclaration,
     Suite,
     load_suite,
     run_gate,
 )
+from ol_llm.models import override_models
 from ol_llm.settings import Settings
 from ol_llm.tracing import TracingConfig
 from opik.api_objects.dataset.dataset_item import DatasetItem
+from opik.api_objects.experiment.experiment_item import ExperimentItemContent
 from opik.evaluation import test_case, test_result
 from opik.evaluation.evaluation_result import EvaluationResult
 from opik.exceptions import DatasetVersionNotFound
@@ -41,6 +44,9 @@ from opik.rest_api.types import (
     FeedbackScoreAveragePublic,
     PromptVersionLinkPublic,
 )
+from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 APP = "dagster-ml"
 USE_CASE = "feedback-summary"
@@ -112,6 +118,16 @@ class FakeExperiments:
         self.updates: list[tuple[str, dict[str, Any]]] = []
         self.queries: list[list[dict[str, str]]] = []
 
+    def get_experiment_by_id(self, id: str) -> ExperimentPublic:  # noqa: A002
+        """A stored experiment, or one ``fake_result`` ran on dataset v1."""
+        stored = {e.id: e for e in self.stored}
+        return stored.get(
+            id,
+            ExperimentPublic(
+                id=id, dataset_id=f"ds-{DATASET}", dataset_version_id="dv-v1"
+            ),
+        )
+
     def find_experiments(
         self, *, page: int, size: int, dataset_id: str, filters: str
     ) -> SimpleNamespace:
@@ -141,6 +157,17 @@ class FakeClient:
         self._real = real
         self.datasets: dict[tuple[str, str], FakeDataset] = {}
         self.rest_client = SimpleNamespace(experiments=FakeExperiments())
+        self.experiment_items: dict[str, list[ExperimentItemContent]] = {}
+        self.feedback_scores: list[dict[str, Any]] = []
+
+    def get_experiment_by_id(self, experiment_id: str) -> SimpleNamespace:
+        items = self.experiment_items[experiment_id]
+        return SimpleNamespace(
+            name=experiment_id, get_items=lambda max_results: items[:max_results]
+        )
+
+    def log_traces_feedback_scores(self, scores: list[dict[str, Any]]) -> None:
+        self.feedback_scores.extend(scores)
 
     def get_or_create_dataset(
         self, name: str, description: str | None, project_name: str
@@ -267,6 +294,7 @@ def experiment(  # noqa: PLR0913
     brevity: float = 1.0,
     age_hours: int = 1,
     name: str | None = None,
+    pairwise_score: float | None = None,
 ) -> ExperimentPublic:
     detail = next(
         v
@@ -284,12 +312,22 @@ def experiment(  # noqa: PLR0913
                 prompt_version_id=detail["id"], prompt_id=detail["prompt_id"]
             )
         ],
+        dataset_version_id=f"dv-{dataset_version}",
         dataset_version_summary=DatasetVersionSummaryPublic(
             version_name=dataset_version
         ),
         feedback_scores=[
             FeedbackScoreAveragePublic(name="placeholders", value=1.0),
             FeedbackScoreAveragePublic(name="brevity", value=brevity),
+            *(
+                []
+                if pairwise_score is None
+                else [
+                    FeedbackScoreAveragePublic(
+                        name=PAIRWISE_METRIC, value=pairwise_score
+                    )
+                ]
+            ),
         ],
     )
 
@@ -299,10 +337,11 @@ def experiment(  # noqa: PLR0913
 
 def test_the_documented_declarations_are_valid() -> None:
     doc = (WORKFLOW.parents[2] / "docs" / "evaluation-gate.md").read_text()
-    [example] = re.findall(r"```toml\n(.*?)```", doc, flags=re.DOTALL)
+    # The second example adds pairwise judging to the first.
+    first, second = re.findall(r"```toml\n(.*?)```", doc, flags=re.DOTALL)
     docstring = (gate_module.__doc__ or "").split("::\n", 1)[1].split("``suite``")[0]
 
-    for text in (example, textwrap.dedent(docstring)):
+    for text in (first, first + second, textwrap.dedent(docstring)):
         assert GateDeclaration.model_validate(tomllib.loads(text)).thresholds
 
 
@@ -354,6 +393,39 @@ def test_a_declaration_loads_from_toml(tmp_path: Path) -> None:
         ),
         ({"mode": "strict"}, "'advisory' or 'blocking'"),
         ({"suite": "no_attribute"}, "should match pattern"),
+        (
+            {"pairwise": {"criteria": "Better."}, "judge_model": "openai:gpt-4o-mini"},
+            f"needs a threshold on {PAIRWISE_METRIC}",
+        ),
+        (
+            {
+                "pairwise": {"criteria": "Better."},
+                "thresholds": [{"metric": PAIRWISE_METRIC, "minimum": 0.45}],
+            },
+            "needs judge_model",
+        ),
+        (
+            {"thresholds": [{"metric": PAIRWISE_METRIC, "minimum": 0.45}]},
+            r"needs \[pairwise\] declared",
+        ),
+        (
+            {
+                "pairwise": {"criteria": "Better."},
+                "judge_model": "openai:gpt-4o-mini",
+                "thresholds": [
+                    {"metric": PAIRWISE_METRIC, "minimum": 0.4, "tolerance": 0.05}
+                ],
+            },
+            "not a tolerance",
+        ),
+        (
+            {
+                "pairwise": {"criteria": "  "},
+                "judge_model": "openai:gpt-4o-mini",
+                "thresholds": [{"metric": PAIRWISE_METRIC, "minimum": 0.45}],
+            },
+            "at least 1 character",
+        ),
     ],
 )
 def test_a_declaration_refuses_what_cannot_gate(
@@ -725,6 +797,182 @@ def test_a_default_branch_run_records_itself_as_the_baseline(
     ]
     assert outcome.recorded_baseline
     assert "recorded as the baseline" in outcome.markdown()
+
+
+# Pairwise
+
+
+def pairwise(**changes: Any) -> GateDeclaration:  # noqa: ANN401
+    return declaration(
+        judge_model="openai:gpt-4o-mini",
+        pairwise={"criteria": "Prefer the answer that keeps the placeholder."},
+        thresholds=[
+            {"metric": "placeholders", "minimum": 1.0},
+            {"metric": PAIRWISE_METRIC, "minimum": 0.45},
+        ],
+        **changes,
+    )
+
+
+def baseline_answers(client: FakeClient, baseline: ExperimentPublic) -> None:
+    """The baseline answered the first item without its placeholder."""
+    assert baseline.id is not None
+    client.experiment_items[baseline.id] = [
+        ExperimentItemContent(
+            id=f"b{i}",
+            dataset_item_id=f"i{i}",
+            trace_id=f"bt{i}",
+            dataset_item_data=item,
+            evaluation_task_output={"output": output},
+            feedback_scores=[],
+        )
+        for i, (item, output) in enumerate(
+            zip(GOLDEN, ["v1: great", "v1: {lectures}"], strict=True)
+        )
+    ]
+
+
+@pytest.mark.usefixtures("prompts", "runs")
+def test_pairwise_with_no_baseline_is_not_compared(client: FakeClient) -> None:
+    seeded(client)
+
+    outcome = run_gate(pairwise(), suite=suite, change="pr-12")
+
+    assert outcome.pairwise is None
+    assert not client.feedback_scores
+    assert outcome.not_run is None
+    assert outcome.exit_status == 0
+    _, win_rate = outcome.report.outcomes
+    assert win_rate.status == "not compared"
+    markdown = outcome.markdown()
+    assert (
+        f"| `{PAIRWISE_METRIC}` | none | >= 0.45 |  | 0 of 0 | not compared |"
+        in markdown
+    )
+    assert "or on the pairwise win rate, is not compared" in markdown
+
+
+@pytest.mark.usefixtures("runs")
+@pytest.mark.parametrize("minimum", [0.45, 0.8])
+def test_pairwise_judges_the_run_against_the_baseline(
+    client: FakeClient, prompts: PromptLibrary, minimum: float
+) -> None:
+    seeded(client)
+    baseline = experiment(prompts, pairwise_score=0.9)
+    client.rest_client.experiments.stored.append(baseline)
+    baseline_answers(client, baseline)
+    gate = pairwise(mode="blocking").model_copy(
+        update={
+            "thresholds": [
+                Threshold(metric="placeholders", minimum=1.0),
+                Threshold(metric=PAIRWISE_METRIC, minimum=minimum),
+            ]
+        }
+    )
+
+    with override_models(preferring("{great}")):
+        outcome = run_gate(gate, suite=suite, change="pr-12")
+
+    assert outcome.pairwise is not None
+    assert outcome.pairwise.reference == baseline.id
+    # The run kept {great} where the baseline dropped it, a win; both kept
+    # {lectures}, so the judge's position decides each order, a tie.
+    assert [
+        (s["id"], s["value"], s["category_name"]) for s in client.feedback_scores
+    ] == [
+        ("t0", 1.0, "win"),
+        ("t1", 0.5, "tie"),
+    ]
+    _, win_rate = outcome.report.outcomes
+    assert (win_rate.mean, win_rate.scored, win_rate.baseline) == (0.75, 2, None)
+    assert outcome.failed is (minimum > win_rate.mean)
+    markdown = outcome.markdown()
+    assert (
+        f"| `{PAIRWISE_METRIC}` | 0.75 | >= {minimum:.2f} |  | 2 of 2 | "
+        f"{win_rate.status} |"
+    ) in markdown
+    assert (
+        "Pairwise against the baseline: Judged 2 pair(s) in both answer orders: 1 "
+        "won, 1 tied (1 because the orders disagreed), 0 lost. A tie counts as half "
+        "a win."
+    ) in markdown
+
+
+@pytest.mark.usefixtures("runs")
+def test_a_pairwise_judge_that_judged_nothing_could_not_run(
+    client: FakeClient, prompts: PromptLibrary
+) -> None:
+    seeded(client)
+    baseline = experiment(prompts)
+    client.rest_client.experiments.stored.append(baseline)
+    baseline_answers(client, baseline)
+
+    def refuse(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        raise ModelHTTPError(400, "gpt-4o-mini", body="no")
+
+    with override_models(FunctionModel(refuse)):
+        outcome = run_gate(
+            pairwise(prompts={USE_CASE: "v1"}),
+            suite=suite,
+            change="main",
+            record_baseline=True,
+        )
+
+    assert outcome.not_run is not None
+    assert outcome.not_run.startswith("the pairwise judge judged no pair.")
+    assert "2 not judged (the judge raised LLMRejected x2)" in outcome.not_run
+    assert outcome.exit_status == GATE_ERROR_STATUS
+    assert not outcome.recorded_baseline
+
+
+@pytest.mark.usefixtures("runs")
+def test_new_answer_fields_leave_the_old_baseline_unpaired(
+    client: FakeClient, prompts: PromptLibrary
+) -> None:
+    seeded(client)
+    baseline = experiment(prompts)
+    client.rest_client.experiments.stored.append(baseline)
+    baseline_answers(client, baseline)
+    gate = pairwise(prompts={USE_CASE: "v1"}).model_copy(
+        update={
+            "pairwise": PairwiseDeclaration(
+                criteria="Better.", answer_fields=["output", "sources"]
+            )
+        }
+    )
+
+    def with_sources(context: GateContext) -> Suite:
+        built = suite(context)
+        return Suite(
+            task=lambda item: {**built.task(item), "sources": []},
+            metrics=built.metrics,
+        )
+
+    outcome = run_gate(gate, suite=with_sources, change="main", record_baseline=True)
+
+    # The default-branch run records the baseline the next change pairs with.
+    assert outcome.not_run is None
+    assert outcome.recorded_baseline
+    _, win_rate = outcome.report.outcomes
+    assert win_rate.status == "not compared"
+    assert outcome.pairwise is not None
+    assert "2 not paired (the reference's answer has no ['sources'] x2)" in (
+        outcome.markdown()
+    )
+
+
+@pytest.mark.usefixtures("runs")
+def test_a_baseline_on_another_dataset_version_cannot_be_paired(
+    client: FakeClient, prompts: PromptLibrary
+) -> None:
+    seeded(client)
+    # Its summary names the pinned version, but its version id is another's.
+    baseline = experiment(prompts).model_copy(update={"dataset_version_id": "dv-other"})
+    client.rest_client.experiments.stored.append(baseline)
+    baseline_answers(client, baseline)
+
+    with pytest.raises(GateConfigurationError, match="same dataset version"):
+        run_gate(pairwise(), suite=suite, change="pr-12")
 
 
 # The command

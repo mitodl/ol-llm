@@ -26,6 +26,13 @@ the owning team reviews like code (spec §5.1 item 3)::
     tolerance = 0.05                    # at most 0.05 below the baseline
     direction = "higher"
 
+    [pairwise]                          # optional: judge against the baseline
+    criteria = "Prefer the summary that keeps every point the feedback makes."
+
+    [[thresholds]]
+    metric = "win_rate_vs_baseline"     # a tie counts as half a win
+    minimum = 0.45
+
 ``suite`` names a callable, ``module:attribute``, that takes a ``GateContext`` and
 returns a ``Suite``: the task under test and its metrics. The module is imported
 with the declaration's directory first on ``sys.path``, so it can sit beside the
@@ -34,7 +41,10 @@ declaration or be part of the app's installed package.
 ``run_gate`` fetches the pinned prompt versions, checks the dataset and its pinned
 version exist (seeding the declared file first), runs ``evaluate`` tagged with the
 gate and the change under review, and checks the scores against the thresholds,
-with each ``tolerance`` measured from the baseline. Anything that keeps the gate
+with each ``tolerance`` measured from the baseline. With ``[pairwise]`` declared,
+the judge also compares each answer with the baseline's answer to the same item
+(``judge_pairwise``), and ``win_rate_vs_baseline`` is the share it preferred,
+counting a tie as half. Anything that keeps the gate
 from running raises ``GateConfigurationError`` with what to do about it, in either
 mode: a gate that cannot run must not pass.
 
@@ -42,13 +52,14 @@ The baseline is the newest experiment recorded with ``record_baseline`` (CI does
 that on the default branch) for this gate, on the pinned dataset version, linked to
 every prompt's ``production``-labeled version. The spec's "last experiment for the
 production version" would otherwise include runs from pull requests that never
-merged. With no baseline, only the fixed bounds apply, and the next default-branch
-run records one.
+merged. With no baseline, only the fixed bounds apply, the pairwise win rate is not
+compared, and the next default-branch run records one.
 
 Needs the ``pydantic-ai`` extra, the provider extras for the task's and judge's
 models, and opik installed whole (see ``ol_llm.evaluation``).
 """
 
+import dataclasses
 import json
 import logging
 import pkgutil
@@ -73,12 +84,16 @@ from opik.rest_api.types import ExperimentPublic
 from ol_llm import tracing
 from ol_llm.evaluation import (
     LLM_ERROR_FIELD,
+    PAIRWISE_METRIC,
     GateMode,
     GateReport,
     JudgeModel,
+    MetricOutcome,
+    PairwiseComparison,
     Threshold,
     evaluate,
     judge_model,
+    judge_pairwise,
     load_items,
     score_report,
     seed_dataset,
@@ -127,6 +142,22 @@ class DatasetPin(pydantic.BaseModel):
     group: str | None = None
 
 
+class PairwiseDeclaration(pydantic.BaseModel):
+    """A gate's pairwise comparison with its baseline; see ``judge_pairwise``.
+
+    :param criteria: what makes one answer better than another for this use
+        case, as the judge is to apply it.
+    :param answer_fields: the task output fields the judge compares.
+    """
+
+    model_config = pydantic.ConfigDict(extra="forbid", frozen=True)
+
+    criteria: Annotated[
+        str, pydantic.StringConstraints(strip_whitespace=True, min_length=1)
+    ]
+    answer_fields: Annotated[list[str], pydantic.Field(min_length=1)] = ["output"]
+
+
 class GateDeclaration(pydantic.BaseModel):
     """One use case's evaluation gate, as its repository declares it.
 
@@ -140,6 +171,8 @@ class GateDeclaration(pydantic.BaseModel):
         that changes it, the new version; otherwise production's.
     :param dataset: the dataset and its pinned version.
     :param thresholds: what passing means, one per metric.
+    :param pairwise: judge each answer against the baseline's; needs
+        ``judge_model`` and a threshold on ``win_rate_vs_baseline``.
     """
 
     model_config = pydantic.ConfigDict(extra="forbid", frozen=True)
@@ -152,6 +185,7 @@ class GateDeclaration(pydantic.BaseModel):
     prompts: Annotated[dict[str, VersionName], pydantic.Field(min_length=1)]
     dataset: DatasetPin
     thresholds: Annotated[list[Threshold], pydantic.Field(min_length=1)]
+    pairwise: PairwiseDeclaration | None = None
 
     @pydantic.field_validator("thresholds")
     @classmethod
@@ -161,6 +195,37 @@ class GateDeclaration(pydantic.BaseModel):
             msg = f"Each metric takes one threshold; {duplicated} have more"
             raise ValueError(msg)
         return thresholds
+
+    @pydantic.model_validator(mode="after")
+    def _pairwise_is_judged_and_bounded(self) -> "GateDeclaration":
+        bound = next((t for t in self.thresholds if t.metric == PAIRWISE_METRIC), None)
+        if self.pairwise is None:
+            if bound is not None:
+                msg = f"A threshold on {PAIRWISE_METRIC} needs [pairwise] declared"
+                raise ValueError(msg)
+            return self
+        if self.judge_model is None:
+            msg = "[pairwise] needs judge_model set"
+            raise ValueError(msg)
+        if bound is None:
+            msg = (
+                f"[pairwise] needs a threshold on {PAIRWISE_METRIC}, e.g. "
+                "minimum = 0.45"
+            )
+            raise ValueError(msg)
+        if bound.tolerance is not None:
+            # The baseline's own win rate was against an older baseline.
+            msg = (
+                f"{PAIRWISE_METRIC} is already relative to the baseline, so it takes "
+                "a minimum or maximum, not a tolerance"
+            )
+            raise ValueError(msg)
+        return self
+
+    @property
+    def scored_thresholds(self) -> list[Threshold]:
+        """The thresholds on the experiment's own scores, without the pairwise one."""
+        return [t for t in self.thresholds if t.metric != PAIRWISE_METRIC]
 
     @classmethod
     def load(cls, path: Path) -> "GateDeclaration":
@@ -264,8 +329,10 @@ class GateOutcome:
     :param baseline_note: why there is none, when there is none.
     :param recorded_baseline: whether this run is now a baseline.
     :param not_run: why the experiment evaluated nothing, when it did not: every
-        task raised, or a thresholded metric scored no item. The gate then
-        cannot vouch for the change in either mode.
+        task raised, a thresholded metric scored no item, or the pairwise judge
+        judged no pair. The gate then cannot vouch for the change in either mode.
+    :param pairwise: the comparison with the baseline, when the gate declares
+        one and there was a baseline.
     """
 
     declaration: GateDeclaration
@@ -277,6 +344,7 @@ class GateOutcome:
     baseline_note: str | None = None
     recorded_baseline: bool = False
     not_run: str | None = None
+    pairwise: PairwiseComparison | None = None
 
     @property
     def failed(self) -> bool:
@@ -353,8 +421,8 @@ class GateOutcome:
         lines.extend(["", *self._context_lines(markdown=True)])
         if uncompared:
             lines.append(
-                "A threshold with only a tolerance is not compared until there is "
-                "a baseline."
+                "A threshold with only a tolerance, or on the pairwise win rate, is "
+                "not compared until there is a baseline."
             )
         if missed and self.not_run is None and declaration.mode == "advisory":
             lines.append(
@@ -379,6 +447,11 @@ class GateOutcome:
             )
         elif self.baseline_note:
             lines.append(f"No baseline: {self.baseline_note}")
+        if self.pairwise is not None:
+            lines.append(
+                f"Pairwise against the baseline: {self.pairwise.describe()} A tie "
+                "counts as half a win."
+            )
         if self.recorded_baseline:
             lines.append("This run is recorded as the baseline for later changes.")
         return lines
@@ -433,8 +506,9 @@ def run_gate(
     :returns: the outcome. A blocking miss does not raise; see
         ``GateOutcome.failed``.
     :rtype: GateOutcome
-    :raises GateConfigurationError: if tracing is off, or the dataset, its pinned
-        version, or a pinned prompt version does not exist.
+    :raises GateConfigurationError: if tracing is off, the dataset, its pinned
+        version, or a pinned prompt version does not exist, or the pairwise
+        comparison cannot pair the baseline's answers with this run's.
     """
     if not tracing.enabled():
         msg = (
@@ -481,23 +555,43 @@ def run_gate(
         task_threads=built.task_threads,
         experiment_tags=[_gate_tag(declaration), f"change:{change}"],
     )
+    baseline, note = find_baseline(
+        declaration, dataset_id=result.dataset_id, exclude=result.experiment_id
+    )
+    pairwise = None
+    if declaration.pairwise is not None and baseline is not None and judge is not None:
+        try:
+            pairwise = judge_pairwise(
+                result,
+                baseline.experiment_id,
+                judge=judge,
+                criteria=declaration.pairwise.criteria,
+                project_name=declaration.app,
+                answer_fields=declaration.pairwise.answer_fields,
+                threads=built.task_threads,
+            )
+        except ValueError as exc:
+            msg = f"Could not compare with the baseline: {exc}"
+            raise GateConfigurationError(msg) from exc
     # A run that evaluated nothing must not become the baseline either.
     not_run = _not_run(
-        result, score_report(result, declaration.thresholds, mode=declaration.mode)
+        result,
+        score_report(result, declaration.scored_thresholds, mode=declaration.mode),
+        pairwise,
     )
     recorded = record_baseline and not_run is None
     if recorded:
         tracing.opik_client().rest_client.experiments.update_experiment(
             result.experiment_id, tags_to_add=[BASELINE_TAG]
         )
-    baseline, note = find_baseline(
-        declaration, dataset_id=result.dataset_id, exclude=result.experiment_id
-    )
-    report = score_report(
-        result,
-        declaration.thresholds,
-        mode=declaration.mode,
-        baselines=None if baseline is None else baseline.means,
+    report = _with_pairwise(
+        score_report(
+            result,
+            declaration.thresholds,
+            mode=declaration.mode,
+            baselines=None if baseline is None else baseline.means,
+        ),
+        pairwise,
     )
     return GateOutcome(
         declaration=declaration,
@@ -509,10 +603,39 @@ def run_gate(
         baseline_note=note,
         recorded_baseline=recorded,
         not_run=not_run,
+        pairwise=pairwise,
     )
 
 
-def _not_run(result: "EvaluationResult", report: GateReport) -> str | None:
+def _with_pairwise(
+    report: GateReport, pairwise: PairwiseComparison | None
+) -> GateReport:
+    """Put the pairwise win rate in place of the experiment's own scores for it."""
+
+    def outcome(scored: MetricOutcome) -> MetricOutcome:
+        if scored.threshold.metric != PAIRWISE_METRIC:
+            return scored
+        if pairwise is None:
+            return MetricOutcome(
+                threshold=scored.threshold,
+                mean=None,
+                scored=0,
+                unscored=0,
+                compared=False,
+                detail="no baseline",
+            )
+        return pairwise.outcome(scored.threshold)
+
+    return dataclasses.replace(
+        report, outcomes=tuple(outcome(o) for o in report.outcomes)
+    )
+
+
+def _not_run(
+    result: "EvaluationResult",
+    report: GateReport,
+    pairwise: PairwiseComparison | None,
+) -> str | None:
     """Say why an experiment evaluated nothing, or return ``None`` if it did."""
     items = result.test_results
     if not items:
@@ -536,6 +659,8 @@ def _not_run(result: "EvaluationResult", report: GateReport) -> str | None:
             "(e.g. its judge raised each time), or the suite produces no score of "
             "that name."
         )
+    if pairwise is not None and pairwise.unjudged and not pairwise.verdicts:
+        return f"the pairwise judge judged no pair. {pairwise.describe()}"
     return None
 
 

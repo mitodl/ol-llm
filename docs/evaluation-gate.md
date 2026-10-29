@@ -133,6 +133,58 @@ The spec defines the baseline as the last experiment for the production version.
 requests also run that version (any model or configuration change does), so taking any such
 experiment would measure a change against an unmerged one.
 
+## Pairwise comparison with the baseline
+
+Thresholds bound each metric's mean, so they can say an answer got worse on a scale, but not
+whether the judge would rather have the baseline's answer to the same question. A gate gets
+that by declaring `[pairwise]` with the criteria for its use case, and a threshold on
+`win_rate_vs_baseline`, added to a declaration like the one above:
+
+```toml
+[pairwise]
+criteria = """
+Choose the response that best serves the learner who asked. Prefer responses that are
+accurate and supported by the retrieval context, that address what was asked including
+qualifiers such as "basic" or "free", and that are clear and appropriately concise.
+"""
+answer_fields = ["output"]               # the task output fields the judge compares
+
+[[thresholds]]
+metric = "win_rate_vs_baseline"
+minimum = 0.45
+```
+
+Once the experiment has run, `ol_llm.evaluation.judge_pairwise` pairs its items with the
+baseline's by dataset item id (the baseline is on the same pinned dataset version, so every
+item should pair). For each pair, the declared `judge_model` sees the dataset item and the two
+answers' `answer_fields`, and says which better meets the criteria, or that neither does. It
+is asked twice, once with each answer first. When the two orders agree that is the verdict,
+and when they do not the item is a tie, so a judge that favors whichever answer comes first
+cannot decide an item. The judge's calls go through ol-llm under the `eval-judge` use case, so
+each is a trace in the app's project like any other judge call.
+
+Each verdict is logged on the run's experiment item as a `win_rate_vs_baseline` score: 1 for a
+win, 0.5 for a tie, 0 for a loss, with the judge's reason for each order and the verdict as the
+score's category. A tie counts as half a win, so the win rate is the mean of those scores, and
+0.5 means the change did as well as the baseline. The report also counts wins, ties, and losses, and how many ties came from the two
+orders disagreeing. `minimum = 0.45` lets a change lose slightly more items than it wins, since
+a judge is noisy.
+
+An item in only one of the two experiments, or one where the baseline has no answer (its task
+raised an `LLMError`, or its output lacks one of `answer_fields`), has no pair and does not
+count either way; the report says how many there were and why. When no item has a pair, e.g.
+right after a change to `answer_fields`, the win rate is `not compared` until the next
+default-branch run records a baseline with those fields. An item the run's task raised on, or
+the judge raised on, counts as unscored, which fails the threshold as it does for any other
+metric, and a run where the judge raised on every pair cannot run (exit 2). A pairwise
+comparison takes one trial per item, and needs every one of the run's answers to have the
+`answer_fields`; the gate cannot run if either is not so.
+
+With no baseline, `win_rate_vs_baseline` is `not compared`, as a tolerance-only threshold is,
+and the judge is not called. The threshold takes a `minimum` or `maximum` and no `tolerance`,
+since the win rate is already relative to the baseline. The criteria above are a start for
+the chat bots, from learn-ai's `rag_evaluation --pairwise`; each use case should write its own.
+
 ## The workflow
 
 ```yaml

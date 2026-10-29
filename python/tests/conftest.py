@@ -23,6 +23,14 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 )
 from opik.api_objects.prompt import prompt_cache
 from opik.message_processing.emulation.models import TraceModel
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    ToolCallPart,
+    UserPromptPart,
+)
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 _PROMPTS = "/api/v1/private/prompts/versions"
 _ENVIRONMENTS = re.compile(rf"{_PROMPTS}/(?P<id>[^/]+)/environments")
@@ -420,3 +428,27 @@ def prompt_library() -> Generator[PromptLibrary]:
     yield PROMPTS
     prompt_cache.get_global_cache().clear()
     PROMPTS.reset()
+
+
+def preferring(word: str, seen: list[str] | None = None) -> FunctionModel:
+    """A judge that prefers the answer with ``word``, and the first when both or
+    neither has it, so position decides a pair it cannot tell apart."""
+
+    def reply(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        [request] = messages
+        assert isinstance(request, ModelRequest)
+        [part] = request.parts
+        assert isinstance(part, UserPromptPart)
+        text = str(part.content)
+        if seen is not None:
+            seen.append(text)
+        a, b = text.split("Answer A:")[1].split("Answer B:")
+        better = "B" if word in b and word not in a else "A"
+        [tool] = info.output_tools
+        return ModelResponse(
+            parts=[
+                ToolCallPart(tool.name, {"reason": f"{better} is it", "better": better})
+            ]
+        )
+
+    return FunctionModel(reply)
