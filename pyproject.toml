@@ -5,7 +5,7 @@ description = "Workspace root for ol-llm. Not published; the distribution lives 
 requires-python = ">=3.11"
 
 [dependency-groups]
-prek = ["prek==0.5.4"]
+prek = ["prek==0.5.5"]
 dev = [
     { include-group = "prek" },
     "mypy>=1.18",
