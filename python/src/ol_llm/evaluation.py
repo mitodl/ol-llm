@@ -1295,6 +1295,13 @@ def judge_pairwise(  # noqa: PLR0913
     unjudged = []
     pairs = []
     for item_id, answered in candidates.items():
+        # Checked before pairing, so answer fields that match neither experiment
+        # raise rather than leave every item unpaired and record a new baseline.
+        mine = (
+            None
+            if answered.output.get(LLM_ERROR_FIELD)
+            else _answer(answered, answer_fields)
+        )
         if (other := references.get(item_id)) is None:
             unpaired.append(
                 SkippedItem(dataset_item_id=item_id, reason="only in the candidate")
@@ -1314,21 +1321,18 @@ def judge_pairwise(  # noqa: PLR0913
                     reason=f"the reference's answer has no {missing}",
                 )
             )
-        elif error := answered.output.get(LLM_ERROR_FIELD):
+        elif mine is None:
             unjudged.append(
                 SkippedItem(
                     dataset_item_id=item_id,
-                    reason=f"the candidate's task raised {error}",
+                    reason=(
+                        "the candidate's task raised "
+                        f"{answered.output[LLM_ERROR_FIELD]}"
+                    ),
                 )
             )
         else:
-            pairs.append(
-                (
-                    answered,
-                    _answer(answered, answer_fields),
-                    {f: other.output[f] for f in answer_fields},
-                )
-            )
+            pairs.append((answered, mine, {f: other.output[f] for f in answer_fields}))
     instructions = _PAIRWISE_INSTRUCTIONS.format(criteria=criteria)
     verdicts = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:

@@ -1291,6 +1291,23 @@ def test_pairwise_names_a_candidate_answer_field_it_lacks(client: FakeClient) ->
         )
 
 
+def test_pairwise_names_a_field_neither_experiment_has(client: FakeClient) -> None:
+    # Unpaired, every item would make the metric "not compared" and let a
+    # default-branch run record a baseline that still lacks the field.
+    store_experiment(client, "baseline", {"a": UNKNOWN})
+    store_experiment(client, "candidate", {"a": LEWIN})
+
+    with pytest.raises(ValueError, match=r"has no \['answer'\]"):
+        judge_pairwise(
+            "candidate",
+            "baseline",
+            judge=judge_model(APP, JUDGE),
+            criteria=PAIRWISE_CRITERIA,
+            project_name=APP,
+            answer_fields=["answer"],
+        )
+
+
 def test_a_reference_without_the_answer_fields_is_not_compared(
     client: FakeClient,
 ) -> None:
