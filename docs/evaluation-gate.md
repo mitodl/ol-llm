@@ -165,9 +165,8 @@ each is a trace in the app's project like any other judge call.
 
 Each verdict is logged on the run's experiment item as a `win_rate_vs_baseline` score: 1 for a
 win, 0.5 for a tie, 0 for a loss, with the judge's reason for each order and the verdict as the
-score's category. A tie counts as half a win, so the win rate is the mean of those scores, the
-same average Opik shows on the experiment, and 0.5 means the change did as well as the
-baseline. The report also counts wins, ties, and losses, and how many ties came from the two
+score's category. A tie counts as half a win, so the win rate is the mean of those scores, and
+0.5 means the change did as well as the baseline. The report also counts wins, ties, and losses, and how many ties came from the two
 orders disagreeing. `minimum = 0.45` lets a change lose slightly more items than it wins, since
 a judge is noisy.
 

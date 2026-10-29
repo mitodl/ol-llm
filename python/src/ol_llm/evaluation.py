@@ -1131,8 +1131,7 @@ class PairwiseComparison:
     """A candidate experiment judged item by item against a reference experiment.
 
     The win rate counts a tie as half a win: it is the mean of each verdict's
-    score (``PAIRWISE_SCORES``), the same mean Opik shows for the score on the
-    candidate experiment, and 0.5 means the candidate did as well as the
+    score (``PAIRWISE_SCORES``), and 0.5 means the candidate did as well as the
     reference.
 
     :param metric: the score's name.
@@ -1250,7 +1249,7 @@ def judge_pairwise(  # noqa: PLR0913
     favors a position cannot decide an item. Each verdict is logged as the
     ``metric`` score on the candidate's item, 1 for a win, 0.5 for a tie and 0
     for a loss, with the judge's reasons, so Opik shows it beside the
-    experiment's other scores and averages it to the win rate.
+    experiment's other scores.
 
     The judge's calls go through ``complete_sync`` under the judge's use case
     (``eval-judge`` from ``judge_model``), so each is traced and costed there.
