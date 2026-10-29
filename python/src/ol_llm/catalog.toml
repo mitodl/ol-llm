@@ -147,6 +147,24 @@ opik_model = "text-embedding-3-small"
 input_usd_per_mtok = "0.02"
 output_usd_per_mtok = "0"
 
+# Anthropic direct.
+
+[[model]]
+id = "anthropic:claude-sonnet-5"
+kind = "chat"
+opik_provider = "anthropic"
+opik_model = "claude-sonnet-5"
+input_usd_per_mtok = "2.00"
+output_usd_per_mtok = "10.00"
+
+# Priced by prompt length: $0.50/$2.50 above 100,000 prompt tokens. Opik 2.2.94 has
+# no price for it.
+[[model]]
+id = "anthropic:claude-haiku-5-5"
+kind = "chat"
+input_usd_per_mtok = "0.10"
+output_usd_per_mtok = "0.50"
+
 # Bedrock.
 
 [[model]]
@@ -156,6 +174,14 @@ opik_provider = "bedrock"
 opik_model = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
 input_usd_per_mtok = "1.00"
 output_usd_per_mtok = "5.00"
+
+# A US cross-region profile, priced 10% above the global one, and by prompt length
+# like the direct model. Opik 2.2.94 has no price for it.
+[[model]]
+id = "bedrock:us.anthropic.claude-haiku-5-5"
+kind = "chat"
+input_usd_per_mtok = "0.11"
+output_usd_per_mtok = "0.55"
 
 # A US cross-region profile, priced 10% above the global one.
 [[model]]
