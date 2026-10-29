@@ -18,6 +18,9 @@ for that:
   catalog-checked, routed, retried, and traced like any other call, under the
   ``eval-judge`` use case. Opik's judge metrics that take a ``model`` accept any
   ``OpikBaseModel``, and given one they do not import litellm.
+- ``judge_pairwise`` has the judge compare a candidate experiment's answers with
+  a reference experiment's, item by item, and logs each verdict on the
+  candidate's items, so its win rate can be thresholded like any other metric.
 - ``check_thresholds`` compares an experiment's scores to the declared
   thresholds. Gates are advisory until a use case's owner makes them blocking
   (spec §5.1 item 4), so by default it reports and does not raise.
@@ -34,6 +37,8 @@ aborts the run with ``ModuleNotFoundError``.
 """
 
 import argparse
+import concurrent.futures
+import contextvars
 import functools
 import inspect
 import json
@@ -41,6 +46,7 @@ import logging
 import math
 import re
 import sys
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,11 +54,14 @@ from typing import Any, Literal, cast
 
 import opik
 import pydantic
+from opik.api_objects.experiment.experiment import Experiment
+from opik.api_objects.experiment.experiment_item import ExperimentItemContent
 from opik.evaluation.evaluation_result import EvaluationResult
 from opik.evaluation.metrics import BaseMetric, arguments_helpers, score_result
 from opik.evaluation.metrics.arguments_validator import validate_score_arguments
 from opik.evaluation.models import OpikBaseModel
 from opik.evaluation.models.base_model import ConversationDict
+from opik.types import BatchFeedbackScoreDict
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -734,8 +743,8 @@ class Threshold:
 
 
 OutcomeStatus = Literal["pass", "fail", "not compared"]
-"""How a metric did: ``not compared`` is a tolerance-only threshold with no
-baseline, which neither passes nor fails."""
+"""How a metric did: ``not compared`` is a tolerance-only threshold, or a pairwise
+win rate, with no baseline, which neither passes nor fails."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -748,6 +757,9 @@ class MetricOutcome:
     :param unscored: items without one, because scoring failed or never ran.
     :param baseline: the baseline experiment's mean, when there is one and it
         scored the metric.
+    :param compared: false for a metric that only exists against a baseline,
+        such as a pairwise win rate, when there was none to compare with.
+    :param detail: more about how the items scored, for the report line.
     """
 
     threshold: Threshold
@@ -755,15 +767,20 @@ class MetricOutcome:
     scored: int
     unscored: int
     baseline: float | None = None
+    compared: bool = True
+    detail: str | None = None
 
     @property
     def status(self) -> OutcomeStatus:
         """Whether the metric passed, failed, or could not be compared.
 
-        ``fail`` when an item is unscored, the mean is not a number, or it is
-        outside a bound or the tolerance; ``not compared`` for a tolerance-only
-        threshold with no baseline; else ``pass``.
+        ``not compared`` for a metric that was not ``compared`` or a
+        tolerance-only threshold with no baseline; ``fail`` when an item is
+        unscored, the mean is not a number, or it is outside a bound or the
+        tolerance; else ``pass``.
         """
+        if not self.compared:
+            return "not compared"
         threshold, mean = self.threshold, self.mean
         if mean is None or math.isnan(mean) or self.unscored:
             return "fail"
@@ -806,6 +823,8 @@ class MetricOutcome:
                 if self.baseline is None
                 else f", baseline {self.baseline:.2f}"
             )
+        if self.detail:
+            counts += f", {self.detail}"
         return (
             f"{status} {self.threshold.metric}: {mean}, needs "
             f"{self.threshold.describe()} ({counts})"
@@ -957,15 +976,7 @@ def check_experiment(
 def _experiment_report(
     experiment_id: str, thresholds: Sequence[Threshold], *, mode: GateMode
 ) -> GateReport:
-    experiment = tracing.opik_client().get_experiment_by_id(experiment_id)
-    # One past the SDK's cap, which max_results=None does not lift.
-    found = experiment.get_items(max_results=MAX_EXPERIMENT_ITEMS + 1)
-    if len(found) > MAX_EXPERIMENT_ITEMS:
-        msg = (
-            f"Experiment {experiment_id} has more than {MAX_EXPERIMENT_ITEMS} items, "
-            "more than the Opik SDK reads"
-        )
-        raise ValueError(msg)
+    experiment, found = _experiment_items(experiment_id)
     # Opik sends a null value for a score it has no value for.
     items = [
         _item_scores((score["name"], score["value"]) for score in item.feedback_scores)
@@ -978,6 +989,26 @@ def _experiment_report(
         thresholds=thresholds,
         mode=mode,
     )
+
+
+def _experiment_items(
+    experiment_id: str,
+) -> tuple[Experiment, list[ExperimentItemContent]]:
+    """Read an experiment and its items from Opik.
+
+    :raises ValueError: if it has more items than the SDK reads, rather than
+        return part of them.
+    """
+    experiment = tracing.opik_client().get_experiment_by_id(experiment_id)
+    # One past the SDK's cap, which max_results=None does not lift.
+    found = experiment.get_items(max_results=MAX_EXPERIMENT_ITEMS + 1)
+    if len(found) > MAX_EXPERIMENT_ITEMS:
+        msg = (
+            f"Experiment {experiment_id} has more than {MAX_EXPERIMENT_ITEMS} items, "
+            "more than the Opik SDK reads"
+        )
+        raise ValueError(msg)
+    return experiment, found
 
 
 def _item_scores(scores: Iterable[tuple[str, float | None]]) -> dict[str, float | None]:
@@ -1030,6 +1061,429 @@ def _enforce(report: GateReport) -> GateReport:
             raise EvaluationGateError(report)
         log.warning("%s", report.describe())
     return report
+
+
+PAIRWISE_METRIC = "win_rate_vs_baseline"
+"""The score ``judge_pairwise`` logs on each candidate item, and the metric a
+threshold bounds the win rate with."""
+
+PairwiseOutcome = Literal["win", "loss", "tie"]
+"""How the candidate's answer did against the reference's on one item."""
+
+PAIRWISE_SCORES: Mapping[PairwiseOutcome, float] = {"win": 1.0, "tie": 0.5, "loss": 0.0}
+"""Each outcome's score. A tie is half a win, so the mean is the win rate."""
+
+_PAIRWISE_INSTRUCTIONS = """\
+You compare two answers to the same request and say which better meets the \
+criteria below. The request is a dataset item, as JSON. Each answer is the output \
+of a different version of the same system, also as JSON.
+
+Judge only by the criteria. Which answer comes first is no reason to prefer it, \
+and neither is length, unless the criteria ask for brevity. When neither answer \
+meets the criteria better than the other, the verdict is "tie".
+
+Give your reason in a few sentences, then the better answer: "A", "B", or "tie".
+
+Criteria:
+{criteria}"""
+
+
+class _PairwiseChoice(pydantic.BaseModel):
+    reason: str = pydantic.Field(description="Why, by the criteria.")
+    better: Literal["A", "B", "tie"] = pydantic.Field(
+        description='The answer that better meets the criteria, or "tie".'
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class PairVerdict:
+    """The judge's verdict on one item's pair of answers.
+
+    :param dataset_item_id: the dataset item both experiments answered.
+    :param trace_id: the candidate's trace for the item, which holds the score.
+    :param outcome: how the candidate's answer did.
+    :param reason: the judge's reason in each answer order.
+    :param orders_agreed: whether both orders gave the same verdict; when they
+        did not, the outcome is a tie.
+    """
+
+    dataset_item_id: str
+    trace_id: str
+    outcome: PairwiseOutcome
+    reason: str
+    orders_agreed: bool
+
+
+@dataclass(frozen=True, kw_only=True)
+class SkippedItem:
+    """An item ``judge_pairwise`` did not judge, and why.
+
+    :param dataset_item_id: the dataset item.
+    :param reason: e.g. ``only in the reference``.
+    """
+
+    dataset_item_id: str
+    reason: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class PairwiseComparison:
+    """A candidate experiment judged item by item against a reference experiment.
+
+    The win rate counts a tie as half a win: it is the mean of each verdict's
+    score (``PAIRWISE_SCORES``), the same mean Opik shows for the score on the
+    candidate experiment, and 0.5 means the candidate did as well as the
+    reference.
+
+    :param metric: the score's name.
+    :param candidate: the candidate experiment's id.
+    :param reference: the reference experiment's id.
+    :param verdicts: one per judged pair, in the candidate's item order.
+    :param unpaired: items with no pair to judge: in one experiment only, or
+        with no answer from the reference (its task raised, or its output lacks
+        an answer field). They do not count for or against the candidate, and
+        when no item is paired the win rate is not compared.
+    :param unjudged: pairs that could not be judged: the candidate's task or the
+        judge raised an ``LLMError``. They count as unscored, which fails a
+        threshold as for any other metric.
+    """
+
+    metric: str
+    candidate: str
+    reference: str
+    verdicts: tuple[PairVerdict, ...]
+    unpaired: tuple[SkippedItem, ...] = ()
+    unjudged: tuple[SkippedItem, ...] = ()
+
+    def count(self, outcome: PairwiseOutcome) -> int:
+        """Return how many verdicts had an outcome."""
+        return sum(v.outcome == outcome for v in self.verdicts)
+
+    @property
+    def disagreements(self) -> int:
+        """How many ties came from the two answer orders disagreeing."""
+        return sum(not v.orders_agreed for v in self.verdicts)
+
+    @property
+    def win_rate(self) -> float | None:
+        """Wins plus half the ties, over the judged pairs; ``None`` with none."""
+        if not self.verdicts:
+            return None
+        scores = [PAIRWISE_SCORES[v.outcome] for v in self.verdicts]
+        return sum(scores) / len(scores)
+
+    def outcome(self, threshold: Threshold) -> MetricOutcome:
+        """Return the win rate against a threshold on ``metric``.
+
+        ``not compared`` when no item had a pair, as with no reference at all.
+
+        :param threshold: the threshold.
+        :returns: the outcome, with the counts as its detail.
+        :rtype: MetricOutcome
+        """
+        if not self.verdicts and not self.unjudged:
+            return MetricOutcome(
+                threshold=threshold,
+                mean=None,
+                scored=0,
+                unscored=0,
+                compared=False,
+                detail=f"no item paired, {len(self.unpaired)} unpaired",
+            )
+        return MetricOutcome(
+            threshold=threshold,
+            mean=self.win_rate,
+            scored=len(self.verdicts),
+            unscored=len(self.unjudged),
+            detail=(
+                f"{self.count('win')} won, {self.count('tie')} tied, "
+                f"{self.count('loss')} lost"
+            ),
+        )
+
+    def describe(self) -> str:
+        """Return the counts, and why any item was not judged, as one paragraph."""
+        parts = [
+            (
+                f"Judged {len(self.verdicts)} pair(s) in both answer orders: "
+                f"{self.count('win')} won, {self.count('tie')} tied "
+                f"({self.disagreements} because the orders disagreed), "
+                f"{self.count('loss')} lost."
+            )
+        ]
+        for label, skipped in (
+            ("not paired", self.unpaired),
+            ("not judged", self.unjudged),
+        ):
+            if skipped:
+                reasons = Counter(s.reason for s in skipped).most_common()
+                counts = ", ".join(f"{reason} x{n}" for reason, n in reasons)
+                parts.append(f"{len(skipped)} {label} ({counts}).")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True, kw_only=True)
+class _Answered:
+    dataset_item_id: str
+    trace_id: str
+    item: Mapping[str, Any]
+    output: Mapping[str, Any]
+
+
+def judge_pairwise(  # noqa: PLR0913
+    candidate: EvaluationResult | str,
+    reference: str,
+    *,
+    judge: JudgeModel,
+    criteria: str,
+    project_name: str,
+    answer_fields: Sequence[str] = ("output",),
+    metric: str = PAIRWISE_METRIC,
+    threads: int = 16,
+) -> PairwiseComparison:
+    """Judge a candidate experiment's answers against a reference experiment's.
+
+    Pairs the two experiments' items by dataset item id; both must have run on
+    the same dataset version. The judge sees the item and the two answers, and
+    is asked twice, once with each answer first: when the two orders agree that
+    is the verdict, and when they do not the pair is a tie, so a judge that
+    favors a position cannot decide an item. Each verdict is logged as the
+    ``metric`` score on the candidate's item, 1 for a win, 0.5 for a tie and 0
+    for a loss, with the judge's reasons, so Opik shows it beside the
+    experiment's other scores and averages it to the win rate.
+
+    The judge's calls go through ``complete_sync`` under the judge's use case
+    (``eval-judge`` from ``judge_model``), so each is traced and costed there.
+
+    :param candidate: the experiment under test: what ``evaluate`` returned, or
+        its id in Opik.
+    :param reference: the experiment to compare with, e.g. the gate's baseline.
+    :param judge: the judge, from ``judge_model``.
+    :param criteria: what makes one answer better than the other, for this use
+        case.
+    :param project_name: the app's Opik project, which holds the experiments.
+    :param answer_fields: the task output fields the judge compares; it sees
+        the whole dataset item.
+    :param metric: the score's name.
+    :param threads: pairs judged at once.
+    :returns: the verdicts, and the items that were not judged.
+    :rtype: PairwiseComparison
+    :raises ValueError: if the experiments did not run on the same dataset
+        version, either has two items for one dataset item, or a candidate's
+        answer lacks one of ``answer_fields``. A reference answer that lacks one
+        leaves its item unpaired, so a gate whose answer fields changed can
+        record a new baseline.
+    """
+    candidate_id = candidate if isinstance(candidate, str) else candidate.experiment_id
+    _check_same_dataset_version(candidate_id, reference)
+    if isinstance(candidate, str):
+        candidates = _answers(_experiment_items(candidate)[1])
+    else:
+        candidates = _keyed(
+            _Answered(
+                dataset_item_id=test.test_case.dataset_item_id,
+                trace_id=test.test_case.trace_id,
+                item=test.test_case.dataset_item_content,
+                output=test.test_case.task_output,
+            )
+            for test in candidate.test_results
+        )
+    references = _answers(_experiment_items(reference)[1])
+    unpaired = [
+        SkippedItem(dataset_item_id=item_id, reason="only in the reference")
+        for item_id in references.keys() - candidates.keys()
+    ]
+    unjudged = []
+    pairs = []
+    for item_id, answered in candidates.items():
+        if (other := references.get(item_id)) is None:
+            unpaired.append(
+                SkippedItem(dataset_item_id=item_id, reason="only in the candidate")
+            )
+        elif error := other.output.get(LLM_ERROR_FIELD):
+            unpaired.append(
+                SkippedItem(
+                    dataset_item_id=item_id,
+                    reason=f"the reference's task raised {error}",
+                )
+            )
+        elif missing := [f for f in answer_fields if f not in other.output]:
+            # The reference predates the fields; a new reference will have them.
+            unpaired.append(
+                SkippedItem(
+                    dataset_item_id=item_id,
+                    reason=f"the reference's answer has no {missing}",
+                )
+            )
+        elif error := answered.output.get(LLM_ERROR_FIELD):
+            unjudged.append(
+                SkippedItem(
+                    dataset_item_id=item_id,
+                    reason=f"the candidate's task raised {error}",
+                )
+            )
+        else:
+            pairs.append(
+                (
+                    answered,
+                    _answer(answered, answer_fields),
+                    {f: other.output[f] for f in answer_fields},
+                )
+            )
+    instructions = _PAIRWISE_INSTRUCTIONS.format(criteria=criteria)
+    verdicts = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
+        # Each call runs in a copy of this context, so model overrides and the
+        # Opik trace context set by the caller reach the judge's calls.
+        futures = [
+            pool.submit(
+                contextvars.copy_context().run,
+                _judge_pair,
+                judge,
+                instructions,
+                answered,
+                mine,
+                theirs,
+            )
+            for answered, mine, theirs in pairs
+        ]
+        for (answered, _, _), future in zip(pairs, futures, strict=True):
+            try:
+                verdicts.append(future.result())
+            except LLMError as exc:
+                log.warning(
+                    "The pairwise judge raised %s on item %s",
+                    type(exc).__name__,
+                    answered.dataset_item_id,
+                )
+                unjudged.append(
+                    SkippedItem(
+                        dataset_item_id=answered.dataset_item_id,
+                        reason=f"the judge raised {type(exc).__name__}",
+                    )
+                )
+    if verdicts:
+        tracing.opik_client().log_traces_feedback_scores(
+            scores=[
+                BatchFeedbackScoreDict(
+                    id=verdict.trace_id,
+                    name=metric,
+                    value=PAIRWISE_SCORES[verdict.outcome],
+                    reason=verdict.reason,
+                    category_name=verdict.outcome,
+                    project_name=project_name,
+                )
+                for verdict in verdicts
+            ]
+        )
+    tracing.flush()
+    return PairwiseComparison(
+        metric=metric,
+        candidate=candidate_id,
+        reference=reference,
+        verdicts=tuple(verdicts),
+        unpaired=tuple(unpaired),
+        unjudged=tuple(unjudged),
+    )
+
+
+def _check_same_dataset_version(candidate: str, reference: str) -> None:
+    experiments = tracing.opik_client().rest_client.experiments
+    found = {
+        experiment_id: experiments.get_experiment_by_id(id=experiment_id)
+        for experiment_id in (candidate, reference)
+    }
+    versions = {(e.dataset_id, e.dataset_version_id) for e in found.values()}
+    if len(versions) > 1 or any(version is None for _, version in versions):
+        msg = (
+            f"Experiments {candidate} and {reference} did not run on the same "
+            "dataset version, so their items cannot be paired"
+        )
+        raise ValueError(msg)
+
+
+def _answers(items: Iterable[ExperimentItemContent]) -> dict[str, _Answered]:
+    return _keyed(
+        _Answered(
+            dataset_item_id=item.dataset_item_id,
+            trace_id=item.trace_id,
+            item=item.dataset_item_data or {},
+            output=item.evaluation_task_output or {},
+        )
+        for item in items
+    )
+
+
+def _keyed(answers: Iterable[_Answered]) -> dict[str, _Answered]:
+    """Key answers by dataset item id.
+
+    :raises ValueError: if two answer one item, as with ``trial_count`` above 1,
+        since then which to pair is ambiguous.
+    """
+    keyed: dict[str, _Answered] = {}
+    for answered in answers:
+        if answered.dataset_item_id in keyed:
+            msg = (
+                f"Dataset item {answered.dataset_item_id} has two answers in one "
+                "experiment; a pairwise comparison takes one trial per item"
+            )
+            raise ValueError(msg)
+        keyed[answered.dataset_item_id] = answered
+    return keyed
+
+
+def _answer(answered: _Answered, fields: Sequence[str]) -> dict[str, Any]:
+    if missing := [f for f in fields if f not in answered.output]:
+        msg = (
+            f"The candidate's answer to dataset item {answered.dataset_item_id} has no "
+            f"{missing}; it has {sorted(answered.output)}. Name the fields to "
+            "compare with answer_fields."
+        )
+        raise ValueError(msg)
+    return {f: answered.output[f] for f in fields}
+
+
+def _judge_pair(
+    judge: JudgeModel,
+    instructions: str,
+    answered: _Answered,
+    candidate: Mapping[str, Any],
+    reference: Mapping[str, Any],
+) -> PairVerdict:
+    candidate_first = _choose(judge, instructions, answered.item, candidate, reference)
+    reference_first = _choose(judge, instructions, answered.item, reference, candidate)
+    first = {"A": "win", "B": "loss", "tie": "tie"}[candidate_first.better]
+    second = {"A": "loss", "B": "win", "tie": "tie"}[reference_first.better]
+    agreed = first == second
+    reason = (
+        f"Candidate as A: {candidate_first.reason}\n"
+        f"Candidate as B: {reference_first.reason}"
+    )
+    if not agreed:
+        reason = f"The two answer orders disagreed, so this is a tie.\n{reason}"
+    return PairVerdict(
+        dataset_item_id=answered.dataset_item_id,
+        trace_id=answered.trace_id,
+        outcome=cast("PairwiseOutcome", first if agreed else "tie"),
+        reason=reason,
+        orders_agreed=agreed,
+    )
+
+
+def _choose(
+    judge: JudgeModel,
+    instructions: str,
+    item: Mapping[str, Any],
+    a: Mapping[str, Any],
+    b: Mapping[str, Any],
+) -> _PairwiseChoice:
+    request = "\n\n".join(
+        f"{label}:\n{json.dumps(value, ensure_ascii=False, indent=2, default=str)}"
+        for label, value in (("Request", item), ("Answer A", a), ("Answer B", b))
+    )
+    return complete_sync(
+        judge.use_case, request, output_type=_PairwiseChoice, instructions=instructions
+    ).output
 
 
 def main(argv: Sequence[str] | None = None) -> int:
