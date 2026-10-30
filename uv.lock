@@ -5,7 +5,7 @@ resolution-markers = [
     "python_full_version >= '3.15'",
     "python_full_version == '3.14.*'",
     "python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform == 'emscripten'",
-    "(python_full_version < '3.14' and sys_platform != 'emscripten') or (python_full_version < '3.12' and sys_platform == 'emscripten')",
+    "python_full_version < '3.12' or (python_full_version >= '3.12' and python_full_version < '3.14' and sys_platform != 'emscripten')",
 ]
 
 [manifest]
@@ -1963,7 +1963,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.38" },
     { name = "opentelemetry-sdk", specifier = ">=1.38" },
-    { name = "opik", specifier = "==2.2.94" },
+    { name = "opik", specifier = "==2.2.103" },
     { name = "pydantic", specifier = ">=2.14,<3" },
     { name = "pydantic-ai-harness", marker = "extra == 'harness'", specifier = ">=0.60,<0.61" },
     { name = "pydantic-ai-slim", marker = "extra == 'pydantic-ai'", specifier = ">=2.60,<3" },
@@ -2138,7 +2138,7 @@ wheels = [
 
 [[package]]
 name = "opik"
-version = "2.2.94"
+version = "2.2.103"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3-stubs", extra = ["bedrock-runtime"] },
@@ -2162,9 +2162,9 @@ dependencies = [
     { name = "uuid6" },
     { name = "watchfiles" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/eb/56/a433a491c46e15bf56bfd439fb18312e92eb2539345d40c869054be1e644/opik-2.2.94.tar.gz", hash = "sha256:5ad6dab275d23cc2820500ba97a65a077dd818bc592bc9bf59e22abcb5389259", size = 1397362, upload-time = "2026-10-07T14:26:53.644Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/86/3c/6c333820950da7bcad9aa63b80a1145da5ae5122d0bc0d8c0493a52dc682/opik-2.2.103.tar.gz", hash = "sha256:8508e7a283b0adc0fc69afd9091ac700d97d0d1c7b15c7662e9fcb66d33f5036", size = 1407548, upload-time = "2026-10-16T10:17:27.52Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f0/1d/15d3b9fd58e60ae789c3ae33931f679600ea4e107c2c555315ef71f22889/opik-2.2.94-py3-none-any.whl", hash = "sha256:f87cd0e890fbf684915ccd09ca102ebf9861ecb2896e3c605723cea7ffadc262", size = 2134186, upload-time = "2026-10-07T14:26:51.506Z" },
+    { url = "https://files.pythonhosted.org/packages/80/d7/d7cf8dc7d97e29cfe7f4fd890c34d0cd868e3e097b335ae78e7f02939f18/opik-2.2.103-py3-none-any.whl", hash = "sha256:2b157bfd056ccac635881543cb0c02ac37b3415a1c125059d729b27fa9d93ed9", size = 2150458, upload-time = "2026-10-16T10:17:25.661Z" },
 ]
 
 [[package]]
