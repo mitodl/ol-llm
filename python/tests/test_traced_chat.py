@@ -10,6 +10,7 @@ import ol_llm.catalog as catalog_module
 import ol_llm.langchain as langchain_module
 import opik
 import pytest
+from conftest import opik_context_is_empty
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
     CallbackManagerForLLMRun,
@@ -18,7 +19,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.messages.ai import UsageMetadata
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_core.runnables import RunnableConfig, RunnableLambda
+from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from ol_llm import (
     Attribution,
     UseCase,
@@ -113,6 +114,20 @@ class Replies(BaseChatModel):
             yield chunk
 
 
+class Stalls(Replies):
+    """A chat model that streams its first word, then waits until it is cancelled."""
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],  # noqa: ARG002
+        stop: list[str] | None = None,  # noqa: ARG002
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,  # noqa: ARG002
+        **kwargs: Any,  # noqa: ANN401, ARG002
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        yield ChatGenerationChunk(message=AIMessageChunk(content=self.reply))
+        await asyncio.Event().wait()
+
+
 @pytest.fixture(autouse=True)
 def fresh_catalog_checks() -> Generator[None]:
     """Check each test's use cases against the catalog it patches in."""
@@ -141,6 +156,11 @@ def chat(
         )
         traced.record(reply)
     return reply
+
+
+def streaming_graph(model: BaseChatModel) -> Runnable[str, BaseMessage]:
+    """A graph whose root run streams the model's reply, as ``astream`` on a graph."""
+    return RunnableLambda(lambda message: message, name="prepare") | model
 
 
 def spans(trace: TraceModel) -> list[SpanModel]:
@@ -435,3 +455,141 @@ def test_an_embedding_model_is_refused() -> None:
 
     with pytest.raises(ValueError, match="kind 'embedding'"):
         chat(use_case=embedding)
+
+
+def assert_ended(trace: TraceModel) -> None:
+    assert trace.end_time is not None
+    assert [span.name for span in spans(trace) if span.end_time is None] == []
+
+
+def test_a_stream_left_with_break_ends_with_the_block() -> None:
+    async def chat_twice() -> bool:
+        with traced_chat(TUTOR, "ping") as traced:
+            config: RunnableConfig = {"callbacks": [*traced.callbacks]}
+            async for _ in streaming_graph(Replies(reply="a b c")).astream(
+                "ping", config
+            ):
+                break
+            traced.record("a")
+        left_empty = opik_context_is_empty()
+        chat()
+        return left_empty
+
+    with opik.record_traces_locally() as storage:
+        assert asyncio.run(chat_twice())
+        first, second = storage.trace_trees
+
+    assert_ended(first)
+    assert first.output == {"output": "a"}
+    [root] = first.spans
+    assert root.output == {"output": "a"}
+    [sequence] = root.spans
+    assert sequence.output is None
+    assert [span.name for span in sequence.spans] == ["prepare", "Replies"]
+    # The abandoned stream is closed after the trace ended, and not recorded.
+    assert [span.name for span in spans(first) if span.error_info] == []
+    assert_ended(second)
+    assert [span.name for span in second.spans] == ["tutor"]
+
+
+def test_a_stream_left_with_an_exception_ends_with_the_block_recording_it() -> None:
+    closed = "socket closed"
+
+    async def fail() -> None:
+        with traced_chat(TUTOR, "ping") as traced:
+            config: RunnableConfig = {"callbacks": [*traced.callbacks]}
+            async for _ in streaming_graph(Replies()).astream("ping", config):
+                raise ProviderError(closed)
+
+    async def fail_then_chat() -> bool:
+        with pytest.raises(ProviderError, match=closed):
+            await fail()
+        left_empty = opik_context_is_empty()
+        chat()
+        return left_empty
+
+    with opik.record_traces_locally() as storage:
+        assert asyncio.run(fail_then_chat())
+        failed, second = storage.trace_trees
+
+    assert_ended(failed)
+    assert failed.error_info is not None
+    assert failed.error_info["exception_type"] == "ProviderError"
+    errors = {span.name: span.error_info for span in spans(failed) if span.error_info}
+    assert set(errors) == {"tutor", "RunnableSequence", "Replies"}
+    assert {error["exception_type"] for error in errors.values()} == {"ProviderError"}
+    assert_ended(second)
+    assert [span.name for span in second.spans] == ["tutor"]
+
+
+def test_a_cancelled_stream_ends_with_the_block() -> None:
+    left_empty: list[bool] = []
+
+    async def cancel() -> None:
+        entered = asyncio.Event()
+
+        async def streaming() -> None:
+            try:
+                with traced_chat(TUTOR, "ping") as traced:
+                    config: RunnableConfig = {"callbacks": [*traced.callbacks]}
+                    async for _ in streaming_graph(Stalls()).astream("ping", config):
+                        entered.set()
+            except asyncio.CancelledError:
+                left_empty.append(opik_context_is_empty())
+                raise
+
+        task = asyncio.create_task(streaming())
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    with opik.record_traces_locally() as storage:
+        asyncio.run(cancel())
+        [trace] = storage.trace_trees
+
+    assert left_empty == [True]
+    assert_ended(trace)
+    # As a cancelled run's: the root trace closes without an error.
+    assert trace.error_info is None
+    errors = {
+        span.name: span.error_info["exception_type"]
+        for span in spans(trace)
+        if span.error_info
+    }
+    assert errors == {"RunnableSequence": "CancelledError", "Stalls": "CancelledError"}
+
+
+def test_without_content_an_error_that_is_no_exception_keeps_its_type_and_frames() -> (
+    None
+):
+    tracing.reset()
+    configure_tracing(TracingConfig(include_content=False))
+
+    def refuse(message: str) -> str:
+        echoed = f"the provider echoed: secret text {message}"
+        raise ProviderError(echoed)
+
+    def agent(message: str) -> str:
+        # A cancellation chained to an error whose message echoes the prompt.
+        try:
+            return refuse(message)
+        except ProviderError as exc:
+            raise asyncio.CancelledError from exc
+
+    def cancelled_chat() -> None:
+        with traced_chat(TUTOR, "ping") as traced:
+            RunnableLambda(agent, name="agent").invoke(
+                "ping", {"callbacks": [*traced.callbacks]}
+            )
+
+    with opik.record_traces_locally() as storage:
+        with pytest.raises(asyncio.CancelledError):
+            cancelled_chat()
+        [trace] = storage.trace_trees
+
+    [error] = [span.error_info for span in spans(trace) if span.error_info]
+    assert error["exception_type"] == "CancelledError"
+    assert error.get("message") is None
+    assert error["traceback"]
+    assert "secret text" not in repr(trace)

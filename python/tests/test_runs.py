@@ -8,7 +8,12 @@ from typing import Any
 
 import opik
 import pytest
-from conftest import GEMINI, PromptLibrary, assert_error_kept_without_content
+from conftest import (
+    GEMINI,
+    PromptLibrary,
+    assert_error_kept_without_content,
+    opik_context_is_empty,
+)
 from ol_llm import (
     Attribution,
     LLMInvalidOutput,
@@ -32,7 +37,6 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
-from opik import context_storage
 from pydantic import BaseModel
 from pydantic_ai import Agent
 from pydantic_ai.capabilities import Instrumentation
@@ -88,13 +92,6 @@ def stalling(entered: asyncio.Event) -> FunctionModel:
         raise AssertionError  # pragma: no cover
 
     return FunctionModel(stall)
-
-
-def opik_context_is_empty() -> bool:
-    return (
-        context_storage.get_trace_data() is None
-        and context_storage.span_data_stack_empty()
-    )
 
 
 def recording(seen: list[AgentInfo]) -> FunctionModel:

@@ -221,7 +221,7 @@ def _model_tags(use_case: UseCase) -> tuple[str, ...]:
     return status_tags([embedding_entry(use_case)])
 
 
-def error_info(error: Exception, *, content: bool) -> ErrorInfoDict:
+def error_info(error: BaseException, *, content: bool) -> ErrorInfoDict:
     """Return what a trace or span records about an error.
 
     Without content the message is left out, and the traceback keeps only where

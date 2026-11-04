@@ -26,7 +26,8 @@ from langchain_core.messages.ai import UsageMetadata, add_usage
 from langchain_core.outputs import ChatGeneration, LLMResult
 from langchain_core.runnables.graph import Graph
 from langchain_core.tracers.schemas import Run
-from opik import opik_context
+from opik import context_storage, opik_context
+from opik.api_objects.span import SpanData
 from opik.integrations.langchain import OpikTracer
 from opik.types import DistributedTraceHeadersDict
 
@@ -82,6 +83,10 @@ def traced_chat(
     names that model. The block's exception passes through unchanged and the trace
     records it. Inputs, outputs, and error messages are recorded only when
     ``include_content`` is on; without it an error keeps its type and frames.
+
+    However the block exits, e.g. a ``break`` out of the stream or a cancelled task,
+    the runs it left open end with it and the caller's Opik context is left as the
+    block found it.
 
     The trace is the current Opik trace's child, or a new root trace. The runs
     attach to it whatever thread or task LangChain calls the callbacks from.
@@ -139,7 +144,12 @@ def traced_chat(
             environment=root.environment,
             metadata=dict(metadata or {}),
         )
-        yield ChatTrace(callbacks=(tracer,), output=output)
+        try:
+            yield ChatTrace(callbacks=(tracer,), output=output)
+        except BaseException as exc:
+            tracer.close(exc)
+            raise
+        tracer.close(None)
 
 
 class ChatTracer(OpikTracer):
@@ -151,6 +161,11 @@ class ChatTracer(OpikTracer):
     gives chat spans the catalog's model and provider and LangChain's token usage,
     puts the root trace's environment on every span, and leaves content out when
     ``include_content`` is off.
+
+    Opik's tracer pushes each run's span onto the Opik context of the task that
+    started the run, which for a stream is the caller's, so a ``@track`` function in
+    a node nests under it. ``close`` ends the block's spans and removes them from
+    that context.
     """
 
     def __init__(
@@ -173,10 +188,53 @@ class ChatTracer(OpikTracer):
         super().__init__(
             metadata=metadata, project_name=project_name, distributed_headers=parent
         )
+        self._parent = parent
         self._model, self._provider = _opik_names(use_case.model)
         self._sink = _SpanSink(
             environment=environment, content=include_content(), pending={}
         )
+        self._started: list[SpanData] = []
+        self._closed = False
+
+    def close(self, error: BaseException | None) -> None:
+        """End the runs the block left open and stop recording runs.
+
+        Called from the task that entered the block, before the root trace ends. A
+        block that exits mid-stream leaves the stream's runs open: LangChain ends
+        them when the abandoned stream is closed, if ever, after the root trace
+        has ended. Even then Opik's tracer drops a run's span once the run's root
+        run ends, so a cancelled stream's chat model run, which ends after the
+        graph's, never sends its span ended. So every span the tracer started and
+        did not end ends here, recording the error that ended the block, and the
+        tracer ignores later callbacks, which would send a span a second time. The
+        spans the runs' start callbacks pushed onto this context are removed,
+        leaving the root span on top for ``trace_scope`` to end.
+
+        :param error: what the block raised, if anything.
+        """
+        self._closed = True
+        for span in self._started:
+            if span.end_time is None:
+                span.init_end_time()
+                if error is not None:
+                    span.update(
+                        error_info=error_info(error, content=self._sink.content)
+                    )
+                self._sink.__internal_api__span__(**span.as_parameters)
+        context_storage.trim_span_data_stack_to_certain_span(
+            self._parent["opik_parent_span_id"]
+        )
+
+    def _skip_tracking(self) -> bool:
+        return self._closed or super()._skip_tracking()
+
+    def _emit_start_span(self, span_data: SpanData) -> None:
+        self._started.append(span_data)
+        super()._emit_start_span(span_data)
+
+    def _persist_run(self, run: Run) -> None:
+        if not self._closed:
+            super()._persist_run(run)
 
     @property
     def _opik_client(self) -> opik.Opik:
@@ -235,11 +293,12 @@ class ChatTracer(OpikTracer):
         return super().on_retriever_error(error, run_id=run_id, **kwargs)
 
     def _pend_error(self, run_id: UUID, error: BaseException) -> None:
-        # Opik's tracer records every error as type "Exception" with LangChain's
-        # formatted traceback, which ends with the message.
-        if isinstance(error, Exception):
-            info = error_info(error, content=self._sink.content)
-            self._pend(run_id, {"error_info": info})
+        # Opik's tracer records every error, a cancellation included, as type
+        # "Exception" with LangChain's formatted traceback, which ends with the
+        # message and repeats those of chained exceptions.
+        self._pend(
+            run_id, {"error_info": error_info(error, content=self._sink.content)}
+        )
 
     def _pend(self, run_id: UUID, fields: dict[str, Any]) -> None:
         """Hold fields for the run's span until the tracer sends it, ended."""

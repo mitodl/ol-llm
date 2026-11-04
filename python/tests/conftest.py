@@ -21,6 +21,7 @@ from opentelemetry.sdk.trace.export import SpanExporter
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
+from opik import context_storage
 from opik.api_objects.prompt import prompt_cache
 from opik.message_processing.emulation.models import TraceModel
 from pydantic_ai.messages import (
@@ -225,6 +226,13 @@ TRACING = TracingConfig()
 
 # A frame of a traceback that names where each frame is and quotes nothing.
 _FRAME = re.compile(r'  File ".+", line \d+, in \S+')
+
+
+def opik_context_is_empty() -> bool:
+    return (
+        context_storage.get_trace_data() is None
+        and context_storage.span_data_stack_empty()
+    )
 
 
 def assert_error_kept_without_content(
