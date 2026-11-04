@@ -197,7 +197,7 @@ class TracedCall:
             # left as it was.
             _TRACKER._after_call(  # noqa: SLF001
                 output=None,
-                error_info=_error_info(exc, content=content)
+                error_info=error_info(exc, content=content)
                 if isinstance(exc, Exception)
                 else None,
                 capture_output=content,
@@ -221,8 +221,8 @@ def _model_tags(use_case: UseCase) -> tuple[str, ...]:
     return status_tags([embedding_entry(use_case)])
 
 
-def _error_info(error: Exception, *, content: bool) -> ErrorInfoDict:
-    """Return what the root trace records about an error.
+def error_info(error: Exception, *, content: bool) -> ErrorInfoDict:
+    """Return what a trace or span records about an error.
 
     Without content the message is left out, and the traceback keeps only where
     each frame is: the formatted one ends with the message, repeats those of

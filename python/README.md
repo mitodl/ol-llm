@@ -57,7 +57,8 @@ and Google default credential chains, and so on). Operators can change a use cas
 without a release, e.g. `OL_LLM_CONTENT_SUMMARY_TIMEOUT_SECONDS=120`.
 
 Call sites not built on PydanticAI (LangGraph, a plain SDK) apply the same numbers with
-`ol_llm.resolve_policy(use_case)`, which needs no extra. Their embedding requests go through
+`ol_llm.resolve_policy(use_case)`, which needs no extra. Their chat calls are traced with
+`ol_llm.traced_chat` (see Chat calls on LangChain) and their embedding requests with
 `ol_llm.traced_embedding` (see Embeddings).
 
 Run the agent with `ol_llm.run`, or `ol_llm.run_sync` in a Celery task or Dagster asset:
@@ -342,6 +343,49 @@ already are, so a new model or size adds vectors beside the old ones, and the ap
 switches its queries over once everything is re-embedded. The catalog entry records each
 embedding model's default length, e.g. `ol_llm.load_catalog().get(model_id).dimensions` to
 size a collection without an embedding call.
+
+### Chat calls on LangChain
+
+A call site built on LangChain or LangGraph keeps its own chat model and checks it against
+the catalog with `ol_llm.check_chat_model(use_case)` where it builds it. That runs the checks
+`build_model` runs: a retired model or an embedding model raises, and an unlisted or deprecated
+one logs the warning once per process and returns its `model_status` tags. Each chat turn runs
+inside `ol_llm.traced_chat`, which needs the `langchain` extra:
+
+```python
+TUTOR = ol_llm.UseCase(
+    app="learn-ai", name="tutor", profile="request", model="openai:gpt-4o-mini"
+)
+
+with ol_llm.traced_chat(
+    TUTOR,
+    message,
+    attribution=ol_llm.Attribution(user_id=user.global_id, thread_id=thread_id),
+    graph=agent.get_graph(xray=True),
+) as chat:
+    config = {"callbacks": [*chat.callbacks]}
+    reply = "".join(
+        [
+            str(chunk.content)
+            async for chunk, _ in agent.astream(state, config, stream_mode="messages")
+        ]
+    )
+    chat.record(reply)
+```
+
+It runs the catalog check, opens the root trace `run` opens (the same name, project, tags,
+metadata, thread, and input), and yields LangChain callbacks that record the graph's runs as
+spans of that trace. Pass them in the graph's `config`, or set them on the chat model
+(`model.callbacks`) when another library runs the graph. The runs attach to the trace from any
+thread or task. Every chat model span names the use case's model as the catalog's
+`opik_model` and `opik_provider` give it, with the token usage LangChain reports in
+`usage_metadata`, so Opik prices it whichever chat model class made the call; `ChatLiteLLM`'s
+usage is not read by Opik's own LangChain tracer. The client must call the use case's model.
+`graph` is drawn in Opik's agent graph view; `metadata` goes on the spans of the runs, not
+the root trace. `record` sets the trace's output. Retries, timeouts (from `resolve_policy`),
+and errors stay with the client; the block's exception passes through unchanged and the trace
+records it. Without `OL_LLM_TRACE_CONTENT`, no span keeps its input or output and an error
+keeps its type and frames.
 
 ### Batch
 
@@ -642,8 +686,8 @@ startup, before anything else touches the Opik SDK (the SDK reads the Keycloak h
 first builds its HTTP client) and before building agents (an agent keeps the instrumentation
 it was built with). Once tracing has been used, a different configuration raises
 `RuntimeError` and the one in effect stays. Short-lived processes should call
-`ol_llm.tracing.flush()` before they exit. An app that registers its own Keycloak hook on the SDK (learn-ai's
-`opik_keycloak_auth`) should drop it when it adopts the library.
+`ol_llm.tracing.flush()` before they exit. An app that registers its own Keycloak hook on the
+SDK should drop it when it adopts the library.
 
 ### Testing
 
@@ -663,6 +707,7 @@ else is opt-in:
 | Extra | Installs | For |
 | --- | --- | --- |
 | `pydantic-ai` | `pydantic-ai-slim` | The default construction path for agents and single calls |
+| `langchain` | `langchain-core` | `traced_chat`, for call sites that keep their LangChain or LangGraph chat models |
 | `openai`, `anthropic`, `bedrock`, `google`, `mistral` | the matching `pydantic-ai-slim` extra | A provider SDK; each also installs PydanticAI |
 | `harness` | `pydantic-ai-harness` | In-session memory, compaction, and conversation search. Each harness release pins PydanticAI exactly |
 | `memory` | `hindsight-client` | The shared memory service's client. Provisional: the backend is still being evaluated |
