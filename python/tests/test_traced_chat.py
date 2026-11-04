@@ -114,6 +114,29 @@ class Replies(BaseChatModel):
             yield chunk
 
 
+class Choices(Replies):
+    """A chat model that answers with two choices, each carrying the response's usage.
+
+    As langchain-openai and ChatLiteLLM do for a request with ``n=2``.
+    """
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],  # noqa: ARG002
+        stop: list[str] | None = None,  # noqa: ARG002
+        run_manager: CallbackManagerForLLMRun | None = None,  # noqa: ARG002
+        **kwargs: Any,  # noqa: ANN401, ARG002
+    ) -> ChatResult:
+        return ChatResult(
+            generations=[
+                ChatGeneration(
+                    message=AIMessage(content=reply, usage_metadata=self.usage)
+                )
+                for reply in ("pong", "pang")
+            ]
+        )
+
+
 class Stalls(Replies):
     """A chat model that streams its first word, then waits until it is cancelled."""
 
@@ -455,6 +478,14 @@ def test_an_embedding_model_is_refused() -> None:
 
     with pytest.raises(ValueError, match="kind 'embedding'"):
         chat(use_case=embedding)
+
+
+def test_a_chat_reports_one_responses_usage_for_several_choices() -> None:
+    with opik.record_traces_locally() as storage:
+        chat(Choices())
+        [trace] = storage.trace_trees
+
+    assert llm_span(trace).usage == OPENAI_USAGE
 
 
 def assert_ended(trace: TraceModel) -> None:

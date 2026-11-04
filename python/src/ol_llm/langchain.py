@@ -354,15 +354,21 @@ def _usage(response: LLMResult) -> dict[str, Any] | None:
 
     The SDK reads that shape for any provider. LangChain's ``usage_metadata``
     counts cache reads in ``input_tokens``, as OpenAI's ``prompt_tokens`` does.
+    Each prompt's generations are the choices of one response, and a client that
+    asks for several (``n``) puts the whole response's usage on every choice, so
+    only the first counts.
     """
     total: UsageMetadata | None = None
     for generations in response.generations:
-        for generation in generations:
-            if not isinstance(generation, ChatGeneration):
-                continue
-            message = generation.message
-            if isinstance(message, AIMessage) and message.usage_metadata:
-                total = add_usage(total, message.usage_metadata)
+        usages = (
+            generation.message.usage_metadata
+            for generation in generations
+            if isinstance(generation, ChatGeneration)
+            and isinstance(generation.message, AIMessage)
+            and generation.message.usage_metadata
+        )
+        if (first := next(usages, None)) is not None:
+            total = add_usage(total, first)
     if total is None:
         return None
     usage: dict[str, Any] = {
