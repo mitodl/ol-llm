@@ -380,7 +380,8 @@ spans of that trace. Pass them in the graph's `config`, or set them on the chat 
 thread or task. Every chat model span names the use case's model as the catalog's
 `opik_model` and `opik_provider` give it, with the token usage LangChain reports in
 `usage_metadata`, so Opik prices it whichever chat model class made the call; `ChatLiteLLM`'s
-usage is not read by Opik's own LangChain tracer. The client must call the use case's model.
+usage is not read by Opik's own LangChain tracer. The client must call the use case's model: a
+fallback the client tries when the primary fails is still named, and priced, as the primary.
 `graph` is drawn in Opik's agent graph view; `metadata` goes on the spans of the runs, not
 the root trace. `record` sets the trace's output. Retries, timeouts (from `resolve_policy`),
 and errors stay with the client; the block's exception passes through unchanged and the trace

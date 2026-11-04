@@ -80,9 +80,11 @@ def traced_chat(
     """Trace the LangChain runs of one chat turn under the entry points' root trace.
 
     Every chat model run the callbacks see must call the use case's model: its span
-    names that model. The block's exception passes through unchanged and the trace
-    records it. Inputs, outputs, and error messages are recorded only when
-    ``include_content`` is on; without it an error keeps its type and frames.
+    names that model. A fallback the client tries when the primary fails is still
+    named, and priced, as the use case's model. The block's exception passes through
+    unchanged and the trace records it. Inputs, outputs, and error messages are
+    recorded only when ``include_content`` is on; without it an error keeps its type
+    and frames.
 
     However the block exits, e.g. a ``break`` out of the stream or a cancelled task,
     the runs it left open end with it and the caller's Opik context is left as the
@@ -160,7 +162,8 @@ class ChatTracer(OpikTracer):
     to it instead. Each span the tracer sends passes through ``_SpanSink``, which
     gives chat spans the catalog's model and provider and LangChain's token usage,
     puts the root trace's environment on every span, and leaves content out when
-    ``include_content`` is off.
+    ``include_content`` is off. Each chat span names the use case's model, even when
+    a fallback served the call.
 
     Opik's tracer pushes each run's span onto the Opik context of the task that
     started the run, which for a stream is the caller's, so a ``@track`` function in
