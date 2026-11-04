@@ -40,6 +40,9 @@ from ol_llm.tracing import enabled, include_content
 GRAPH_METADATA_KEY = "_opik_graph_definition"
 """The trace metadata key Opik's "Show Agent Graph" view reads."""
 
+CUT_OFF_METADATA_KEY = "cut_off"
+"""Set on the span of a run still open when the ``traced_chat`` block exited."""
+
 
 def _root_input(user_prompt: str | None) -> None:
     """Stand in for a traced function, so the trace input matches ``run``'s."""
@@ -87,8 +90,8 @@ def traced_chat(
     and frames.
 
     However the block exits, e.g. a ``break`` out of the stream or a cancelled task,
-    the runs it left open end with it and the caller's Opik context is left as the
-    block found it.
+    the runs it left open end with it, marked ``cut_off`` rather than failed, and
+    the caller's Opik context is left as the block found it.
 
     The trace is the current Opik trace's child, or a new root trace. The runs
     attach to it whatever thread or task LangChain calls the callbacks from.
@@ -148,10 +151,8 @@ def traced_chat(
         )
         try:
             yield ChatTrace(callbacks=(tracer,), output=output)
-        except BaseException as exc:
-            tracer.close(exc)
-            raise
-        tracer.close(None)
+        finally:
+            tracer.close()
 
 
 class ChatTracer(OpikTracer):
@@ -199,7 +200,7 @@ class ChatTracer(OpikTracer):
         self._started: list[SpanData] = []
         self._closed = False
 
-    def close(self, error: BaseException | None) -> None:
+    def close(self) -> None:
         """End the runs the block left open and stop recording runs.
 
         Called from the task that entered the block, before the root trace ends. A
@@ -208,21 +209,17 @@ class ChatTracer(OpikTracer):
         has ended. Even then Opik's tracer drops a run's span once the run's root
         run ends, so a cancelled stream's chat model run, which ends after the
         graph's, never sends its span ended. So every span the tracer started and
-        did not end ends here, recording the error that ended the block, and the
-        tracer ignores later callbacks, which would send a span a second time. The
-        spans the runs' start callbacks pushed onto this context are removed,
-        leaving the root span on top for ``trace_scope`` to end.
-
-        :param error: what the block raised, if anything.
+        did not end ends here, marked ``CUT_OFF_METADATA_KEY``, and the tracer
+        ignores later callbacks, which would send a span a second time. The spans
+        record no error: what ended the block, e.g. the caller failing to send a
+        chunk, is the root trace's, not the runs'. The spans the runs' start
+        callbacks pushed onto this context are removed, leaving the root span on
+        top for ``trace_scope`` to end.
         """
         self._closed = True
         for span in self._started:
             if span.end_time is None:
-                span.init_end_time()
-                if error is not None:
-                    span.update(
-                        error_info=error_info(error, content=self._sink.content)
-                    )
+                span.init_end_time().update(metadata={CUT_OFF_METADATA_KEY: True})
                 self._sink.__internal_api__span__(**span.as_parameters)
         context_storage.trim_span_data_stack_to_certain_span(
             self._parent["opik_parent_span_id"]
@@ -232,6 +229,10 @@ class ChatTracer(OpikTracer):
         return self._closed or super()._skip_tracking()
 
     def _emit_start_span(self, span_data: SpanData) -> None:
+        # Named from the start, so a chat span the block cuts off, which never
+        # sees on_llm_end, still names its model.
+        if span_data.type == "llm":
+            span_data.update(model=self._model, provider=self._provider)
         self._started.append(span_data)
         super()._emit_start_span(span_data)
 

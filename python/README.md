@@ -386,7 +386,9 @@ fallback the client tries when the primary fails is still named, and priced, as 
 the root trace. `record` sets the trace's output. Retries, timeouts (from `resolve_policy`),
 and errors stay with the client; the block's exception passes through unchanged and the trace
 records it. A block left mid-stream (a `break`, an exception, a cancelled task) ends the runs
-it left open, and the next `traced_chat` in the same task opens a trace of its own. Without
+it left open with `cut_off` in their metadata and no error, since the block's exception is the
+root trace's; a cut-off chat span still names its model, without usage. The next `traced_chat`
+in the same task opens a trace of its own. Without
 `OL_LLM_TRACE_CONTENT`, no span keeps its input or output and an error keeps its type and frames.
 
 ### Batch

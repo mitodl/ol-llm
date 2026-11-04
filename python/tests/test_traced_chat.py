@@ -29,7 +29,7 @@ from ol_llm import (
     tracing,
 )
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
-from ol_llm.langchain import GRAPH_METADATA_KEY
+from ol_llm.langchain import CUT_OFF_METADATA_KEY, GRAPH_METADATA_KEY
 from ol_llm.models import build_agent, override_models
 from ol_llm.testing import tracing_disabled
 from ol_llm.tracing import TracingConfig, configure_tracing
@@ -493,6 +493,13 @@ def assert_ended(trace: TraceModel) -> None:
     assert [span.name for span in spans(trace) if span.end_time is None] == []
 
 
+def assert_cut_off(span: SpanModel) -> None:
+    """The block cut the span's run off: it names its model and blames nothing."""
+    assert (span.metadata or {}).get(CUT_OFF_METADATA_KEY) is True
+    assert span.error_info is None
+    assert not span.usage
+
+
 def test_a_stream_left_with_break_ends_with_the_block() -> None:
     async def chat_twice() -> bool:
         with traced_chat(TUTOR, "ping") as traced:
@@ -517,6 +524,10 @@ def test_a_stream_left_with_break_ends_with_the_block() -> None:
     [sequence] = root.spans
     assert sequence.output is None
     assert [span.name for span in sequence.spans] == ["prepare", "Replies"]
+    assert_cut_off(sequence)
+    model = llm_span(first)
+    assert_cut_off(model)
+    assert (model.provider, model.model) == ("openai", "gpt-4o-mini")
     # The abandoned stream is closed after the trace ended, and not recorded.
     assert [span.name for span in spans(first) if span.error_info] == []
     assert_ended(second)
@@ -546,9 +557,13 @@ def test_a_stream_left_with_an_exception_ends_with_the_block_recording_it() -> N
     assert_ended(failed)
     assert failed.error_info is not None
     assert failed.error_info["exception_type"] == "ProviderError"
+    # The caller's error is the root's; the runs it cut off are not blamed for it.
     errors = {span.name: span.error_info for span in spans(failed) if span.error_info}
-    assert set(errors) == {"tutor", "RunnableSequence", "Replies"}
-    assert {error["exception_type"] for error in errors.values()} == {"ProviderError"}
+    assert set(errors) == {"tutor"}
+    assert errors["tutor"]["exception_type"] == "ProviderError"
+    model = llm_span(failed)
+    assert_cut_off(model)
+    assert (model.provider, model.model) == ("openai", "gpt-4o-mini")
     assert_ended(second)
     assert [span.name for span in second.spans] == ["tutor"]
 
@@ -583,12 +598,17 @@ def test_a_cancelled_stream_ends_with_the_block() -> None:
     assert_ended(trace)
     # As a cancelled run's: the root trace closes without an error.
     assert trace.error_info is None
+    # LangChain records the cancellation on the graph's run, which it reached; the
+    # chat model's run it never ended is cut off.
     errors = {
         span.name: span.error_info["exception_type"]
         for span in spans(trace)
         if span.error_info
     }
-    assert errors == {"RunnableSequence": "CancelledError", "Stalls": "CancelledError"}
+    assert errors == {"RunnableSequence": "CancelledError"}
+    model = llm_span(trace)
+    assert_cut_off(model)
+    assert (model.provider, model.model) == ("openai", "gpt-4o-mini")
 
 
 def test_without_content_an_error_that_is_no_exception_keeps_its_type_and_frames() -> (
