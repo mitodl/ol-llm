@@ -644,3 +644,35 @@ def test_without_content_an_error_that_is_no_exception_keeps_its_type_and_frames
     assert error.get("message") is None
     assert error["traceback"]
     assert "secret text" not in repr(trace)
+
+
+def test_a_run_another_thread_starts_as_the_block_closes_still_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The worker's run passes the tracer's admission check, then the block closes
+    # before the run's span joins the tracer's started spans.
+    admitted = threading.Event()
+    closed = threading.Event()
+    emit = langchain_module.ChatTracer._emit_start_span  # noqa: SLF001
+
+    def start_late(tracer: langchain_module.ChatTracer, span: Any) -> None:  # noqa: ANN401
+        if span.type == "llm":
+            admitted.set()
+            assert closed.wait(5)
+        emit(tracer, span)
+
+    monkeypatch.setattr(langchain_module.ChatTracer, "_emit_start_span", start_late)
+    with opik.record_traces_locally() as storage:
+        with traced_chat(TUTOR, "ping") as traced:
+            config: RunnableConfig = {"callbacks": [*traced.callbacks]}
+            worker = threading.Thread(target=Replies().invoke, args=("ping", config))
+            worker.start()
+            assert admitted.wait(5)
+        closed.set()
+        worker.join(5)
+        [trace] = storage.trace_trees
+
+    assert_ended(trace)
+    model = llm_span(trace)
+    assert_cut_off(model)
+    assert (model.provider, model.model) == ("openai", "gpt-4o-mini")

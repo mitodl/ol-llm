@@ -13,6 +13,7 @@ reports usage Opik's own LangChain extractors do not read). Retries, timeouts
 Needs the ``langchain`` extra.
 """
 
+import threading
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -199,6 +200,10 @@ class ChatTracer(OpikTracer):
         )
         self._started: list[SpanData] = []
         self._closed = False
+        # Held while close scans the started spans and while a run's span joins
+        # them, so a run admitted on another thread just before close is either
+        # ended by close or ends itself.
+        self._lock = threading.Lock()
 
     def close(self) -> None:
         """End the runs the block left open and stop recording runs.
@@ -216,14 +221,18 @@ class ChatTracer(OpikTracer):
         callbacks pushed onto this context are removed, leaving the root span on
         top for ``trace_scope`` to end.
         """
-        self._closed = True
-        for span in self._started:
-            if span.end_time is None:
-                span.init_end_time().update(metadata={CUT_OFF_METADATA_KEY: True})
-                self._sink.__internal_api__span__(**span.as_parameters)
+        with self._lock:
+            self._closed = True
+            for span in self._started:
+                if span.end_time is None:
+                    self._cut_off(span)
         context_storage.trim_span_data_stack_to_certain_span(
             self._parent["opik_parent_span_id"]
         )
+
+    def _cut_off(self, span: SpanData) -> None:
+        span.init_end_time().update(metadata={CUT_OFF_METADATA_KEY: True})
+        self._sink.__internal_api__span__(**span.as_parameters)
 
     def _skip_tracking(self) -> bool:
         return self._closed or super()._skip_tracking()
@@ -233,8 +242,14 @@ class ChatTracer(OpikTracer):
         # sees on_llm_end, still names its model.
         if span_data.type == "llm":
             span_data.update(model=self._model, provider=self._provider)
-        self._started.append(span_data)
-        super()._emit_start_span(span_data)
+        with self._lock:
+            if self._closed:
+                # Admitted before close, started after: its end callbacks are
+                # skipped, so it ends here.
+                self._cut_off(span_data)
+                return
+            self._started.append(span_data)
+            super()._emit_start_span(span_data)
 
     def _persist_run(self, run: Run) -> None:
         if not self._closed:
