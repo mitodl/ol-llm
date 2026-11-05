@@ -6,6 +6,14 @@ All notable changes to ol-llm are recorded here. The format follows
 
 <!-- scriv-insert-here -->
 
+<a id='changelog-0.0.8'></a>
+## [0.0.8] - 2026-11-05
+
+### Added
+
+- `ol_llm.traced_chat` traces one chat turn of a call site that keeps its LangChain or LangGraph chat model, under the root trace `run` opens: the §4 attribution fields, the catalog check, and a `model_status` tag for a deprecated or unlisted model. It yields LangChain callbacks that record the graph's runs as spans of that trace from any thread or task, retrievers included (Opik's own tracer records no retriever span and drops the runs nested in one). Each chat model span names the use case's model as the catalog's Opik price table names it, with the token usage LangChain reports in the shape Opik prices that provider from (Anthropic's, Bedrock's and Google's own, cache reads and writes included; OpenAI's otherwise), so Opik prices `ChatLiteLLM` calls too. A block left mid-stream (a `break`, an exception, a cancelled task) ends the runs it left open, marked `cut_off` rather than failed, and leaves the caller's Opik context as it found it. `graph` puts the agent graph in Opik's graph view and `metadata` goes on the runs' spans. Without `OL_LLM_TRACE_CONTENT` the spans keep no input or output and an error keeps its type and frames. Needs the new `langchain` extra (#44).
+- `ol_llm.check_chat_model(use_case)` runs `build_model`'s catalog checks for a chat model the call site builds itself: a retired or embedding model raises, and an unlisted or deprecated one warns once per process. It returns the `model_status` tags (#44).
+
 <a id='changelog-0.0.7'></a>
 ## [0.0.7] - 2026-10-29
 
