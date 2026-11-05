@@ -46,6 +46,8 @@ dependencies = [
 [project.optional-dependencies]
 # The default construction path for agents and single calls.
 pydantic-ai = ["pydantic-ai-slim>=2.60,<3"]
+# traced_chat, for call sites that keep their LangChain or LangGraph chat models.
+langchain = ["langchain-core>=1.1,<2"]
 # Provider SDKs, each through PydanticAI's own extra, so a provider extra also
 # installs PydanticAI.
 anthropic = ["pydantic-ai-slim[anthropic]>=2.60,<3"]

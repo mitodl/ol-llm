@@ -10,7 +10,8 @@ that retires a model fails the CI of every app still naming it. ``price_rules``
 exports the prices as the Prometheus recording rules the spend dashboard and alerts
 join token counters against; a model the catalog does not list has no price there.
 
-Needs no extra: call sites not built on PydanticAI check their ids here too.
+Needs no extra: call sites not built on PydanticAI check their ids here too, and
+their use cases with ``check_chat_model``.
 """
 
 import argparse
@@ -286,6 +287,25 @@ def status_tags(entries: Iterable[CatalogEntry | None]) -> tuple[str, ...]:
         elif entry.status == "deprecated":
             statuses.add("deprecated")
     return tuple(f"model_status:{status}" for status in sorted(statuses))
+
+
+@cache
+def check_chat_model(use_case: UseCase) -> tuple[str, ...]:
+    """Check a chat use case's models against the catalog, as ``build_model`` does.
+
+    For call sites that build their own chat client, e.g. a LangChain chat model,
+    at the point they build it. ``traced_chat`` runs it too and tags its trace with
+    the result. A rejected use case raises every time; an unlisted or deprecated
+    model warns once per process.
+
+    :param use_case: the call site.
+    :returns: the ``model_status`` trace tags, from ``status_tags``.
+    :rtype: tuple[str, ...]
+    :raises ValueError: on a model id not in ``provider:model`` form, that is
+        retired, or that the catalog lists as an embedding model, or fallbacks
+        behind a route that falls back on its own.
+    """
+    return status_tags(catalog_entries(use_case, kind="chat"))
 
 
 def embedding_entry(use_case: UseCase) -> CatalogEntry | None:

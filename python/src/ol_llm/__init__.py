@@ -9,8 +9,8 @@ gets them by importing ol_llm before opik. An explicit value in the environment
 wins over either default.
 
 The model factory, the agent builder, and the run and embedding entry points
-need the ``pydantic-ai`` extra. They are imported on first use, so the base
-package imports without it.
+need the ``pydantic-ai`` extra, and ``traced_chat`` the ``langchain`` extra. They
+are imported on first use, so the base package imports without either.
 """
 
 import os
@@ -40,7 +40,12 @@ from ol_llm.batch import (
     dagster_pool,
     process_batch,
 )
-from ol_llm.catalog import CatalogEntry, check_model_ids, load_catalog
+from ol_llm.catalog import (
+    CatalogEntry,
+    check_chat_model,
+    check_model_ids,
+    load_catalog,
+)
 from ol_llm.errors import (
     LLMBudgetExceeded,
     LLMContentFiltered,
@@ -82,6 +87,7 @@ from ol_llm.tracing import (
 
 if TYPE_CHECKING:
     from ol_llm.embeddings import EmbedResult, embed, embed_sync
+    from ol_llm.langchain import ChatTrace, traced_chat
     from ol_llm.models import agent_over, build_agent, build_model, usage_limits
     from ol_llm.runs import (
         LLMResult,
@@ -97,7 +103,9 @@ if TYPE_CHECKING:
 # The version lives only in python/pyproject.toml, which is what a release bumps.
 __version__ = version("ol-llm")
 
-_PYDANTIC_AI_EXPORTS = {
+_LAZY_EXPORTS = {
+    "ChatTrace": "ol_llm.langchain",
+    "traced_chat": "ol_llm.langchain",
     "EmbedResult": "ol_llm.embeddings",
     "embed": "ol_llm.embeddings",
     "embed_sync": "ol_llm.embeddings",
@@ -114,8 +122,12 @@ _PYDANTIC_AI_EXPORTS = {
     "run_stream": "ol_llm.runs",
     "run_sync": "ol_llm.runs",
 }
-# What the pydantic-ai extra installs that ol_llm.models imports directly.
-_PYDANTIC_AI_MODULES = frozenset({"pydantic_ai", "httpx2"})
+# What each extra installs that the lazily imported modules import directly.
+_EXTRA_MODULES = {
+    "pydantic_ai": "pydantic-ai",
+    "httpx2": "pydantic-ai",
+    "langchain_core": "langchain",
+}
 
 __all__ = [
     "Attribution",
@@ -125,6 +137,7 @@ __all__ = [
     "CallPolicy",
     "CatalogEntry",
     "ChatTemplate",
+    "ChatTrace",
     "Chunk",
     "CircuitBreaker",
     "DegradedReason",
@@ -156,6 +169,7 @@ __all__ = [
     "build_agent",
     "build_model",
     "celery_rate_limit",
+    "check_chat_model",
     "check_model_ids",
     "complete",
     "complete_sync",
@@ -177,6 +191,7 @@ __all__ = [
     "run_stream",
     "run_sync",
     "trace_fields",
+    "traced_chat",
     "traced_embedding",
     "usage_limits",
     "worst_case_seconds",
@@ -184,8 +199,8 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:  # noqa: ANN401
-    """Import the PydanticAI-backed API on first use."""
-    if (module_name := _PYDANTIC_AI_EXPORTS.get(name)) is None:
+    """Import the API that needs an extra on first use."""
+    if (module_name := _LAZY_EXPORTS.get(name)) is None:
         msg = f"module {__name__!r} has no attribute {name!r}"
         raise AttributeError(msg)
     try:
@@ -193,8 +208,8 @@ def __getattr__(name: str) -> Any:  # noqa: ANN401
     except ModuleNotFoundError as exc:
         # Only a missing extra gets the hint; any other import failure is a bug
         # and should surface as itself.
-        if (exc.name or "").partition(".")[0] not in _PYDANTIC_AI_MODULES:
+        if (extra := _EXTRA_MODULES.get((exc.name or "").partition(".")[0])) is None:
             raise
-        msg = f"ol_llm.{name} needs the ol-llm[pydantic-ai] extra: {exc}"
+        msg = f"ol_llm.{name} needs the ol-llm[{extra}] extra: {exc}"
         raise ImportError(msg) from exc
     return getattr(module, name)

@@ -784,6 +784,7 @@ requires-dist = [
     { name = "certifi", specifier = ">=2026.10.19" },
     { name = "hindsight-client", marker = "extra == 'memory'", specifier = ">=0.10,<0.11" },
     { name = "httpx", specifier = ">=0.28" },
+    { name = "langchain-core", marker = "extra == 'langchain'", specifier = ">=1.1,<2" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.38" },
     { name = "opentelemetry-sdk", specifier = ">=1.38" },
     { name = "opik", specifier = "==2.2.94" },
@@ -797,7 +798,7 @@ requires-dist = [
     { name = "pydantic-ai-slim", extras = ["openai"], marker = "extra == 'openai'", specifier = ">=2.60,<3" },
     { name = "requests", specifier = ">=2.32" },
 ]
-provides-extras = ["pydantic-ai", "anthropic", "bedrock", "google", "mistral", "openai", "harness", "memory"]
+provides-extras = ["pydantic-ai", "langchain", "anthropic", "bedrock", "google", "mistral", "openai", "harness", "memory"]
 
 [[package]]
 name = "ol-llm-smoke"
