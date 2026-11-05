@@ -17,6 +17,13 @@ dev = [
 
 [tool.uv]
 package = false
+# Floors for transitive packages with advisories, so a full relock can't resolve
+# a vulnerable version again. Recent litellm releases require filelock<4, and
+# without the floor `uv lock --upgrade` takes 1.108 (the first stable release that
+# allows openai 3) and drops filelock to 3.x (GHSA-v4x8-3wr5-3wq8, fixed only in
+# 4.2.1). pyasn1 comes in through the google
+# extra (GHSA-2qm8-x737-gmw5 and three other decoder DoS advisories).
+constraint-dependencies = ["filelock>=4.2.1", "pyasn1>=0.6.5"]
 
 [tool.uv.workspace]
 members = ["python"]

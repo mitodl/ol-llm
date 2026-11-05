@@ -11,6 +11,10 @@ dependencies = ["ol-llm[pydantic-ai]"]
 
 [tool.uv]
 package = false
+# Not a consumer override. filelock is only reachable through litellm, which is
+# never installed here, but the lockfile still records it, and recent litellm
+# releases require filelock<4, a range inside GHSA-v4x8-3wr5-3wq8.
+constraint-dependencies = ["filelock>=4.2.1"]
 override-dependencies = [
     "boto3-stubs; sys_platform == 'never'",
     "click; sys_platform == 'never'",
