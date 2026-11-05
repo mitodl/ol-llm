@@ -171,6 +171,10 @@ class ChatTracer(OpikTracer):
     started the run, which for a stream is the caller's, so a ``@track`` function in
     a node nests under it. ``close`` ends the block's spans and removes them from
     that context.
+
+    Opik's tracer has no retriever hooks, so it records no retriever span and drops
+    any run nested in one for want of a parent span. This tracer records retrievers
+    as it does tools.
     """
 
     def __init__(
@@ -299,6 +303,18 @@ class ChatTracer(OpikTracer):
         """Record the error as the entry points do."""
         self._pend_error(run_id, error)
         return super().on_tool_error(error, run_id=run_id, **kwargs)
+
+    def _on_retriever_start(self, run: Run) -> None:
+        if not self._skip_tracking():
+            self._process_start_span(run, allow_duplicating_root_span=True)
+
+    def _on_retriever_end(self, run: Run) -> None:
+        if not self._skip_tracking():
+            self._process_end_span(run)
+
+    def _on_retriever_error(self, run: Run) -> None:
+        if not self._skip_tracking():
+            self._process_end_span_with_error(run)
 
     def on_retriever_error(
         self,

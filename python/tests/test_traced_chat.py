@@ -14,11 +14,14 @@ from conftest import opik_context_is_empty
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
     CallbackManagerForLLMRun,
+    CallbackManagerForRetrieverRun,
 )
+from langchain_core.documents import Document
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.messages.ai import UsageMetadata
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.retrievers import BaseRetriever
 from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from ol_llm import (
     Attribution,
@@ -644,6 +647,66 @@ def test_without_content_an_error_that_is_no_exception_keeps_its_type_and_frames
     assert error.get("message") is None
     assert error["traceback"]
     assert "secret text" not in repr(trace)
+
+
+class Lookup(BaseRetriever):
+    """A retriever that asks the model first, as a query-rewriting retriever does."""
+
+    model: BaseChatModel | None = None
+    fail: bool = False
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
+    ) -> list[Document]:
+        if self.fail:
+            message = "index down"
+            raise ProviderError(message)
+        if self.model is not None:
+            self.model.invoke(query, {"callbacks": run_manager.get_child()})
+        return [Document(page_content="doc")]
+
+
+def retrieving_graph(retriever: Lookup) -> RunnableLambda[str, str]:
+    def agent(message: str, config: RunnableConfig) -> str:
+        return retriever.invoke(message, config)[0].page_content
+
+    return RunnableLambda(agent, name="agent")
+
+
+def test_a_retriever_is_a_span_holding_the_runs_it_makes() -> None:
+    with opik.record_traces_locally() as storage:
+        with traced_chat(TUTOR, "ping") as traced:
+            retrieving_graph(Lookup(model=Replies())).invoke(
+                "ping", {"callbacks": [*traced.callbacks]}
+            )
+        [trace] = storage.trace_trees
+
+    assert_ended(trace)
+    [retriever] = [span for span in spans(trace) if span.name == "Lookup"]
+    assert retriever.type == "general"
+    [model] = retriever.spans
+    assert (model.type, model.model) == ("llm", "gpt-4o-mini")
+    assert model.usage == OPENAI_USAGE
+
+
+def test_a_failed_retriever_records_its_error() -> None:
+    with opik.record_traces_locally() as storage:
+        with (
+            pytest.raises(ProviderError),
+            traced_chat(TUTOR, "ping") as traced,
+        ):
+            retrieving_graph(Lookup(fail=True)).invoke(
+                "ping", {"callbacks": [*traced.callbacks]}
+            )
+        [trace] = storage.trace_trees
+
+    assert_ended(trace)
+    errors = {
+        span.name: span.error_info["exception_type"]
+        for span in spans(trace)
+        if span.error_info
+    }
+    assert errors["Lookup"] == "ProviderError"
 
 
 def test_a_run_another_thread_starts_as_the_block_closes_still_ends(
