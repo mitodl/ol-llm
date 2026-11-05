@@ -291,6 +291,18 @@ def test_the_span_names_the_model_as_opiks_price_table_does(
     assert (span.provider, span.model) == ("azure", "gpt-4o")
 
 
+def test_only_the_chat_spans_name_a_provider() -> None:
+    with opik.record_traces_locally() as storage:
+        chat()
+        [trace] = storage.trace_trees
+
+    assert {span.name: span.provider for span in spans(trace)} == {
+        "tutor": None,
+        "agent": None,
+        "Replies": "openai",
+    }
+
+
 def test_callbacks_called_from_another_thread_attach_to_the_root() -> None:
     model = Replies()
     with opik.record_traces_locally() as storage:

@@ -198,7 +198,9 @@ class ChatTracer(OpikTracer):
             metadata=metadata, project_name=project_name, distributed_headers=parent
         )
         self._parent = parent
-        self._model, self._provider = _opik_names(use_case.model)
+        # Not _model and _provider: OpikTracer reads its own _provider as a
+        # provider override for every span it ends.
+        self._chat_model, self._chat_provider = _opik_names(use_case.model)
         self._sink = _SpanSink(
             environment=environment, content=include_content(), pending={}
         )
@@ -245,7 +247,7 @@ class ChatTracer(OpikTracer):
         # Named from the start, so a chat span the block cuts off, which never
         # sees on_llm_end, still names its model.
         if span_data.type == "llm":
-            span_data.update(model=self._model, provider=self._provider)
+            span_data.update(model=self._chat_model, provider=self._chat_provider)
         with self._lock:
             if self._closed:
                 # Admitted before close, started after: its end callbacks are
@@ -265,7 +267,10 @@ class ChatTracer(OpikTracer):
 
     def on_llm_end(self, response: LLMResult, *, run_id: UUID, **kwargs: Any) -> Run:  # noqa: ANN401
         """Name the use case's model and the reported usage on the chat span."""
-        fields: dict[str, Any] = {"model": self._model, "provider": self._provider}
+        fields: dict[str, Any] = {
+            "model": self._chat_model,
+            "provider": self._chat_provider,
+        }
         if (usage := _usage(response)) is not None:
             fields["usage"] = usage
         self._pend(run_id, fields)
