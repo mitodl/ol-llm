@@ -32,7 +32,12 @@ dependencies = [
     "httpx>=0.28",
     "opentelemetry-exporter-otlp-proto-http>=1.38",
     "opentelemetry-sdk>=1.38",
-    "opik==2.2.94",
+    # 2.2.139 onward caps every direct dependency at its newest release that is
+    # 3+ days old (comet-ml/opik#9273), and the exact pin would freeze those caps
+    # onto consumers, so this stays on the last release without them. 2.2.138
+    # caps litellm<1.106, and with the openai 3 that PydanticAI's openai extra
+    # needs, that leaves litellm 1.80.17: the README's overrides drop it.
+    "opik==2.2.138",
     # Validates the model catalog. opik requires it already. 2.14 makes rebuilding a
     # deferred model thread-safe (pydantic/pydantic#13438); the openai SDK defers
     # its response models, so batch workers' first concurrent responses failed to
@@ -45,20 +50,23 @@ dependencies = [
 
 [project.optional-dependencies]
 # The default construction path for agents and single calls.
-pydantic-ai = ["pydantic-ai-slim>=2.60,<3"]
+pydantic-ai = ["pydantic-ai-slim>=2.66,<3"]
 # traced_chat, for call sites that keep their LangChain or LangGraph chat models.
 langchain = ["langchain-core>=1.1,<2"]
 # Provider SDKs, each through PydanticAI's own extra, so a provider extra also
 # installs PydanticAI.
-anthropic = ["pydantic-ai-slim[anthropic]>=2.60,<3"]
-bedrock = ["pydantic-ai-slim[bedrock]>=2.60,<3"]
-google = ["pydantic-ai-slim[google]>=2.60,<3"]
-mistral = ["pydantic-ai-slim[mistral]>=2.60,<3"]
-openai = ["pydantic-ai-slim[openai]>=2.60,<3"]
+anthropic = ["pydantic-ai-slim[anthropic]>=2.66,<3"]
+bedrock = ["pydantic-ai-slim[bedrock]>=2.66,<3"]
+google = ["pydantic-ai-slim[google]>=2.66,<3"]
+mistral = ["pydantic-ai-slim[mistral]>=2.66,<3"]
+openai = ["pydantic-ai-slim[openai]>=2.66,<3"]
 # PydanticAI's first-party capabilities: in-session memory, compaction, and
 # conversation search. Each harness release pins pydantic-ai-slim exactly, so
 # this extra also fixes the PydanticAI version. 0.x: pinned to a minor series.
-harness = ["pydantic-ai-harness>=0.60,<0.61"]
+# 0.66 fixes the secret-redaction ReDoS (GHSA-mfx5-pc32-32m8), and slim 2.66
+# fixes eight that affect 2.60 (GHSA-m5vj-8mcw-82qx and others), hence the
+# 2.66 floor on every extra above.
+harness = ["pydantic-ai-harness>=0.66,<0.67"]
 # Client for the shared memory service (cross-session recall and user-scoped
 # facts). Hindsight is the leading candidate and its PoC is still open, so this
 # extra may change backend before the memory interface ships.
