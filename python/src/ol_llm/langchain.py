@@ -30,7 +30,7 @@ from langchain_core.tracers.schemas import Run
 from opik import context_storage, opik_context
 from opik.api_objects.span import SpanData
 from opik.integrations.langchain import OpikTracer
-from opik.types import DistributedTraceHeadersDict
+from opik.types import DistributedTraceHeadersDict, LLMProvider
 
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution
 from ol_llm.catalog import CatalogEntry, check_chat_model, load_catalog
@@ -271,7 +271,7 @@ class ChatTracer(OpikTracer):
             "model": self._chat_model,
             "provider": self._chat_provider,
         }
-        if (usage := _usage(response)) is not None:
+        if (usage := _usage(response, self._chat_provider)) is not None:
             fields["usage"] = usage
         self._pend(run_id, fields)
         return super().on_llm_end(response, run_id=run_id, **kwargs)
@@ -389,11 +389,9 @@ def _opik_names(model_id: str) -> tuple[str, str]:
     return name, provider
 
 
-def _usage(response: LLMResult) -> dict[str, Any] | None:
-    """Return the run's token usage in OpenAI's shape.
+def _usage(response: LLMResult, provider: str) -> dict[str, Any] | None:
+    """Return the run's token usage in the shape Opik prices ``provider`` from.
 
-    The SDK reads that shape for any provider. LangChain's ``usage_metadata``
-    counts cache reads in ``input_tokens``, as OpenAI's ``prompt_tokens`` does.
     Each prompt's generations are the choices of one response, and a client that
     asks for several (``n``) puts the whole response's usage on every choice, so
     only the first counts.
@@ -411,13 +409,56 @@ def _usage(response: LLMResult) -> dict[str, Any] | None:
             total = add_usage(total, first)
     if total is None:
         return None
+    return _provider_usage(total, provider)
+
+
+def _provider_usage(total: UsageMetadata, provider: str) -> dict[str, Any]:
+    """Return LangChain's usage in the provider's own shape.
+
+    Opik's cost calculator for Anthropic and Bedrock reads cache reads and writes
+    from their own keys and bills the input key as uncached; given another shape
+    it bills every input token at the full rate. Its Google calculator reads
+    cached tokens from Google's key. LangChain's ``input_tokens`` is the sum of
+    every input token type, cache reads and writes included, as OpenAI's
+    ``prompt_tokens`` and Google's ``prompt_token_count`` are.
+    """
+    inputs = total.get("input_token_details", {})
+    cache_read = inputs.get("cache_read", 0)
+    cache_write = inputs.get("cache_creation", 0)
+    reasoning = total.get("output_token_details", {}).get("reasoning", 0)
+    uncached = total["input_tokens"] - cache_read - cache_write
+    if provider in {LLMProvider.ANTHROPIC, LLMProvider.ANTHROPIC_VERTEXAI}:
+        return {
+            "input_tokens": uncached,
+            "output_tokens": total["output_tokens"],
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_write,
+        }
+    if provider == LLMProvider.BEDROCK:
+        return {
+            "inputTokens": uncached,
+            "outputTokens": total["output_tokens"],
+            "totalTokens": total["total_tokens"],
+            "cacheReadInputTokens": cache_read,
+            "cacheWriteInputTokens": cache_write,
+        }
+    if provider in {LLMProvider.GOOGLE_AI, LLMProvider.GOOGLE_VERTEXAI}:
+        # Google counts thinking apart from the reply; LangChain counts both in
+        # output_tokens.
+        return {
+            "prompt_token_count": total["input_tokens"],
+            "candidates_token_count": total["output_tokens"] - reasoning,
+            "thoughts_token_count": reasoning,
+            "total_token_count": total["total_tokens"],
+            "cached_content_token_count": cache_read,
+        }
     usage: dict[str, Any] = {
         "prompt_tokens": total["input_tokens"],
         "completion_tokens": total["output_tokens"],
         "total_tokens": total["total_tokens"],
     }
-    if cached := total.get("input_token_details", {}).get("cache_read"):
-        usage["prompt_tokens_details"] = {"cached_tokens": cached}
-    if reasoning := total.get("output_token_details", {}).get("reasoning"):
+    if cache_read:
+        usage["prompt_tokens_details"] = {"cached_tokens": cache_read}
+    if reasoning:
         usage["completion_tokens_details"] = {"reasoning_tokens": reasoning}
     return usage

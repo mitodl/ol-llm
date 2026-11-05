@@ -751,3 +751,86 @@ def test_a_run_another_thread_starts_as_the_block_closes_still_ends(
     model = llm_span(trace)
     assert_cut_off(model)
     assert (model.provider, model.model) == ("openai", "gpt-4o-mini")
+
+
+CACHED_USAGE = UsageMetadata(
+    input_tokens=20,
+    output_tokens=5,
+    total_tokens=25,
+    input_token_details={"cache_read": 6, "cache_creation": 4},
+    output_token_details={"reasoning": 2},
+)
+
+
+@pytest.mark.parametrize(
+    ("provider", "priced_from"),
+    [
+        (
+            "anthropic",
+            {
+                "original_usage.input_tokens": 10,
+                "original_usage.output_tokens": 5,
+                "original_usage.cache_read_input_tokens": 6,
+                "original_usage.cache_creation_input_tokens": 4,
+            },
+        ),
+        (
+            "anthropic_vertexai",
+            {
+                "original_usage.input_tokens": 10,
+                "original_usage.cache_read_input_tokens": 6,
+                "original_usage.cache_creation_input_tokens": 4,
+            },
+        ),
+        (
+            "bedrock",
+            {
+                "original_usage.inputTokens": 10,
+                "original_usage.outputTokens": 5,
+                "original_usage.cacheReadInputTokens": 6,
+                "original_usage.cacheWriteInputTokens": 4,
+            },
+        ),
+        (
+            "google_ai",
+            {
+                "original_usage.prompt_token_count": 20,
+                "original_usage.candidates_token_count": 3,
+                "original_usage.thoughts_token_count": 2,
+                "original_usage.cached_content_token_count": 6,
+            },
+        ),
+        (
+            "openai",
+            {
+                "original_usage.prompt_tokens": 20,
+                "original_usage.completion_tokens": 5,
+                "original_usage.prompt_tokens_details.cached_tokens": 6,
+            },
+        ),
+    ],
+)
+def test_a_cached_reply_carries_the_usage_opik_prices_its_provider_from(
+    monkeypatch: pytest.MonkeyPatch, provider: str, priced_from: dict[str, int]
+) -> None:
+    entry = CatalogEntry(
+        id=f"{provider}:cached-model",
+        kind="chat",
+        opik_provider=provider,
+        opik_model="cached-model",
+        input_usd_per_mtok=Decimal(3),
+        output_usd_per_mtok=Decimal(15),
+    )
+    catalog = Catalog({**load_catalog().entries, entry.id: entry})
+    monkeypatch.setattr(catalog_module, "load_catalog", lambda: catalog)
+    monkeypatch.setattr(langchain_module, "load_catalog", lambda: catalog)
+    use_case = UseCase(app="learn-ai", name="tutor", profile="request", model=entry.id)
+
+    with opik.record_traces_locally() as storage:
+        chat(Replies(usage=CACHED_USAGE), use_case=use_case)
+        [trace] = storage.trace_trees
+
+    usage = llm_span(trace).usage or {}
+    assert {key: usage.get(key) for key in priced_from} == priced_from
+    # The SDK parsed the provider's own shape: every input token is counted once.
+    assert (usage["prompt_tokens"], usage["completion_tokens"]) == (20, 5)
