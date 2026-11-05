@@ -32,7 +32,12 @@ dependencies = [
     "httpx>=0.28",
     "opentelemetry-exporter-otlp-proto-http>=1.38",
     "opentelemetry-sdk>=1.38",
-    "opik==2.2.94",
+    # 2.2.139 onward caps every direct dependency at its newest release that is
+    # 3+ days old (comet-ml/opik#9273), and the exact pin would freeze those caps
+    # onto consumers, so this stays on the last release without them. 2.2.138
+    # caps litellm<1.106, and with the openai 3 that PydanticAI's openai extra
+    # needs, that leaves litellm 1.80.17: the README's overrides drop it.
+    "opik==2.2.138",
     # Validates the model catalog. opik requires it already. 2.14 makes rebuilding a
     # deferred model thread-safe (pydantic/pydantic#13438); the openai SDK defers
     # its response models, so batch workers' first concurrent responses failed to

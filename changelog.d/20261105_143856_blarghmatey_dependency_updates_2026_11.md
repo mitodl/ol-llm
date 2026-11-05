@@ -1,0 +1,3 @@
+### Changed
+
+- The opik pin moves from 2.2.94 to 2.2.138. 2.2.139 and later cap every direct dependency at a release at least 3 days old (comet-ml/opik#9273), which the exact pin would pass on to every consumer, so ol-llm stays below them for now. 2.2.138's only new requirement is `litellm<1.106`. Every litellm it allows after 1.80.17 requires `openai<3`, and the `openai` extra requires openai 3, so an install with the `openai` extra that keeps litellm (an evaluation environment, or one without the README's overrides) now resolves litellm 1.80.17, which has known advisories, where 0.0.8 resolved 1.108.0. The README's overrides drop litellm and are unchanged.

@@ -844,7 +844,7 @@ requires-dist = [
     { name = "langchain-core", marker = "extra == 'langchain'", specifier = ">=1.1,<2" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.38" },
     { name = "opentelemetry-sdk", specifier = ">=1.38" },
-    { name = "opik", specifier = "==2.2.94" },
+    { name = "opik", specifier = "==2.2.138" },
     { name = "pydantic", specifier = ">=2.14,<3" },
     { name = "pydantic-ai-harness", marker = "extra == 'harness'", specifier = ">=0.66,<0.67" },
     { name = "pydantic-ai-slim", marker = "extra == 'pydantic-ai'", specifier = ">=2.66,<3" },
@@ -999,7 +999,7 @@ wheels = [
 
 [[package]]
 name = "opik"
-version = "2.2.94"
+version = "2.2.138"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3-stubs", marker = "sys_platform == 'never'" },
@@ -1023,9 +1023,9 @@ dependencies = [
     { name = "uuid6" },
     { name = "watchfiles", marker = "sys_platform == 'never'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/eb/56/a433a491c46e15bf56bfd439fb18312e92eb2539345d40c869054be1e644/opik-2.2.94.tar.gz", hash = "sha256:5ad6dab275d23cc2820500ba97a65a077dd818bc592bc9bf59e22abcb5389259", size = 1397362, upload-time = "2026-10-07T14:26:53.644Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/da/88/93f099490c186abb69098706e30650a90db253a11303ba86a7b6a907b177/opik-2.2.138.tar.gz", hash = "sha256:e4f042767a26745319601f48b7ac14e45460e37dabcd37e67ec820aca978ce6f", size = 1421812, upload-time = "2026-11-02T10:44:01.007Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f0/1d/15d3b9fd58e60ae789c3ae33931f679600ea4e107c2c555315ef71f22889/opik-2.2.94-py3-none-any.whl", hash = "sha256:f87cd0e890fbf684915ccd09ca102ebf9861ecb2896e3c605723cea7ffadc262", size = 2134186, upload-time = "2026-10-07T14:26:51.506Z" },
+    { url = "https://files.pythonhosted.org/packages/15/aa/69dfc34cc2b6a5b6b63e4bfc5fdab8a308b2e6a1b2a688299c9990b67a9b/opik-2.2.138-py3-none-any.whl", hash = "sha256:891de739aafac526f76e6179f57820c99b1914ef86bc7196ed821354a838aeb3", size = 2173656, upload-time = "2026-11-02T10:43:59.008Z" },
 ]
 
 [[package]]
