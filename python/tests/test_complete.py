@@ -8,7 +8,7 @@ from typing import Any
 
 import opik
 import pytest
-from conftest import PromptLibrary, assert_error_kept_without_content
+from conftest import PromptLibrary, assert_error_kept_without_content, runner_loop
 from ol_llm import (
     Attribution,
     LLMInvalidOutput,
@@ -443,7 +443,7 @@ def test_a_finished_threads_loop_is_released(real_client: UseCase) -> None:
 
     def call() -> None:
         complete_sync(real_client, "hi")
-        loops.append(weakref.ref(asyncio.get_event_loop()))
+        loops.append(weakref.ref(runner_loop()))
 
     thread = threading.Thread(target=call)
     thread.start()

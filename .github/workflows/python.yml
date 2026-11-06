@@ -58,7 +58,7 @@ jobs:
         run: |
           uv venv "$RUNNER_TEMP/newest"
           uv pip install --python "$RUNNER_TEMP/newest" \
-            "./python[anthropic,bedrock,google,mistral,openai,pydantic-ai,langchain]" "pytest>=8.4"
+            "./python[anthropic,bedrock,google,mistral,openai,pydantic-ai,langchain]" "pytest>=8.4" "asgiref>=3.8"
           uv pip list --python "$RUNNER_TEMP/newest"
       - name: Test
         run: '"$RUNNER_TEMP/newest/bin/python" -m pytest python/tests'

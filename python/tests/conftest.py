@@ -1,3 +1,5 @@
+import asyncio
+import gc
 import gzip
 import json
 import os
@@ -5,14 +7,15 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Generator, Sequence
+import weakref
+from collections.abc import Generator, Mapping, Sequence
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import ol_llm.catalog as catalog_module
 import pytest
-from ol_llm import GatewayRoute, UseCase, models, tracing
+from ol_llm import GatewayRoute, UseCase, loops, models, tracing
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.settings import Settings, configure
 from ol_llm.tracing import TracingConfig, configure_tracing
@@ -228,6 +231,32 @@ TRACING = TracingConfig()
 _FRAME = re.compile(r'  File ".+", line \d+, in \S+')
 
 
+RELEASE_TIMEOUT_SECONDS = 5
+
+
+def released(ref: weakref.ref[Any]) -> bool:
+    """Return whether ``ref``'s object is collected within a few seconds.
+
+    An anyio worker thread (Bedrock's requests run on one) keeps its loop until
+    the thread has finished unwinding, a moment after the run returns.
+    """
+    deadline = time.monotonic() + RELEASE_TIMEOUT_SECONDS
+    while True:
+        gc.collect()
+        if ref() is None:
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)
+
+
+def runner_loop() -> asyncio.AbstractEventLoop:
+    """Return the calling thread's ol-llm loop, the one its sync calls ran on."""
+    loop = loops._thread.loop  # noqa: SLF001
+    assert loop is not None
+    return loop
+
+
 def opik_context_is_empty() -> bool:
     return (
         context_storage.get_trace_data() is None
@@ -355,16 +384,24 @@ GEMINI_REPLY = {
         "totalTokenCount": 2,
     },
 }
+EMBEDDINGS_REPLY = {
+    "object": "list",
+    "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]}],
+    "model": "text-embedding-3-small",
+    "usage": {"prompt_tokens": 1, "total_tokens": 1},
+}
+TOKEN_REPLY = {"access_token": "token", "expires_in": 300}
 PRIMARY = "openai:gpt-4o-mini"
 # Not in the released catalog; the fixture adds it.
 GEMINI = "google:gemini-3.1-pro-preview"
 
 
 class KeepAliveProvider(BaseHTTPRequestHandler):
-    """Answers OpenAI Responses and Gemini requests over persistent connections.
+    """Answers OpenAI Responses and embeddings, Gemini, and Keycloak token requests.
 
-    Paths under ``/unavailable`` answer 503, so a chain falls back. Gemini's
-    streaming endpoint answers with one server-sent event.
+    Over persistent connections. Paths under ``/unavailable`` answer 503, so a
+    chain falls back. Gemini's streaming endpoint answers with one server-sent
+    event.
     """
 
     protocol_version = "HTTP/1.1"
@@ -378,7 +415,15 @@ class KeepAliveProvider(BaseHTTPRequestHandler):
             content_type = "text/event-stream"
             body = f"data: {json.dumps(GEMINI_REPLY)}\r\n\r\n".encode()
         else:
-            reply = GEMINI_REPLY if "generateContent" in self.path else RESPONSES_REPLY
+            reply: Mapping[str, object]
+            if self.path.endswith("/embeddings"):
+                reply = EMBEDDINGS_REPLY
+            elif self.path.endswith("/token"):
+                reply = TOKEN_REPLY
+            elif "generateContent" in self.path:
+                reply = GEMINI_REPLY
+            else:
+                reply = RESPONSES_REPLY
             body = json.dumps(reply).encode()
         self.send_response(status)
         self.send_header("content-type", content_type)
@@ -390,19 +435,27 @@ class KeepAliveProvider(BaseHTTPRequestHandler):
         pass
 
 
+@pytest.fixture
+def keepalive_url(provider_env: None) -> Generator[str]:  # noqa: ARG001
+    """Serve ``KeepAliveProvider`` and return its base URL."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), KeepAliveProvider)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
+
+
 @pytest.fixture(
     params=[(PRIMARY,), (GEMINI,), (PRIMARY, GEMINI)],
     ids=["openai", "google", "openai-then-google"],
 )
 def real_client(
-    provider_env: None,  # noqa: ARG001
+    keepalive_url: str,
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
-) -> Generator[UseCase]:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), KeepAliveProvider)
-    server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    url = f"http://127.0.0.1:{server.server_address[1]}"
+) -> UseCase:
+    url = keepalive_url
     monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", url)
     gemini = CatalogEntry(
         id=GEMINI,
@@ -417,15 +470,13 @@ def real_client(
     prefix = "/unavailable" if fallbacks else ""
     route = GatewayRoute(base_url=f"{url}{prefix}/v1", api_key="app-key")
     configure(Settings(environment="ci", gateway_routes={"openai": route}))
-    yield UseCase(
+    return UseCase(
         app="mit-learn",
         name="summary",
         profile="request",
         model=model,
         fallback_models=tuple(fallbacks),
     )
-    server.shutdown()
-    server.server_close()
 
 
 @pytest.fixture
