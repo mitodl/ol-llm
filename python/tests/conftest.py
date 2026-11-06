@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import gzip
 import json
 import os
@@ -6,6 +7,7 @@ import re
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Generator, Mapping, Sequence
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -227,6 +229,25 @@ TRACING = TracingConfig()
 
 # A frame of a traceback that names where each frame is and quotes nothing.
 _FRAME = re.compile(r'  File ".+", line \d+, in \S+')
+
+
+RELEASE_TIMEOUT_SECONDS = 5
+
+
+def released(ref: weakref.ref[Any]) -> bool:
+    """Return whether ``ref``'s object is collected within a few seconds.
+
+    An anyio worker thread (Bedrock's requests run on one) keeps its loop until
+    the thread has finished unwinding, a moment after the run returns.
+    """
+    deadline = time.monotonic() + RELEASE_TIMEOUT_SECONDS
+    while True:
+        gc.collect()
+        if ref() is None:
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)
 
 
 def runner_loop() -> asyncio.AbstractEventLoop:
