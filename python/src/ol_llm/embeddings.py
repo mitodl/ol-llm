@@ -37,10 +37,11 @@ from pydantic_ai.usage import RequestUsage
 
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution
 from ol_llm.catalog import CatalogEntry, embedding_entry, status_tags
+from ol_llm.loops import LoopLocal, run_coroutine
 from ol_llm.models import (
-    LoopLocal,
     classify_failure,
     classify_run_failure,
+    close_provider_model,
     instrumentation_settings,
     provider_factory,
     retrying,
@@ -132,7 +133,9 @@ class PolicyEmbeddingModel(WrapperEmbeddingModel):
         self.catalog_id = model_id
         self.catalog_entry = catalog_entry
         self.policy = policy
-        self._loop_models = None if build is None else LoopLocal(build)
+        self._loop_models = (
+            None if build is None else LoopLocal(build, close_provider_model)
+        )
 
     def _loop_model(self) -> EmbeddingModel:
         """Return the provider model for the running event loop."""
@@ -452,30 +455,22 @@ def embed_sync(
 ) -> EmbedResult:
     """Embed texts synchronously, for Celery tasks and Dagster assets.
 
-    Takes the same arguments as ``embed`` and behaves the same way. It cannot be
-    called while an event loop is running in the thread; use ``embed`` there.
+    Takes the same arguments as ``embed`` and runs it on the thread's ol-llm event
+    loop (see ``run_coroutine``). It cannot be called while an event loop is
+    running in the thread; use ``embed`` there.
 
     :returns: the result.
     :rtype: EmbedResult
     """
-    embedder, call, listed = _start(use_case, texts, dimensions, attribution)
-    results: list[EmbedResult] = []
-
-    def traced(texts: list[str]) -> Mapping[str, object]:
-        call.mark_trace()
-        try:
-            result = embedder.embed_sync(
-                texts, input_type=input_type, settings=_user_settings(call)
-            )
-        except Exception as exc:
-            if (error := _replacement(call, exc)) is exc:
-                raise
-            raise error from exc
-        results.append(_finish(call, result))
-        return _trace_output(results[0])
-
-    call.track(traced)(listed)
-    return results[0]
+    return run_coroutine(
+        embed(
+            use_case,
+            texts,
+            input_type=input_type,
+            dimensions=dimensions,
+            attribution=attribution,
+        )
+    )
 
 
 @contextmanager

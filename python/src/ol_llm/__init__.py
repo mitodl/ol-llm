@@ -55,6 +55,7 @@ from ol_llm.errors import (
     LLMRejected,
     LLMUnavailable,
 )
+from ol_llm.loops import close_thread_loop, run_coroutine
 from ol_llm.policy import (
     CallPolicy,
     Profile,
@@ -171,6 +172,7 @@ __all__ = [
     "celery_rate_limit",
     "check_chat_model",
     "check_model_ids",
+    "close_thread_loop",
     "complete",
     "complete_sync",
     "configure",
@@ -188,6 +190,7 @@ __all__ = [
     "promote_prompt",
     "resolve_policy",
     "run",
+    "run_coroutine",
     "run_stream",
     "run_sync",
     "trace_fields",

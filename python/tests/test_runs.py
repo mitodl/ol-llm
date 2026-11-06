@@ -13,6 +13,7 @@ from conftest import (
     PromptLibrary,
     assert_error_kept_without_content,
     opik_context_is_empty,
+    runner_loop,
 )
 from ol_llm import (
     Attribution,
@@ -554,7 +555,7 @@ def test_a_finished_threads_loop_is_released_by_the_agent(
 
     def call() -> None:
         run_sync(agent, "hi")
-        loops.append(weakref.ref(asyncio.get_event_loop()))
+        loops.append(weakref.ref(runner_loop()))
 
     assert run_in_threads(call, 1) == []
     gc.collect()

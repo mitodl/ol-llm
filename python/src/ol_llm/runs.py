@@ -53,6 +53,7 @@ from ol_llm.attribution import (
     degraded_metadata,
 )
 from ol_llm.errors import LLMError
+from ol_llm.loops import run_coroutine
 from ol_llm.models import (
     agent_over,
     answering_model,
@@ -352,32 +353,24 @@ def run_sync(  # noqa: PLR0913
 ) -> LLMResult[OutputT]:
     """Run an agent synchronously, for Celery tasks and Dagster assets.
 
-    Takes the same arguments as ``run`` and behaves the same way. Like PydanticAI's
-    ``run_sync``, it cannot be called while an event loop is running in the
-    thread; use ``run`` there.
+    Takes the same arguments as ``run`` and runs it on the thread's ol-llm event
+    loop (see ``run_coroutine``). It cannot be called while an event loop is
+    running in the thread; use ``run`` there.
 
     :returns: the result.
     :rtype: LLMResult
     """
-    state = _start(agent, attribution, postprocess, prompt)
-    results: list[LLMResult[OutputT]] = []
-
-    def traced(user_prompt: str | None) -> OutputT:
-        arguments = state.agent_arguments()
-        with recording_answers() as answers:
-            try:
-                result = agent.run_sync(
-                    user_prompt, deps=deps, message_history=message_history, **arguments
-                )
-            except Exception as exc:
-                if (error := state.replacement(exc, answers)) is None:
-                    raise
-                raise error from exc
-        results.append(state.finish(result))
-        return results[0].output
-
-    state.track(traced)(user_prompt)
-    return results[0]
+    return run_coroutine(
+        run(
+            agent,
+            user_prompt,
+            deps=deps,
+            attribution=attribution,
+            message_history=message_history,
+            postprocess=postprocess,
+            prompt=prompt,
+        )
+    )
 
 
 @asynccontextmanager
