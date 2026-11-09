@@ -33,8 +33,8 @@ uv run prek run --all-files                     # the same hooks CI runs
   `<=`, but opik also bounds litellm with `<1.106`):
   `curl -s https://pypi.org/pypi/opik/<version>/json | jq -r '.info.requires_dist[] | select(test("<"))'`.
   Replace the block in the README's "Overriding opik's version caps" section with one entry per
-  capped package. Write each entry as the union of the non-cap bounds of every package that
-  requires it (list them with `uv tree --invert --package <name> --depth 1`, then read each
+  capped package. Write each entry as all the non-cap bounds of every package that requires it,
+  combined (list them with `uv tree --invert --package <name> --depth 1`, then read each
   one's requirement on it), with opik's environment markers kept, e.g. `"pydantic>=2.14,<3"`,
   `"tenacity>=8.1.0,!=8.4.0"` (langchain-core excludes 8.4.0). `python/smoke/pyproject.toml`
   takes the cap entries for the packages its slimming list does not drop. Keep the smoke test

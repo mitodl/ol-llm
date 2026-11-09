@@ -783,10 +783,13 @@ copy into `[tool.uv] override-dependencies`. The block has one entry for every c
 - uv uses an override in place of every requirement on that package from every package in the
   graph, the application's own included, so each entry restates the bounds the rest of the
   graph needs and opik's environment markers, not a bare name, e.g. `"pydantic>=2.14,<3"` keeps
-  ol-llm's floor.
+  ol-llm's floor. The block covers ol-llm's own dependencies; before copying it, add the bounds
+  the application's other dependencies put on each package in it.
 - opik also bounds litellm with `<1.106` on Python 3.11 and later, separately from its cap. The
   litellm entry replaces that bound too, so it keeps `<1.106` and opik's excluded versions
-  unless the application has checked opik's evaluation path against a newer litellm.
+  unless the application has checked opik's evaluation path against a newer litellm. Since
+  `<1.106` is stricter than the cap, that entry resolves the same as having none until it is
+  raised.
 - pip has no equivalent of `override-dependencies`. A pip consumer gets the caps of the pinned
   opik release.
 
