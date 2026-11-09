@@ -64,8 +64,8 @@ openai = ["pydantic-ai-slim[openai]>=2.66,<3"]
 # conversation search. Each harness release pins pydantic-ai-slim exactly, so
 # this extra also fixes the PydanticAI version. 0.x: pinned to a minor series.
 # 0.66 fixes the secret-redaction ReDoS (GHSA-mfx5-pc32-32m8), and slim 2.66
-# fixes eight that affect 2.60 (GHSA-m5vj-8mcw-82qx and others), hence the
-# 2.66 floor on every extra above.
+# fixes eight that affect 2.65 and earlier (GHSA-m5vj-8mcw-82qx and others),
+# hence the 2.66 floor on every extra above.
 harness = ["pydantic-ai-harness>=0.66,<0.67"]
 # Client for the shared memory service (cross-session recall and user-scoped
 # facts). Hindsight is the leading candidate and its PoC is still open, so this
