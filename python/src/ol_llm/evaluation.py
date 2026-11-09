@@ -54,6 +54,7 @@ from typing import Any, Literal, cast
 
 import opik
 import pydantic
+from opik import context_storage
 from opik.api_objects.experiment.experiment import Experiment
 from opik.api_objects.experiment.experiment_item import ExperimentItemContent
 from opik.evaluation.evaluation_result import EvaluationResult
@@ -461,6 +462,23 @@ def seed_dataset(
     return dataset
 
 
+def _carry_environment() -> None:
+    """Put the deployment environment on the item's trace and its open span.
+
+    ``opik.evaluate`` opens each item's trace with no environment (``engine.py``),
+    and Opik gives a nested span its parent's environment, so without this the
+    task's and the judges' calls land in Opik's default environment instead of
+    ``Settings.environment``, with a warning for each.
+    ``opik_context`` hands out copies; these are the objects Opik sends when the
+    span and trace close. The exact opik pin keeps ``context_storage`` stable.
+    """
+    environment = get_settings().environment
+    if (trace := context_storage.get_trace_data()) is not None:
+        trace.environment = environment
+    if (span := context_storage.top_span_data()) is not None:
+        span.environment = environment
+
+
 def _guard_task(
     task: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> Callable[[dict[str, Any]], dict[str, Any]]:
@@ -472,6 +490,7 @@ def _guard_task(
 
     @functools.wraps(task)
     def guarded(item: dict[str, Any]) -> dict[str, Any]:
+        _carry_environment()
         try:
             return task(item)
         except LLMError as exc:
@@ -508,6 +527,9 @@ class _MetricOnLLMError(BaseMetric):
         **inputs: Any,  # noqa: ANN401
     ) -> score_result.ScoreResult | list[score_result.ScoreResult]:
         """Score the item with the metric, or fail it after an ``LLMError``."""
+        # A span-reading metric runs under a trace Opik opens again, after the
+        # task's has closed.
+        _carry_environment()
         if (error := inputs.get(LLM_ERROR_FIELD)) is not None:
             return self._failed(f"the task raised {error}")
         # What opik.evaluate does before calling a metric, so a missing input
@@ -570,7 +592,8 @@ def evaluate(  # noqa: PLR0913
     records which prompt versions and which dataset version the experiment ran
     against. The experiment is tagged with the app and environment, and its
     config records the environment. Buffered traces and spans are sent before it
-    returns, so a CI job can exit straight after.
+    returns, so a CI job can exit straight after. Each item's trace, and the
+    task's and judges' calls under it, are in the deployment environment.
 
     An ``LLMError`` from the task does not abort the run, as Opik would: the
     item's output becomes ``{"ol_llm_error": "<error class>"}``, a

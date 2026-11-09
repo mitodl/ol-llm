@@ -1,7 +1,8 @@
+import contextlib
 import json
 import logging
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,6 +37,8 @@ from ol_llm.evaluation import (
 )
 from ol_llm.models import PolicyModel, override_models, shared_model
 from ol_llm.prompts import ManagedPrompt
+from ol_llm.runs import complete_sync
+from opik.api_objects import local_recording
 from opik.api_objects.dataset.dataset_item import DatasetItem
 from opik.api_objects.experiment.experiment_item import ExperimentItemContent
 from opik.evaluation import test_case, test_result
@@ -43,11 +46,13 @@ from opik.evaluation.evaluation_result import EvaluationResult
 from opik.evaluation.metrics import BaseMetric, Hallucination
 from opik.evaluation.metrics.score_result import ScoreResult
 from opik.exceptions import ScoreMethodMissingArguments
+from opik.message_processing.emulation.models import SpanModel, TraceModel
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    TextPart,
     ToolCallPart,
     UserPromptPart,
 )
@@ -517,6 +522,79 @@ def test_a_span_reading_judges_llm_error_is_a_failed_score(
     judged = scores[FILTERED]["span_judge"]
     assert judged.scoring_failed
     assert judged.reason == "the judge raised LLMUnavailable"
+
+
+SUMMARY = UseCase(app=APP, name="summary", profile="request", model=JUDGE)
+
+
+class LibrarySpanJudge(BaseMetric):
+    """A span-reading judge that asks through the library, on Opik's second pass."""
+
+    def __init__(self) -> None:
+        super().__init__(name="library_span_judge")
+        self.judge = judge_model(APP, JUDGE)
+
+    def score(self, output: str, task_span: object, **_: object) -> ScoreResult:
+        del task_span
+        self.judge.generate_string(output)
+        return ScoreResult(name=self.name, value=1.0)
+
+
+def all_spans(spans: list[SpanModel]) -> list[SpanModel]:
+    return [s for span in spans for s in (span, *all_spans(span.spans))]
+
+
+def answer_or_verdict(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+    if info.output_tools:
+        [tool] = info.output_tools
+        return ModelResponse(parts=[ToolCallPart(tool.name, VERDICT)])
+    return ModelResponse(parts=[TextPart("Prof. Lewin.")])
+
+
+@ON_OPIKS_ENGINE
+def test_the_items_traces_and_the_calls_under_them_keep_the_environment(
+    production_prompt: ManagedPrompt[TextTemplate],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def task(item: dict[str, Any]) -> dict[str, Any]:
+        return {"output": complete_sync(SUMMARY, item["question"]).output}
+
+    # Opik records the run itself to score a span-reading metric and allows one
+    # recording at a time, so the test reads Opik's recording.
+    traces: list[TraceModel] = []
+    record = local_recording.record_traces_locally
+
+    @contextlib.contextmanager
+    def keeping(**kwargs: Any) -> Iterator[Any]:  # noqa: ANN401
+        with record(**kwargs) as recording:
+            yield recording
+            traces.extend(recording.trace_trees)
+
+    monkeypatch.setattr(local_recording, "record_traces_locally", keeping)
+    monkeypatch.setattr(logging.getLogger("opik"), "propagate", True)
+    seed_dataset("rag-golden", RAG[:1], project_name=APP)
+
+    with override_models(FunctionModel(answer_or_verdict)):
+        evaluate(
+            task,
+            dataset="rag-golden",
+            project_name=APP,
+            metrics=[Hallucination(model=judge_model(APP, JUDGE)), LibrarySpanJudge()],
+            prompts=[production_prompt],
+            scoring_key_mapping={"input": "question"},
+            task_threads=1,
+        )
+
+    spans = [span for trace in traces for span in all_spans(trace.spans)]
+    assert {span.name for span in spans} >= {"summary", JUDGE_USE_CASE}
+    assert {trace.environment for trace in traces} == {"ci"}
+    # On the span-reading pass Opik checks the metric's arguments in a span of
+    # its own before any ol-llm code runs. That span makes no call.
+    assert {span.name for span in spans if span.environment != "ci"} <= {
+        "library_span_judge_arg_validation"
+    }
+    assert "nested span under the environment" not in caplog.text
 
 
 @ON_OPIKS_ENGINE
