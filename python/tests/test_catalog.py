@@ -12,9 +12,11 @@ import opik
 import pytest
 from ol_llm import UseCase, run_sync
 from ol_llm.catalog import (
+    CHECKED_USE_CASES_MAX,
     TOKENS_PER_MTOK,
     Catalog,
     CatalogEntry,
+    check_chat_model,
     check_model_ids,
     load_catalog,
     main,
@@ -119,6 +121,29 @@ def test_unlisted_model_builds_and_warns(caplog: pytest.LogCaptureFixture) -> No
     assert model.catalog_entry is None
     assert "openai:gpt-3.5-turbo" in caplog.text
     assert "does not list" in caplog.text
+
+
+def test_unlisted_model_id_is_logged_escaped(caplog: pytest.LogCaptureFixture) -> None:
+    """An id from a request can't break the log line it is written into"""
+    model_id = "openai:gpt\nERROR forged line"
+
+    with caplog.at_level(logging.WARNING, logger="ol_llm.catalog"):
+        build_model(use_case(model_id))
+
+    assert repr(model_id) in caplog.text
+    assert model_id not in caplog.text
+
+
+def test_check_chat_model_cache_is_bounded() -> None:
+    """Distinct model ids from callers don't grow the cache without limit"""
+    check_chat_model.cache_clear()
+    try:
+        for n in range(CHECKED_USE_CASES_MAX + 1):
+            check_chat_model(use_case(f"openai:unlisted-{n}"))
+
+        assert check_chat_model.cache_info().currsize == CHECKED_USE_CASES_MAX
+    finally:
+        check_chat_model.cache_clear()
 
 
 def test_unlisted_fallback_builds() -> None:

@@ -23,7 +23,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
-from functools import cache
+from functools import cache, lru_cache
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Literal, Self
@@ -43,6 +43,12 @@ ModelStatus = Literal["allowed", "deprecated", "retired"]
 Route = Literal["direct", "gateway"]
 
 TOKENS_PER_MTOK = 1_000_000
+
+# How many use cases a process remembers having checked. An application can build a
+# use case from a request's model id, so an unbounded cache grows with every
+# distinct id a caller sends.
+CHECKED_USE_CASES_MAX = 1024
+
 CATALOG_RESOURCE = "catalog.toml"
 PRICE_RULE_GROUP = "ol_llm_model_prices"
 
@@ -258,14 +264,14 @@ def catalog_entries(use_case: UseCase, *, kind: ModelKind) -> list[CatalogEntry 
     for model_id, entry in zip(use_case.model_ids, entries, strict=True):
         if entry is None:
             log.warning(
-                "Use case %s names %s, which the model catalog does not list, so "
+                "Use case %s names %r, which the model catalog does not list, so "
                 "the spend rules have no price for it",
                 use_case.name,
                 model_id,
             )
         elif entry.status == "deprecated":
             log.warning(
-                "Use case %s names %s, which is deprecated and retires on %s",
+                "Use case %s names %r, which is deprecated and retires on %s",
                 use_case.name,
                 model_id,
                 entry.retires_on,
@@ -289,14 +295,15 @@ def status_tags(entries: Iterable[CatalogEntry | None]) -> tuple[str, ...]:
     return tuple(f"model_status:{status}" for status in sorted(statuses))
 
 
-@cache
+@lru_cache(maxsize=CHECKED_USE_CASES_MAX)
 def check_chat_model(use_case: UseCase) -> tuple[str, ...]:
     """Check a chat use case's models against the catalog, as ``build_model`` does.
 
     For call sites that build their own chat client, e.g. a LangChain chat model,
     at the point they build it. ``traced_chat`` runs it too and tags its trace with
     the result. A rejected use case raises every time; an unlisted or deprecated
-    model warns once per process.
+    model warns once, until its use case falls out of the last
+    ``CHECKED_USE_CASES_MAX`` checked.
 
     :param use_case: the call site.
     :returns: the ``model_status`` trace tags, from ``status_tags``.
