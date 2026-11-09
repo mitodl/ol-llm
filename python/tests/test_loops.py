@@ -473,18 +473,19 @@ def test_a_bedrock_client_never_uses_boto3s_default_session(
 
 def test_no_loop_is_created_between_the_snapshot_and_the_fork() -> None:
     # Later before-fork hooks (logging's among them) can release the GIL.
-    loops._before_fork()  # noqa: SLF001
-    try:
-        with ThreadPoolExecutor(1) as worker:
+    with ThreadPoolExecutor(1) as worker:
+        loops._before_fork()  # noqa: SLF001
+        try:
             first_call = worker.submit(run_coroutine, asyncio.sleep(0))
             time.sleep(0.2)
-            assert not first_call.done()
+            blocked = not first_call.done()
+        finally:
+            # Before the pool's shutdown waits on the blocked worker.
             loops._after_fork_in_parent()  # noqa: SLF001
-            first_call.result(timeout=5)
-            worker.submit(close_thread_loop).result()
-    finally:
-        if loops._loops_lock.locked():  # noqa: SLF001
-            loops._loops_lock.release()  # noqa: SLF001
+        first_call.result(timeout=5)
+        worker.submit(close_thread_loop).result()
+
+    assert blocked
 
 
 def test_a_thread_creating_a_loop_can_still_fork_and_call_ol_llm() -> None:
