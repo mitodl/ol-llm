@@ -28,13 +28,16 @@ uv run prek run --all-files                     # the same hooks CI runs
 - `opik` is pinned exactly. Bumping it means the smoke test must still pass with the overrides
   in `python/smoke/pyproject.toml`, which are the overrides consumers copy from the README.
 - `opik` is bumped once a month (the Renovate rule in `renovate.json` opens the PR on the 1st),
-  so the version caps it puts on its dependencies stay close to current. On a bump, read the new
-  release's caps from its metadata:
-  `curl -s https://pypi.org/pypi/opik/<version>/json | jq -r '.info.requires_dist[] | select(contains("<="))'`.
-  Replace the cap overrides in the README's "Overriding opik's version caps" section and in
-  `python/smoke/pyproject.toml` with one entry per capped package the slimming list does not
-  already drop, written as the range opik and ol-llm need without the cap (e.g.
-  `"pydantic>=2.14,<3"`, `"sentry_sdk>=2.0.0"`), and keep the smoke test
+  so the version caps it puts on its dependencies stay close to current. On a bump, list every
+  requirement of the new release with an upper bound and review them by hand (caps are mostly
+  `<=`, but opik also bounds litellm with `<1.106`):
+  `curl -s https://pypi.org/pypi/opik/<version>/json | jq -r '.info.requires_dist[] | select(test("<"))'`.
+  Replace the block in the README's "Overriding opik's version caps" section with one entry per
+  capped package. Write each entry as the union of the non-cap bounds of every package that
+  requires it (list them with `uv tree --invert --package <name> --depth 1`, then read each
+  one's requirement on it), with opik's environment markers kept, e.g. `"pydantic>=2.14,<3"`,
+  `"tenacity>=8.1.0,!=8.4.0"` (langchain-core excludes 8.4.0). `python/smoke/pyproject.toml`
+  takes the cap entries for the packages its slimming list does not drop. Keep the smoke test
   passing with them. Drop them once comet-ml/opik#9491 moves the caps into an extra.
 - Do not add litellm as a dependency.
 - No async client is created outside a `LoopLocal` (`ol_llm/loops.py`) with a close function,

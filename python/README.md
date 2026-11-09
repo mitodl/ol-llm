@@ -763,23 +763,30 @@ ol-llm = "0d"
 ## Overriding opik's version caps
 
 opik 2.2.139 and later cap each direct dependency at a recent release (`name<=X` in the
-package metadata, e.g. `openai<=3.42.1` and `pydantic<=2.14.2` in 2.2.143), and each opik
-release moves the caps. ol-llm pins opik exactly, so an application inherits the caps of the
-pinned release until ol-llm bumps opik, which it does once a month. An application that
+package metadata, e.g. `openai<=3.42.1` and `pydantic<=2.14.2` in 2.2.143), and opik
+releases move the caps over time. ol-llm pins opik exactly, so an application inherits the
+caps of the pinned release until ol-llm bumps opik, which it does once a month. An application that
 requires a newer version than a cap fails to resolve (`openai==3.46.0` next to opik 2.2.143 is
 unsatisfiable), and one that does not gets the capped version without a warning (pydantic
 2.14.2 under opik 2.2.143, with 2.14.3 out).
 
 The opik release ol-llm pins now, 2.2.94, has no caps, so there is nothing to add. When ol-llm
 moves to a release that has them, the changelog says so and this section gives the block to
-copy into `[tool.uv] override-dependencies`, next to the slimming overrides above.
+copy into `[tool.uv] override-dependencies`. The block has one entry for every capped package.
 
-- Every uv consumer needs the cap overrides, evaluation environments included. A runtime image
-  needs none for a package the slimming list already drops: that override replaces opik's
-  capped requirement as well.
-- uv uses an override in place of every requirement on that package, the application's own and
-  ol-llm's included, so each entry is the range the application needs, not a bare name, e.g.
-  `"pydantic>=2.14,<3"` keeps ol-llm's floor.
+- Every uv consumer needs the cap overrides, evaluation environments included, which copy the
+  whole block because they do not slim (see above). An application on the `openai` extra keeps
+  the `openai` cap entry, since it drops `openai` from the slimming list.
+- A slimmed runtime image keeps the slimming entry for each package the slimming list drops and
+  leaves out that package's cap entry. uv applies both entries when a package has two, so the
+  cap entry would install the package the slimming entry drops.
+- uv uses an override in place of every requirement on that package from every package in the
+  graph, the application's own included, so each entry restates the bounds the rest of the
+  graph needs and opik's environment markers, not a bare name, e.g. `"pydantic>=2.14,<3"` keeps
+  ol-llm's floor.
+- opik also bounds litellm with `<1.106` on Python 3.11 and later, separately from its cap. The
+  litellm entry replaces that bound too, so it keeps `<1.106` and opik's excluded versions
+  unless the application has checked opik's evaluation path against a newer litellm.
 - pip has no equivalent of `override-dependencies`. A pip consumer gets the caps of the pinned
   opik release.
 
