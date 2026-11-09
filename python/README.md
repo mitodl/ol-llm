@@ -704,9 +704,10 @@ SDK should drop it when it adopts the library.
 `ol_llm.testing.override_models` makes `build_model` and `build_agent` use PydanticAI's
 `TestModel` or `FunctionModel` in place of a provider, still under the library's retry and
 error handling. Set `OPIK_TRACK_DISABLE=true` for a test suite that should export no traces,
-or use `ol_llm.testing.tracing_disabled` around one test. SDK calls a test makes itself
-(`create_prompt`, `promote_prompt`, datasets) still reach Opik when `OPIK_KEYCLOAK_*` is set,
-so leave those unset in a suite that should send nothing. `opik.record_traces_locally()`
+or use `ol_llm.testing.tracing_disabled` around one test. Neither stops SDK calls a test
+makes itself (`fetch_prompt`, `create_prompt`, `promote_prompt`, datasets): those still reach
+Opik, authenticated when `OPIK_KEYCLOAK_*` is set, so mock them in a test that must not touch
+the network. `opik.record_traces_locally()`
 captures the root traces a test produces. Script responses and failures with
 `FunctionModel`; do not commit recorded provider responses. `override_embedding_models` does
 the same for `embed` and `embed_sync`, e.g. with PydanticAI's `TestEmbeddingModel`.
