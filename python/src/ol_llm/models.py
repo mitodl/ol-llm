@@ -7,6 +7,7 @@ the extra for each provider a use case names.
 """
 
 import asyncio
+import inspect
 import os
 import random
 import sys
@@ -30,7 +31,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial
 from types import TracebackType
-from typing import Any, Generic, NoReturn, Self, TypeVar, cast, overload
+from typing import Any, NoReturn, Self, TypeVar, cast, overload
 
 import anyio
 import httpx
@@ -41,6 +42,7 @@ from pydantic_ai.capabilities import (
     Instrumentation,
     RaiseContentFilterError,
 )
+from pydantic_ai.embeddings import EmbeddingModel
 from pydantic_ai.exceptions import (
     ContentFilterError,
     FallbackExceptionGroup,
@@ -86,13 +88,13 @@ from ol_llm.errors import (
     LLMRejected,
     LLMUnavailable,
 )
+from ol_llm.loops import LoopLocal, register_at_fork
 from ol_llm.policy import CallPolicy, Profile, UseCase, resolve_policy
 from ol_llm.settings import GatewayRoute, Settings, get_settings
 from ol_llm.tracing import include_content, tracer_provider
 
 OutputT = TypeVar("OutputT")
 _T = TypeVar("_T")
-_V = TypeVar("_V")
 _NO_DEPS: type[None] = type(None)
 DepsT = TypeVar("DepsT")
 
@@ -156,39 +158,27 @@ _model_override: ContextVar[Model | Mapping[str, Model] | None] = ContextVar(
 _answers: ContextVar[list[str] | None] = ContextVar("ol_llm_answers", default=None)
 
 
-class LoopLocal(threading.local, Generic[_V]):
-    """A value built once for each event loop that uses it, kept by the loop's thread.
+async def close_provider_model(model: Model | EmbeddingModel) -> None:
+    """Close the HTTP client of a provider model built for one event loop.
 
-    For what holds provider clients, which bind to the loop they first run on: a
-    pooled ``httpx`` connection belongs to that loop's transport, and SDK clients
-    keep asyncio locks and events (a provider's own enter lock among them). Shared
-    across loops, they fail with "bound to a different event loop", or "Event loop
-    is closed" once the first loop is gone, which is what ``run_sync`` from a
-    thread pool and ``asyncio.run`` per task do. A loop runs on one thread, so
-    keeping the values per thread loses nothing, and a worker thread's loop, which
-    ``run_sync`` never closes, is released with the thread.
+    A provider that made its own client (Google, Mistral) owns it; one given an SDK
+    client (OpenAI, Azure, Anthropic, Together) leaves it to its maker, which is
+    ol-llm here. Bedrock's boto3 client is synchronous and shared by every loop
+    (see ``provider_factory``), so it stays open, as does a test's own model.
 
-    :param build: builds the value; called again for each new loop.
+    :param model: the provider model.
     """
-
-    def __init__(self, build: Callable[[], _V]) -> None:
-        """Start empty; ``threading.local`` runs this again in each new thread."""
-        self._build = build
-        self._values: dict[asyncio.AbstractEventLoop, _V] = {}
-
-    def get(self) -> _V:
-        """Return the running loop's value, dropping the values of closed loops.
-
-        :returns: the value.
-        :rtype: _V
-        :raises RuntimeError: if no event loop is running.
-        """
-        loop = asyncio.get_running_loop()
-        for closed in [other for other in self._values if other.is_closed()]:
-            del self._values[closed]
-        if (value := self._values.get(loop)) is None:
-            value = self._values[loop] = self._build()
-        return value
+    # Chat and embedding models both keep their provider here; only chat models
+    # expose it as a property.
+    provider: Provider[Any] | None = getattr(model, "_provider", None)
+    if provider is None:
+        return
+    if (own := provider._own_http_client) is not None:  # noqa: SLF001
+        await own.aclose()
+        return
+    close = getattr(provider.client, "close", None)
+    if close is not None and inspect.iscoroutinefunction(close):
+        await close()
 
 
 # The models complete runs on, by use case, with the settings each was built with.
@@ -196,6 +186,15 @@ class LoopLocal(threading.local, Generic[_V]):
 # Bedrock would also create boto3 clients concurrently from the default session.
 _shared_models: dict[UseCase, tuple[Settings, Model]] = {}
 _shared_models_lock = threading.Lock()
+
+
+def _after_fork_in_child() -> None:
+    # A parent thread may have held it at the fork, and won't release it here.
+    global _shared_models_lock  # noqa: PLW0603
+    _shared_models_lock = threading.Lock()
+
+
+register_at_fork(after_in_child=_after_fork_in_child)
 
 # Patched in tests so retries do not wait.
 _sleep: Callable[[float], Any] = asyncio.sleep
@@ -527,7 +526,9 @@ class PolicyModel(WrapperModel):
         self.catalog_entry = catalog_entry
         self.profile_name = use_case.profile
         self.policy = policy
-        self._loop_models = None if build is None else LoopLocal(build)
+        self._loop_models = (
+            None if build is None else LoopLocal(build, close_provider_model)
+        )
 
     def _loop_model(self) -> Model:
         """Return the provider model for the running event loop."""
@@ -881,7 +882,9 @@ def _bedrock_client(policy: CallPolicy) -> Any:  # noqa: ANN401
         connect_timeout=policy.timeout_seconds,
         retries={"total_max_attempts": 1},
     )
-    return boto3.client("bedrock-runtime", config=config)
+    # A session of its own: boto3's default session isn't thread-safe, and other
+    # models' factories build their clients on other threads at the same time.
+    return boto3.session.Session().client("bedrock-runtime", config=config)
 
 
 def _bedrock_provider(client: Any) -> Provider[Any]:  # noqa: ANN401
@@ -954,11 +957,13 @@ def provider_factory(
     :rtype: Callable[[str], Provider[Any]]
 
     It runs again for each event loop a model's requests run on (see
-    ``PolicyModel``). The boto3 client is synchronous, so every loop shares the
-    first one built: creating clients from boto3's default session on several
-    threads at once is not thread-safe.
+    ``PolicyModel``). The boto3 client is synchronous, so every loop in a process
+    shares the first one built there, under a per-process lock. A forked child
+    builds its own rather than share the parent's pooled connection.
     """
-    bedrock_clients: list[Any] = []
+    bedrock_clients: dict[int, Any] = {}
+    # One per process, so a child never waits on a lock held at the fork.
+    bedrock_locks: dict[int, threading.Lock] = {}
 
     def factory(provider: str) -> Provider[Any]:  # noqa: PLR0911
         if provider in _OPENAI_PROVIDERS:
@@ -972,9 +977,11 @@ def provider_factory(
                 settings.gateway_routes.get("anthropic"), use_case
             )
         if provider == "bedrock":
-            if not bedrock_clients:
-                bedrock_clients.append(_bedrock_client(policy))
-            return _bedrock_provider(bedrock_clients[0])
+            pid = os.getpid()
+            with bedrock_locks.setdefault(pid, threading.Lock()):
+                if (client := bedrock_clients.get(pid)) is None:
+                    client = bedrock_clients[pid] = _bedrock_client(policy)
+            return _bedrock_provider(client)
         if provider in {"google", "google-cloud"}:
             return _google_provider(provider, policy)
         if provider == "mistral":

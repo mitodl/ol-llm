@@ -8,6 +8,7 @@ requires-python = ">=3.11"
 prek = ["prek==0.5.4"]
 dev = [
     { include-group = "prek" },
+    "asgiref>=3.8",
     "mypy>=1.18",
     "ol-llm[anthropic,bedrock,google,harness,langchain,memory,mistral,openai,pydantic-ai]",
     "pytest>=8.4",

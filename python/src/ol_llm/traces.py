@@ -96,23 +96,13 @@ class TracedCall:
             prompt_version=prompt.version if prompt else None,
         )
 
-    def track(self, func: Callable[..., _T]) -> Callable[..., _T]:
-        """Wrap ``func`` in the call's root trace, as ``trace_scope`` opens it.
-
-        The trace's input is ``func``'s arguments and its output what it returns.
-        """
-
-        def traced(*args: object) -> _T:
-            with self.trace_scope(func, *args) as outcome:
-                result = outcome.value = func(*args)
-            return result
-
-        return traced
-
     def track_async(
         self, func: Callable[..., Awaitable[_T]]
     ) -> Callable[..., Awaitable[_T]]:
-        """Wrap the coroutine function ``func`` in the call's root trace."""
+        """Wrap the coroutine function ``func`` in the call's root trace.
+
+        The trace's input is ``func``'s arguments and its output what it returns.
+        """
 
         async def traced(*args: object) -> _T:
             with self.trace_scope(func, *args) as outcome:

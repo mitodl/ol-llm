@@ -43,9 +43,15 @@ The agent's model has a timeout on every request, retries rate limits and outage
 nothing else, falls back once the primary has spent its retries, and raises `LLMError`
 subclasses (`LLMRateLimited`, `LLMUnavailable`, `LLMRejected`, ...) with the provider's
 exception as the cause. Build agents once, not per request: each build creates new provider
-clients. An agent built once can run on any thread or event loop (`run_sync` from a thread pool,
-`asyncio.run` per task); its model keeps one set of provider clients per event loop, released
-with the thread that ran the loop. A call site that needs a new agent per run (per-run
+clients. An agent built once can run on any thread or event loop; its model keeps one set of
+provider clients per event loop. The `*_sync` entry points run on one long-lived event loop per
+thread that ol-llm owns, so a thread builds its clients once and reuses them on every call. Sync
+code that awaits ol-llm itself uses `ol_llm.run_coroutine(coro)` for the same reason, not
+`asyncio.run` or `async_to_sync`: those start a loop per call, and the clients built for a loop
+ol-llm does not own are dropped, not closed, once it has closed. `ol_llm.close_thread_loop()` closes
+the calling thread's loop and its clients, for a worker thread about to finish; the main
+thread's closes at exit. A forked child (a Celery prefork worker) sets the parent's loops and
+clients aside without closing them and builds its own, and gets new tracing clients too. A call site that needs a new agent per run (per-run
 instructions, output schema, or validators) builds the model once with `ol_llm.build_model` and
 each agent over it with `ol_llm.agent_over(model, ...)`, which takes the agent arguments
 `build_agent` does (`settings` belongs to `build_model`). Agents over one model share its

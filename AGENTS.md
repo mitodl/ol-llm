@@ -28,6 +28,11 @@ uv run prek run --all-files                     # the same hooks CI runs
 - `opik` is pinned exactly. Bumping it means the smoke test must still pass with the overrides
   in `python/smoke/pyproject.toml`, which are the overrides consumers copy from the README.
 - Do not add litellm as a dependency.
+- No async client is created outside a `LoopLocal` (`ol_llm/loops.py`) with a close function,
+  so the runner can close it and a forked child drops it. New loop-local resources join the
+  lifecycle matrix in `python/tests/test_loops.py`.
+- Sync entry points run their coroutine with `run_coroutine`, never `asyncio.run` or a
+  PydanticAI `*_sync` method, and the README tells apps to do the same.
 - A change a consumer would notice adds a fragment with `uv run scriv create --edit`
   (`changelog.d/README.md`). Never edit `CHANGELOG.md` directly outside a release.
 - A release bumps the version in `python/pyproject.toml`, the only place the version lives,
