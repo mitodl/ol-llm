@@ -3,6 +3,7 @@ import gc
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
 
@@ -27,6 +28,7 @@ from ol_llm import (
     run_sync,
     tracing,
 )
+from ol_llm.catalog import CHECKED_USE_CASES_MAX
 from ol_llm.models import build_agent, override_models, shared_model
 from ol_llm.tracing import TracingConfig, configure_tracing
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -408,6 +410,29 @@ def test_first_calls_on_several_threads_build_the_model_once(
 
     assert len(built) == 1
     assert found == built * 4
+
+
+def test_shared_models_keep_only_the_most_recently_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Distinct model ids from callers don't grow the shared models without limit"""
+    monkeypatch.setattr(models, "_shared_models", OrderedDict())
+    monkeypatch.setattr(models, "build_model", lambda *_, **__: object())
+
+    def summary(n: int) -> UseCase:
+        return UseCase(
+            app="mit-learn", name="summary", profile="request", model=f"openai:m-{n}"
+        )
+
+    first, second = shared_model(summary(0)), shared_model(summary(1))
+    for n in range(2, CHECKED_USE_CASES_MAX):
+        shared_model(summary(n))
+    assert shared_model(summary(0)) is first
+    shared_model(summary(CHECKED_USE_CASES_MAX))
+
+    assert len(models._shared_models) == CHECKED_USE_CASES_MAX  # noqa: SLF001
+    assert shared_model(summary(0)) is first
+    assert shared_model(summary(1)) is not second
 
 
 def test_an_override_never_reaches_the_shared_model() -> None:

@@ -3,6 +3,7 @@ import gc
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from decimal import Decimal
 from typing import Any
@@ -28,7 +29,7 @@ from ol_llm import (
     embeddings,
     tracing,
 )
-from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
+from ol_llm.catalog import CHECKED_USE_CASES_MAX, Catalog, CatalogEntry, load_catalog
 from ol_llm.embeddings import PolicyEmbeddingModel, build_embedder, shared_embedder
 from ol_llm.settings import GatewayRoute
 from ol_llm.testing import override_embedding_models, tracing_disabled
@@ -207,6 +208,24 @@ def test_first_calls_on_several_threads_build_the_embedder_once(
 
     assert len(built) == 1
     assert found == built * 4
+
+
+def test_shared_embedders_keep_only_the_most_recently_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Distinct use cases from callers don't grow the shared embedders without limit"""
+    monkeypatch.setattr(embeddings, "_shared_embedders", OrderedDict())
+    monkeypatch.setattr(embeddings, "build_embedder", lambda *_, **__: object())
+
+    first, second = shared_embedder(SEARCH, 0), shared_embedder(SEARCH, 1)
+    for n in range(2, CHECKED_USE_CASES_MAX):
+        shared_embedder(SEARCH, n)
+    assert shared_embedder(SEARCH, 0) is first
+    shared_embedder(SEARCH, CHECKED_USE_CASES_MAX)
+
+    assert len(embeddings._shared_embedders) == CHECKED_USE_CASES_MAX  # noqa: SLF001
+    assert shared_embedder(SEARCH, 0) is first
+    assert shared_embedder(SEARCH, 1) is not second
 
 
 @pytest.mark.usefixtures("provider_env")

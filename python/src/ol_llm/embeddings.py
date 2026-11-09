@@ -16,6 +16,7 @@ another size, are not comparable, so changing either means re-embedding.
 
 import json
 import threading
+from collections import OrderedDict
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -45,6 +46,7 @@ from ol_llm.models import (
     instrumentation_settings,
     provider_factory,
     retrying,
+    reuse_or_build,
 )
 from ol_llm.policy import CallPolicy, UseCase, resolve_policy
 from ol_llm.settings import Settings, get_settings
@@ -65,7 +67,9 @@ _model_override: ContextVar[EmbeddingModel | None] = ContextVar(
 # was built with: each build creates provider clients, and calls should reuse them.
 # The lock keeps two threads' first calls from building one twice, as for
 # ol_llm.models.shared_model.
-_shared_embedders: dict[tuple[UseCase, int | None], tuple[Settings, Embedder]] = {}
+_shared_embedders: OrderedDict[
+    tuple[UseCase, int | None], tuple[Settings, Embedder]
+] = OrderedDict()
 _shared_embedders_lock = threading.Lock()
 
 
@@ -323,7 +327,8 @@ def shared_embedder(use_case: UseCase, dimensions: int | None = None) -> Embedde
 
     Built on the first call for a use case and vector length and reused on every
     thread and event loop, since ``PolicyEmbeddingModel`` keeps a provider model
-    per loop. An embedder is rebuilt after ``configure`` replaces the settings. Under
+    per loop. An embedder is rebuilt after ``configure`` replaces the settings, or
+    once it has fallen out of the ``CHECKED_USE_CASES_MAX`` most recently used. Under
     ``override_embedding_models`` every call builds a new one, so an override never
     outlives its block.
 
@@ -337,13 +342,12 @@ def shared_embedder(use_case: UseCase, dimensions: int | None = None) -> Embedde
         return build_embedder(use_case, dimensions=dimensions)
     settings = get_settings()
     with _shared_embedders_lock:
-        cached = _shared_embedders.get((use_case, dimensions))
-        if cached is None or cached[0] is not settings:
-            embedder = build_embedder(
-                use_case, dimensions=dimensions, settings=settings
-            )
-            cached = _shared_embedders[use_case, dimensions] = (settings, embedder)
-    return cached[1]
+        return reuse_or_build(
+            _shared_embedders,
+            (use_case, dimensions),
+            settings,
+            lambda: build_embedder(use_case, dimensions=dimensions, settings=settings),
+        )
 
 
 def _start(

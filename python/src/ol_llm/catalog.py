@@ -44,9 +44,9 @@ Route = Literal["direct", "gateway"]
 
 TOKENS_PER_MTOK = 1_000_000
 
-# How many use cases a process remembers having checked. An application can build a
-# use case from a request's model id, so an unbounded cache grows with every
-# distinct id a caller sends.
+# How many use cases a process remembers having checked, and keeps a shared model or
+# embedder for. An application can build a use case from a request's model id, so
+# an unbounded cache grows with every distinct id a caller sends.
 CHECKED_USE_CASES_MAX = 1024
 
 CATALOG_RESOURCE = "catalog.toml"
