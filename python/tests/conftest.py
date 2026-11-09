@@ -18,7 +18,7 @@ import pytest
 from ol_llm import GatewayRoute, UseCase, loops, models, tracing
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.settings import Settings, configure
-from ol_llm.tracing import TracingConfig, configure_tracing
+from ol_llm.tracing import KeycloakClient, TracingConfig, configure_tracing
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -56,6 +56,7 @@ class PromptLibrary:
             self.environments = {"development", "staging", "production"}
             self.retrievals = 0
             self.delay_seconds = 0.0
+            self.authorizations: list[str | None] = []
 
     def add(  # noqa: PLR0913
         self,
@@ -93,10 +94,14 @@ class PromptLibrary:
                 for v in self.prompts[project_name, name]
             }
 
-    def handle(self, method: str, path: str, body: bytes) -> tuple[int, Any] | None:
+    def handle(
+        self, method: str, path: str, body: bytes, authorization: str | None
+    ) -> tuple[int, Any] | None:
         """Answer a prompt request, or return ``None`` for any other path."""
         if not path.startswith(_PROMPTS):
             return None
+        with self._lock:
+            self.authorizations.append(authorization)
         request = json.loads(gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body)
         if method == "POST" and path == f"{_PROMPTS}/retrieve":
             time.sleep(self.delay_seconds)
@@ -181,11 +186,21 @@ PROMPTS = PromptLibrary()
 
 
 class AcceptingOpik(BaseHTTPRequestHandler):
-    """Accepts every SDK request, so the SDK has nothing to queue and replay."""
+    """Accepts every SDK request, so the SDK has nothing to queue and replay.
+
+    Also answers Keycloak token requests at ``KEYCLOAK_PATH``.
+    """
 
     def _accept(self) -> None:
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        if (answer := PROMPTS.handle(self.command, self.path, body)) is not None:
+        answer = (
+            (200, TOKEN_REPLY)
+            if self.path == KEYCLOAK_PATH
+            else PROMPTS.handle(
+                self.command, self.path, body, self.headers.get("Authorization")
+            )
+        )
+        if answer is not None:
             status, payload = answer
             data = json.dumps(payload).encode() if payload is not None else b""
             self.send_response(status)
@@ -217,6 +232,12 @@ class AcceptingOpik(BaseHTTPRequestHandler):
 _opik = ThreadingHTTPServer(("127.0.0.1", 0), AcceptingOpik)
 threading.Thread(target=_opik.serve_forever, daemon=True).start()
 OPIK_URL = f"http://127.0.0.1:{_opik.server_address[1]}/api"
+KEYCLOAK_PATH = "/keycloak/token"
+OPIK_KEYCLOAK = KeycloakClient(
+    token_url=f"http://127.0.0.1:{_opik.server_address[1]}{KEYCLOAK_PATH}",
+    client_id="ol-opik-client",
+    client_secret="secret",
+)
 
 # The SDK reads these when it first builds its client, which no import does.
 # Tests read root traces with opik.record_traces_locally and model spans from the

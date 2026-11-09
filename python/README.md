@@ -686,7 +686,7 @@ to the same instance:
 | `OPIK_URL_OVERRIDE` | the Opik API, e.g. `https://opik-qa.ol.mit.edu/api` |
 | `OPIK_WORKSPACE` | `default` on our instances |
 | `OPIK_KEYCLOAK_TOKEN_URL`, `OPIK_KEYCLOAK_CLIENT_ID`, `OPIK_KEYCLOAK_CLIENT_SECRET` | the Keycloak client the app authenticates to Opik with; `OPIK_KEYCLOAK_SCOPE` if it needs one. Leave `OPIK_API_KEY` unset |
-| `OPIK_TRACK_DISABLE` | `true` turns tracing off, for local development without an Opik |
+| `OPIK_TRACK_DISABLE` | `true` turns tracing off, for local development without an Opik. Runs open no root trace and export no spans; SDK calls the app makes itself (prompt sync, datasets, experiments) still send the Keycloak token |
 | `OL_LLM_TRACE_CONTENT` | `false` keeps prompts, completions, tool arguments, and error messages out of traces. On by default until the data-handling policy decides |
 
 Without a call, tracing reads these the first time an agent or embedder is built or a run
@@ -703,8 +703,11 @@ SDK should drop it when it adopts the library.
 
 `ol_llm.testing.override_models` makes `build_model` and `build_agent` use PydanticAI's
 `TestModel` or `FunctionModel` in place of a provider, still under the library's retry and
-error handling. Set `OPIK_TRACK_DISABLE=true` for a test suite that should send nothing, or
-use `ol_llm.testing.tracing_disabled` around one test. `opik.record_traces_locally()`
+error handling. Set `OPIK_TRACK_DISABLE=true` for a test suite that should export no traces,
+or use `ol_llm.testing.tracing_disabled` around one test. Neither stops SDK calls a test
+makes itself (`fetch_prompt`, `create_prompt`, `promote_prompt`, datasets): those still reach
+Opik, authenticated when `OPIK_KEYCLOAK_*` is set, so mock them in a test that must not touch
+the network. `opik.record_traces_locally()`
 captures the root traces a test produces. Script responses and failures with
 `FunctionModel`; do not commit recorded provider responses. `override_embedding_models` does
 the same for `embed` and `embed_sync`, e.g. with PydanticAI's `TestEmbeddingModel`.

@@ -14,8 +14,10 @@ version exported into the image at build time, marked degraded with
 ``embedded_prompt``. The fetch carries on in the background and fills the cache,
 so the next call gets the managed version.
 
-With tracing off (``OPIK_TRACK_DISABLE=true``) there is no Opik to fetch from, so
-``get_prompt`` returns the embedded default unmarked: that is local development.
+With tracing off (``OPIK_TRACK_DISABLE=true``) ``get_prompt`` does not fetch and
+returns the embedded default unmarked: that is local development. ``fetch_prompt``,
+``create_prompt`` and ``promote_prompt`` still call Opik, with the Keycloak token
+when a client is configured.
 
 ``create_prompt`` and ``promote_prompt`` are for the CI jobs that sync prompts
 and move the ``production`` label from the pointer file (spec §2.3).

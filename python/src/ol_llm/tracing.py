@@ -15,7 +15,9 @@ a client-credentials JWT on every ``/api`` request; ``OPIK_KEYCLOAK_TOKEN_URL``,
 ``OPIK_KEYCLOAK_SCOPE`` turn that on for both halves from one token cache.
 
 ``OPIK_TRACK_DISABLE=true`` is the no-op mode for tests and local development: the
-library opens no root traces and builds no exporter.
+library opens no root traces and builds no exporter. It does not turn off Keycloak:
+SDK calls the app makes itself (prompt sync, datasets, experiments) still send the
+token.
 
 Spans are filed under the Opik project of the trace they belong to. That is the
 app's project for a run the library opened, and the caller's project for a run
@@ -120,9 +122,10 @@ class TracingConfig:
     span exporter reads them from the same place so the two cannot disagree.
 
     :param enabled: false turns tracing off: runs open no root trace and export no
-        spans.
-    :param keycloak: the client to authenticate with; ``None`` sends no
-        credentials, for an Opik with nothing in front of it.
+        spans. SDK calls outside a run still authenticate with ``keycloak``.
+    :param keycloak: the client to authenticate with, whether or not tracing is
+        enabled; ``None`` sends no credentials, for an Opik with nothing in front
+        of it.
     :param include_content: whether traces carry prompts, completions, and tool
         arguments. On until the data-handling policy says otherwise.
     """
@@ -503,12 +506,11 @@ def _start(config: TracingConfig) -> _Tracing:
     opik_config = OpikConfig()
     host = httpx.URL(opik_config.url_override).host
     tokens = KeycloakTokens(config.keycloak) if config.keycloak else None
-    sdk_tokens = tokens if config.enabled else None
     if _sdk_auth is not None:
-        _sdk_auth.tokens = sdk_tokens
+        _sdk_auth.tokens = tokens
         _sdk_auth.host = host
-    elif sdk_tokens is not None:
-        _sdk_auth = HttpxBearerAuth(sdk_tokens, host=host)
+    elif tokens is not None:
+        _sdk_auth = HttpxBearerAuth(tokens, host=host)
         add_httpx_client_hook(
             HttpxClientHook(
                 client_modifier=None, client_init_arguments={"auth": _sdk_auth}
@@ -549,7 +551,7 @@ def opik_client() -> opik.Opik:
 
     Settling the configuration registers the Keycloak hook, which the SDK reads only
     when it builds its client, so every SDK call outside a traced run (prompt sync,
-    datasets, experiments) gets the same token as the runs.
+    datasets, experiments) gets the same token as the runs, with tracing on or off.
 
     :returns: the client.
     :rtype: opik.Opik

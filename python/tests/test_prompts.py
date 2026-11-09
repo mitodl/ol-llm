@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import httpx
 import opik
 import pytest
-from conftest import PromptLibrary
+from conftest import OPIK_KEYCLOAK, TOKEN_REPLY, PromptLibrary
 from ol_llm import (
     ChatTemplate,
     TextTemplate,
@@ -21,6 +21,7 @@ from ol_llm.tracing import (
     configure_tracing,
 )
 from opik import context_storage
+from opik.api_objects.opik_client import reset_global_client
 from opik.api_objects.prompt import mask_context
 from opik.exceptions import (
     EnvironmentNotFoundError,
@@ -330,6 +331,24 @@ def test_with_tracing_off_the_embedded_default_is_used_unmarked(
 
     assert (prompt.source, prompt.degraded_reasons) == ("embedded", ())
     assert prompt_library.retrievals == 0
+
+
+def test_with_tracing_off_an_sdk_fetch_still_sends_the_keycloak_token(
+    prompt_library: PromptLibrary,
+) -> None:
+    tracing.reset()
+    configure_tracing(TracingConfig(enabled=False, keycloak=OPIK_KEYCLOAK))
+    # The SDK reads its hooks when it builds its client.
+    reset_global_client()
+    prompt_library.add("summary", "Summarize {{text}}.", environments=("production",))
+
+    prompt = prompts.fetch_prompt(
+        "summary", project_name=PROJECT, environment="production"
+    )
+
+    assert prompt is not None
+    assert prompt.version == "v1"
+    assert prompt_library.authorizations == [f"Bearer {TOKEN_REPLY['access_token']}"]
 
 
 def test_a_fetch_inside_a_trace_links_the_version(
