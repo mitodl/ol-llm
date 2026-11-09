@@ -104,8 +104,9 @@ _loops: "weakref.WeakSet[asyncio.AbstractEventLoop]" = weakref.WeakSet()
 
 
 # Held from the snapshot before a fork until it is done, so no thread creates a
-# loop the snapshot missed.
-_loops_lock = threading.Lock()
+# loop the snapshot missed. Reentrant, for a signal handler that forks or calls
+# ol-llm while its thread is creating a loop.
+_loops_lock = threading.RLock()
 
 
 def _thread_loop() -> asyncio.AbstractEventLoop:
@@ -212,7 +213,7 @@ def _after_fork_in_parent() -> None:
 
 def _after_fork_in_child() -> None:
     global _loops_lock  # noqa: PLW0603
-    _loops_lock = threading.Lock()
+    _loops_lock = threading.RLock()
     _inherited.extend(_held_across_fork)
     _held_across_fork.clear()
     _inherited.append(_thread.loop)

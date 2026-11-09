@@ -487,6 +487,22 @@ def test_no_loop_is_created_between_the_snapshot_and_the_fork() -> None:
             loops._loops_lock.release()  # noqa: SLF001
 
 
+def test_a_thread_creating_a_loop_can_still_fork_and_call_ol_llm() -> None:
+    # As a signal handler would, from inside the thread's own loop creation.
+    def reenter() -> None:
+        with loops._loops_lock:  # noqa: SLF001
+            loops._before_fork()  # noqa: SLF001
+            loops._after_fork_in_parent()  # noqa: SLF001
+            run_coroutine(asyncio.sleep(0))
+            close_thread_loop()
+
+    thread = threading.Thread(target=reenter, daemon=True)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+
+
 def test_without_register_at_fork_no_hook_is_registered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
