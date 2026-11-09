@@ -6,6 +6,29 @@ All notable changes to ol-llm are recorded here. The format follows
 
 <!-- scriv-insert-here -->
 
+<a id='changelog-0.0.9'></a>
+## [0.0.9] - 2026-11-09
+
+### Added
+
+- `ol_llm.run_coroutine(coro)` runs a coroutine on one long-lived event loop per thread that ol-llm owns, so the provider clients built for that loop are reused by every later call in the thread. Sync code that awaits ol-llm should use it in place of `asyncio.run` or `async_to_sync`, which start a loop per call and leave a client behind per call. It refuses to run inside a running loop, and an interrupted coroutine is cancelled and cleaned up before the exception propagates.
+- `ol_llm.close_thread_loop()` closes the calling thread's loop and the provider clients built for it. The main thread's loop closes at interpreter exit.
+
+### Changed
+
+- `run_sync`, `complete_sync`, and `embed_sync` run on that per-thread loop instead of PydanticAI's `run_sync`, so a Celery task or Dagster asset reuses one set of provider clients per worker thread.
+- On models without mid-conversation system messages (in the catalog: every Bedrock and Google model, and `anthropic:claude-sonnet-5`), every request with a system prompt or instructions now carries a fixed sentence explaining PydanticAI's `<system>` tag in its system field. It goes after any `system_prompt=` text and ahead of the instructions, so for an agent built with `instructions=` alone, as ol-llm's entry points are, it is the first system block. PydanticAI 2.63 added it (pydantic/pydantic-ai#11506) and offers no setting to turn it off. Each cached prompt prefix takes one cache miss after the upgrade, and tests that assert the first system block is the app's prompt need updating. OpenAI, Azure, Mistral and `anthropic:claude-haiku-5-5` requests are unchanged.
+
+### Fixed
+
+- A process forked after ol-llm was used (a Celery prefork worker whose app configured tracing at startup) no longer shares the parent's sockets or waits on its dead threads. The child keeps every parent thread's event loop alive without closing it, drops the parent's provider clients without closing them, builds its own Bedrock client, gets new HTTP clients for the Keycloak token endpoint and the span exporter, and a new Opik SDK client, whose sender threads did not survive the fork. It also starts with fresh module locks (shared models, embedders, settings, tracing) and no in-flight prompt fetches, so a lock or fetch a parent thread held at the fork can't block it. Before, `ol_llm.tracing.flush()` in the child hung waiting on the parent's sender threads.
+- Each Bedrock client is built from a boto3 session of its own instead of boto3's default session, which isn't thread-safe, so first calls from several models on different threads no longer race. Threads using one model share one client.
+
+### Security
+
+- Every PydanticAI extra now requires `pydantic-ai-slim>=2.66`, which fixes eight advisories published on 2026-11-04 that affect 2.65 and earlier, among them GHSA-m5vj-8mcw-82qx (high) and GHSA-jp94-mmr3-2pvv.
+- The `harness` extra moves to `pydantic-ai-harness` 0.66, which fixes exponential backtracking in the `private_key` secret-redaction pattern (GHSA-mfx5-pc32-32m8). The extra's old `<0.61` cap held consumers on affected releases. 0.66 pins PydanticAI 2.66.
+
 <a id='changelog-0.0.8'></a>
 ## [0.0.8] - 2026-11-05
 
