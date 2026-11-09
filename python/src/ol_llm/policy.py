@@ -59,6 +59,11 @@ PROFILE_DEFAULTS: Mapping[Profile, CallPolicy] = {
 class UseCase:
     """One LLM call site, declared once as a module-level constant.
 
+    Of its fields, only ``model`` may come from request input, e.g. a chat request
+    naming its model. ``fallback_models`` and every other field must be defined by
+    the application: ol-llm keeps a use case whose models the catalog all lists in
+    a cache tier callers can't evict, which assumes there are only so many of them.
+
     :param app: the application, e.g. ``learn-ai``. Becomes the Opik project.
     :param name: the use case, e.g. ``course-translation``: lowercase letters, digits,
         and hyphens. Names the environment overrides, so it may not be ``request`` or

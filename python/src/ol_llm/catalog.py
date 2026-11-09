@@ -53,11 +53,14 @@ TOKENS_PER_MTOK = 1_000_000
 # only so many; this is a safety net, not a window callers can cycle through.
 CHECKED_USE_CASES_MAX = 1024
 
-# How many use cases naming a model the catalog does not list a process keeps checks,
-# models and embedders for. An application can build a use case from a request's
-# model id, so a caller can make as many of these as it sends ids. Kept apart and
-# few, they can't evict the application's own use cases, which would then rebuild
-# their clients under the lock every first call shares.
+# How many use cases naming a model the catalog does not list (or an embedding length
+# it does not record) a process keeps checks, models and embedders for. An
+# application can build a use case from a request's model id, so a caller can make
+# as many of these as it sends ids. Kept apart and few, they can't evict the
+# application's own cataloged use cases, which would then rebuild their clients
+# under the lock every first call shares. An application's own use case on an
+# unlisted model shares this tier, so caller churn can evict it too; listing its
+# model in the catalog keeps it protected.
 UNCATALOGED_USE_CASES_MAX = 64
 
 CATALOG_RESOURCE = "catalog.toml"
@@ -324,18 +327,42 @@ def is_cataloged(use_case: UseCase) -> bool:
     return all(catalog.get(model_id) is not None for model_id in use_case.model_ids)
 
 
+def is_cataloged_embedder(key: tuple[UseCase, int | None]) -> bool:
+    """Return whether the catalog lists an embedder's model at the length asked for.
+
+    An application can pass a request's vector length on, as it can a model id, so
+    only no length or the one the catalog records counts.
+
+    :param key: the use case and the vector length asked for, ``None`` for the
+        model's own.
+    :returns: ``True`` when the use case is cataloged at that length.
+    :rtype: bool
+    """
+    use_case, dimensions = key
+    entry = load_catalog().get(use_case.model)
+    return (
+        is_cataloged(use_case)
+        and entry is not None
+        and dimensions in (None, entry.dimensions)
+    )
+
+
 class UseCaseCache(Generic[_K, _V]):
     """Values kept per use case, in two tiers so a caller can't evict an app's own.
 
-    A use case whose models the catalog all lists (``is_cataloged``) keeps its value
-    in a tier of up to ``CHECKED_USE_CASES_MAX``. Any other use case may come from a
-    request's model id, so its value goes in a tier of the
+    A key ``protected`` accepts (e.g. ``is_cataloged``) is one the application
+    declared, so its value goes in a tier of up to ``CHECKED_USE_CASES_MAX``. Any
+    other key may come from a request, so its value goes in a tier of the
     ``UNCATALOGED_USE_CASES_MAX`` most recently used. Each tier drops its least
     recently used value once it is full.
+
+    :param protected: whether a key belongs in the protected tier. Called only when
+        a value is kept.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, protected: Callable[[_K], bool]) -> None:
         """Start empty."""
+        self._protected = protected
         self._lock = threading.Lock()
         self._cataloged: OrderedDict[_K, _V] = OrderedDict()
         self._uncataloged: OrderedDict[_K, _V] = OrderedDict()
@@ -355,14 +382,13 @@ class UseCaseCache(Generic[_K, _V]):
                     return tier[key]
         return None
 
-    def put(self, key: _K, use_case: UseCase, value: _V) -> None:
-        """Keep a value, in the tier its use case belongs to.
+    def put(self, key: _K, value: _V) -> None:
+        """Keep a value, in the tier its key belongs to.
 
         :param key: what the value is for.
-        :param use_case: the use case the key is for, which picks the tier.
         :param value: the value.
         """
-        if is_cataloged(use_case):
+        if self._protected(key):
             tier, most = self._cataloged, CHECKED_USE_CASES_MAX
         else:
             tier, most = self._uncataloged, UNCATALOGED_USE_CASES_MAX
@@ -372,13 +398,12 @@ class UseCaseCache(Generic[_K, _V]):
             if len(tier) > most:
                 tier.popitem(last=False)
 
-    def get_or_build(self, key: _K, use_case: UseCase, build: Callable[[], _V]) -> _V:
+    def get_or_build(self, key: _K, build: Callable[[], _V]) -> _V:
         """Return the value kept for a key, building and keeping it if there is none.
 
         A build that raises keeps nothing, so the next call builds again.
 
         :param key: what the value is for.
-        :param use_case: the use case the key is for, which picks the tier.
         :param build: builds the value.
         :returns: the value.
         :rtype: _V
@@ -386,7 +411,7 @@ class UseCaseCache(Generic[_K, _V]):
         value = self.get(key)
         if value is None:
             value = build()
-            self.put(key, use_case, value)
+            self.put(key, value)
         return value
 
     def sizes(self) -> tuple[int, int]:
@@ -422,14 +447,12 @@ class CachedCheck(Generic[_V]):
     def __init__(self, check: Callable[[UseCase], _V]) -> None:
         """Wrap the check."""
         self._check = check
-        self.cache: UseCaseCache[UseCase, _V] = UseCaseCache()
+        self.cache: UseCaseCache[UseCase, _V] = UseCaseCache(is_cataloged)
         update_wrapper(self, check)
 
     def __call__(self, use_case: UseCase) -> _V:
         """Return the check's result for the use case, running it on a miss."""
-        return self.cache.get_or_build(
-            use_case, use_case, lambda: self._check(use_case)
-        )
+        return self.cache.get_or_build(use_case, lambda: self._check(use_case))
 
     def cache_clear(self) -> None:
         """Forget every result, so the next call for each use case checks again."""

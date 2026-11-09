@@ -83,6 +83,7 @@ from ol_llm.catalog import (
     CatalogEntry,
     UseCaseCache,
     catalog_entries,
+    is_cataloged,
     status_tags,
 )
 from ol_llm.errors import (
@@ -191,7 +192,9 @@ async def close_provider_model(model: Model | EmbeddingModel) -> None:
 # The models complete runs on, by use case, with the settings each was built with.
 # The lock keeps two threads' first calls from building a use case twice, which for
 # Bedrock would also create boto3 clients concurrently from the default session.
-_shared_models: UseCaseCache[UseCase, tuple[Settings, Model]] = UseCaseCache()
+_shared_models: UseCaseCache[UseCase, tuple[Settings, Model]] = UseCaseCache(
+    is_cataloged
+)
 _shared_models_lock = threading.Lock()
 
 
@@ -207,7 +210,6 @@ register_at_fork(after_in_child=_after_fork_in_child)
 def reuse_or_build(
     shared: UseCaseCache[_K, tuple[Settings, _T]],
     key: _K,
-    use_case: UseCase,
     settings: Settings,
     build: Callable[[], _T],
 ) -> _T:
@@ -220,7 +222,6 @@ def reuse_or_build(
     :param shared: the values, by key, with the settings each was built with. The
         caller holds the lock that keeps two threads from building one twice.
     :param key: what the value is built for.
-    :param use_case: the use case the key is for.
     :param settings: the settings in force.
     :param build: builds the value under ``settings``.
     :returns: the value.
@@ -229,7 +230,7 @@ def reuse_or_build(
     kept = shared.get(key)
     if kept is None or kept[0] is not settings:
         kept = (settings, build())
-        shared.put(key, use_case, kept)
+        shared.put(key, kept)
     return kept[1]
 
 
@@ -1499,7 +1500,6 @@ def shared_model(use_case: UseCase) -> Model:
     with _shared_models_lock:
         return reuse_or_build(
             _shared_models,
-            use_case,
             use_case,
             settings,
             lambda: build_model(use_case, settings=settings),

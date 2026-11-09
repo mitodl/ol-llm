@@ -33,6 +33,8 @@ from ol_llm.catalog import (
     UNCATALOGED_USE_CASES_MAX,
     Catalog,
     CatalogEntry,
+    UseCaseCache,
+    is_cataloged_embedder,
     load_catalog,
 )
 from ol_llm.embeddings import PolicyEmbeddingModel, build_embedder, shared_embedder
@@ -219,7 +221,7 @@ def test_uncataloged_use_cases_never_evict_a_cataloged_embedder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A caller cycling unlisted model ids can't push out the app's own use cases"""
-    fresh = type(embeddings._shared_embedders)()  # noqa: SLF001
+    fresh = UseCaseCache(is_cataloged_embedder)
     monkeypatch.setattr(embeddings, "_shared_embedders", fresh)
     monkeypatch.setattr(embeddings, "build_embedder", lambda *_, **__: object())
     cataloged = shared_embedder(SEARCH)
@@ -236,6 +238,30 @@ def test_uncataloged_use_cases_never_evict_a_cataloged_embedder(
 
     assert shared_embedder(SEARCH) is cataloged
     assert fresh.sizes() == (1, UNCATALOGED_USE_CASES_MAX)
+
+
+def test_request_dimensions_never_evict_a_cataloged_embedder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller cycling vector lengths can't push out the app's own embedders"""
+    monkeypatch.setattr(embeddings, "build_embedder", lambda *_, **__: object())
+    embeddings._shared_embedders.clear()  # noqa: SLF001
+    try:
+        cataloged = shared_embedder(SEARCH)
+        for dimensions in range(1, CHECKED_USE_CASES_MAX + 2):
+            shared_embedder(SEARCH, dimensions)
+
+        assert shared_embedder(SEARCH) is cataloged
+        assert embeddings._shared_embedders.sizes() == (  # noqa: SLF001
+            1,
+            UNCATALOGED_USE_CASES_MAX,
+        )
+        listed = load_catalog().get(MODEL)
+        assert listed is not None
+        shared_embedder(SEARCH, listed.dimensions)
+        assert embeddings._shared_embedders.sizes()[0] == 2  # noqa: SLF001
+    finally:
+        embeddings._shared_embedders.clear()  # noqa: SLF001
 
 
 @pytest.mark.usefixtures("provider_env")

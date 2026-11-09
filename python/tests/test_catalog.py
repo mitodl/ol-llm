@@ -164,13 +164,13 @@ def test_uncataloged_use_cases_never_evict_a_cataloged_check(
 
 
 def test_the_uncataloged_tier_keeps_the_most_recently_used() -> None:
-    cache: UseCaseCache[str, int] = UseCaseCache()
+    cache: UseCaseCache[str, int] = UseCaseCache(lambda _: False)
     ids = [f"openai:unlisted-{n}" for n in range(UNCATALOGED_USE_CASES_MAX + 1)]
     for n, model_id in enumerate(ids[:-1]):
-        cache.put(model_id, use_case(model_id), n)
+        cache.put(model_id, n)
     assert cache.get(ids[0]) == 0
 
-    cache.put(ids[-1], use_case(ids[-1]), -1)
+    cache.put(ids[-1], -1)
 
     assert cache.get(ids[0]) == 0
     assert cache.get(ids[1]) is None

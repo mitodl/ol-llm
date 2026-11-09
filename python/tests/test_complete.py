@@ -27,7 +27,12 @@ from ol_llm import (
     run_sync,
     tracing,
 )
-from ol_llm.catalog import CHECKED_USE_CASES_MAX, UNCATALOGED_USE_CASES_MAX
+from ol_llm.catalog import (
+    CHECKED_USE_CASES_MAX,
+    UNCATALOGED_USE_CASES_MAX,
+    UseCaseCache,
+    is_cataloged,
+)
 from ol_llm.models import build_agent, override_models, shared_model
 from ol_llm.tracing import TracingConfig, configure_tracing
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -415,7 +420,7 @@ def test_uncataloged_use_cases_never_evict_a_cataloged_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A caller cycling unlisted model ids can't push out the app's own use cases"""
-    fresh = type(models._shared_models)()  # noqa: SLF001
+    fresh = UseCaseCache(is_cataloged)
     monkeypatch.setattr(models, "_shared_models", fresh)
     monkeypatch.setattr(models, "build_model", lambda *_, **__: object())
     cataloged = shared_model(SUMMARY)
