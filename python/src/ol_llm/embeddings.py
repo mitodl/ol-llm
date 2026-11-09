@@ -37,7 +37,7 @@ from pydantic_ai.usage import RequestUsage
 
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution
 from ol_llm.catalog import CatalogEntry, embedding_entry, status_tags
-from ol_llm.loops import LoopLocal, run_coroutine
+from ol_llm.loops import LoopLocal, register_at_fork, run_coroutine
 from ol_llm.models import (
     classify_failure,
     classify_run_failure,
@@ -67,6 +67,15 @@ _model_override: ContextVar[EmbeddingModel | None] = ContextVar(
 # ol_llm.models.shared_model.
 _shared_embedders: dict[tuple[UseCase, int | None], tuple[Settings, Embedder]] = {}
 _shared_embedders_lock = threading.Lock()
+
+
+def _after_fork_in_child() -> None:
+    # A parent thread may have held it at the fork, and won't release it here.
+    global _shared_embedders_lock  # noqa: PLW0603
+    _shared_embedders_lock = threading.Lock()
+
+
+register_at_fork(after_in_child=_after_fork_in_child)
 
 # What a provider embedding model raises on a response it cannot read. Bedrock's
 # Cohere and Nova handlers raise UnexpectedModelBehavior, Titan's indexes the body

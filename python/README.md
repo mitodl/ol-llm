@@ -50,7 +50,7 @@ code that awaits ol-llm itself uses `ol_llm.run_coroutine(coro)` for the same re
 `asyncio.run` or `async_to_sync`: those start a loop per call, and the clients built for a loop
 ol-llm does not own are dropped, not closed, once it has closed. `ol_llm.close_thread_loop()` closes
 the calling thread's loop and its clients, for a worker thread about to finish; the main
-thread's closes at exit. A forked child (a Celery prefork worker) sets the parent's loop and
+thread's closes at exit. A forked child (a Celery prefork worker) sets the parent's loops and
 clients aside without closing them and builds its own, and gets new tracing clients too. A call site that needs a new agent per run (per-run
 instructions, output schema, or validators) builds the model once with `ol_llm.build_model` and
 each agent over it with `ol_llm.agent_over(model, ...)`, which takes the agent arguments

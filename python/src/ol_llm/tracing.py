@@ -70,6 +70,8 @@ from opik.hooks import HttpxClientHook, add_httpx_client_hook
 from opik.integrations.otel import OpikSpanProcessor
 from requests.auth import AuthBase
 
+from ol_llm.loops import register_at_fork
+
 _ENV_PREFIX = "OPIK_KEYCLOAK"
 _CONTENT_ENV = "OL_LLM_TRACE_CONTENT"
 
@@ -665,4 +667,4 @@ def _after_fork_in_child() -> None:
     reset_global_client(end_client=False)
 
 
-os.register_at_fork(after_in_child=_after_fork_in_child)
+register_at_fork(after_in_child=_after_fork_in_child)

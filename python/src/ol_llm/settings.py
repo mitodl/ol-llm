@@ -16,6 +16,8 @@ import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
+from ol_llm.loops import register_at_fork
+
 _ENV_PREFIX = "OL_LLM"
 
 GATEWAY_ROUTE_FAMILIES = frozenset({"openai", "anthropic"})
@@ -114,6 +116,15 @@ class Settings:
 
 _lock = threading.Lock()
 _settings: Settings | None = None
+
+
+def _after_fork_in_child() -> None:
+    # A parent thread may have held it at the fork, and won't release it here.
+    global _lock  # noqa: PLW0603
+    _lock = threading.Lock()
+
+
+register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def configure(settings: Settings) -> None:

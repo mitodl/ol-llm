@@ -21,10 +21,11 @@ import time
 import traceback
 import warnings
 from collections.abc import Callable, Coroutine, Generator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -39,11 +40,16 @@ from ol_llm import (
     complete_sync,
     configure_tracing,
     embed,
+    embeddings,
     loops,
+    models,
+    prompts,
     run_coroutine,
     tracing,
 )
+from ol_llm import settings as settings_module
 from ol_llm.models import shared_model
+from ol_llm.policy import resolve_policy
 from ol_llm.settings import GatewayRoute, Settings, configure
 from ol_llm.testing import override_models
 from ol_llm.tracing import OTLP_TRACES_PATH, KeycloakTokens
@@ -350,21 +356,110 @@ def test_a_forked_child_drops_the_parents_loop_and_values() -> None:
     assert run_in_fork(in_child) == (False, False, False)
 
 
+def after_the_loop_blocks() -> str:
+    # Long enough that the loop is waiting on the self-pipe when this returns.
+    time.sleep(0.05)
+    return "woken"
+
+
+async def woken_via_a_thread() -> str:
+    """Finish only if another thread can wake the running loop."""
+    return await asyncio.wait_for(asyncio.to_thread(after_the_loop_blocks), 5)
+
+
 def test_the_parents_loop_still_wakes_after_a_child_collects_garbage() -> None:
     # The child shares the parent loop's epoll instance; closing the inherited
     # loop there would unregister the parent's self-pipe.
-    def after_the_loop_blocks() -> str:
-        # Long enough that the loop is waiting on the self-pipe when this returns.
-        time.sleep(0.05)
-        return "woken"
-
-    async def via_a_thread() -> str:
-        return await asyncio.wait_for(asyncio.to_thread(after_the_loop_blocks), 5)
-
-    assert run_coroutine(via_a_thread()) == "woken"
+    assert run_coroutine(woken_via_a_thread()) == "woken"
     run_in_fork(gc.collect)
 
-    assert run_coroutine(via_a_thread()) == "woken"
+    assert run_coroutine(woken_via_a_thread()) == "woken"
+
+
+def test_a_worker_threads_loop_still_wakes_after_a_child_collects_garbage() -> None:
+    # The worker thread doesn't survive the fork, so its loop is not the forking
+    # thread's, but it shares the same epoll instance with the parent.
+    with ThreadPoolExecutor(1) as worker:
+        assert worker.submit(run_coroutine, woken_via_a_thread()).result() == "woken"
+        run_in_fork(gc.collect)
+
+        assert worker.submit(run_coroutine, woken_via_a_thread()).result() == "woken"
+        worker.submit(close_thread_loop).result()
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [
+        (models, "_shared_models_lock"),
+        (embeddings, "_shared_embedders_lock"),
+        (settings_module, "_lock"),
+        (prompts, "_inflight_lock"),
+        (tracing, "_lock"),
+    ],
+)
+def test_a_lock_another_thread_holds_at_the_fork_is_free_in_the_child(
+    module: ModuleType, name: str
+) -> None:
+    holding, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with getattr(module, name):
+            holding.set()
+            release.wait()
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    holding.wait()
+    try:
+        assert run_in_fork(lambda: getattr(module, name).acquire(timeout=1))
+    finally:
+        release.set()
+        holder.join()
+
+
+def test_a_forked_child_starts_no_prompt_fetch_from_the_parents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The thread that would resolve it did not survive the fork.
+    monkeypatch.setitem(prompts._inflight, "lookup", Future())  # type: ignore[index]  # noqa: SLF001
+
+    assert run_in_fork(lambda: dict(prompts._inflight)) == {}  # noqa: SLF001
+
+
+def test_concurrent_first_bedrock_calls_build_one_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Clients come from boto3's default session, which isn't thread-safe.
+    built: list[object] = []
+
+    def slow_client(_policy: object) -> object:
+        time.sleep(0.05)
+        built.append(client := object())
+        return client
+
+    monkeypatch.setattr(models, "_bedrock_client", slow_client)
+    monkeypatch.setattr(models, "_bedrock_provider", lambda client: client)
+    use_case = UseCase(
+        app="mit-learn", name="summary", profile="request", model=PRIMARY
+    )
+    factory = models.provider_factory(
+        use_case, resolve_policy(use_case), Settings(environment="ci")
+    )
+
+    with ThreadPoolExecutor(2) as pool:
+        clients = list(pool.map(lambda _: factory("bedrock"), range(2)))
+
+    assert len(built) == 1
+    assert clients[0] is clients[1]
+
+
+def test_without_register_at_fork_no_hook_is_registered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Windows has no fork, and no os.register_at_fork.
+    monkeypatch.delattr(os, "register_at_fork")
+
+    loops.register_at_fork(after_in_child=lambda: None)
 
 
 @pytest.mark.usefixtures("provider_env")

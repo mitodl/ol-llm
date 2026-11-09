@@ -88,7 +88,7 @@ from ol_llm.errors import (
     LLMRejected,
     LLMUnavailable,
 )
-from ol_llm.loops import LoopLocal
+from ol_llm.loops import LoopLocal, register_at_fork
 from ol_llm.policy import CallPolicy, Profile, UseCase, resolve_policy
 from ol_llm.settings import GatewayRoute, Settings, get_settings
 from ol_llm.tracing import include_content, tracer_provider
@@ -186,6 +186,15 @@ async def close_provider_model(model: Model | EmbeddingModel) -> None:
 # Bedrock would also create boto3 clients concurrently from the default session.
 _shared_models: dict[UseCase, tuple[Settings, Model]] = {}
 _shared_models_lock = threading.Lock()
+
+
+def _after_fork_in_child() -> None:
+    # A parent thread may have held it at the fork, and won't release it here.
+    global _shared_models_lock  # noqa: PLW0603
+    _shared_models_lock = threading.Lock()
+
+
+register_at_fork(after_in_child=_after_fork_in_child)
 
 # Patched in tests so retries do not wait.
 _sleep: Callable[[float], Any] = asyncio.sleep
@@ -947,11 +956,14 @@ def provider_factory(
 
     It runs again for each event loop a model's requests run on (see
     ``PolicyModel``). The boto3 client is synchronous, so every loop in a process
-    shares the first one built there: creating clients from boto3's default session
-    on several threads at once is not thread-safe. A forked child builds its own
-    rather than share the parent's pooled connection.
+    shares the first one built there, built under a per-process lock: creating
+    clients from boto3's default session on several threads at once is not
+    thread-safe. A forked child builds its own rather than share the parent's
+    pooled connection.
     """
     bedrock_clients: dict[int, Any] = {}
+    # One per process, so a child never waits on a lock held at the fork.
+    bedrock_locks: dict[int, threading.Lock] = {}
 
     def factory(provider: str) -> Provider[Any]:  # noqa: PLR0911
         if provider in _OPENAI_PROVIDERS:
@@ -966,8 +978,9 @@ def provider_factory(
             )
         if provider == "bedrock":
             pid = os.getpid()
-            if (client := bedrock_clients.get(pid)) is None:
-                client = bedrock_clients[pid] = _bedrock_client(policy)
+            with bedrock_locks.setdefault(pid, threading.Lock()):
+                if (client := bedrock_clients.get(pid)) is None:
+                    client = bedrock_clients[pid] = _bedrock_client(policy)
             return _bedrock_provider(client)
         if provider in {"google", "google-cloud"}:
             return _google_provider(provider, policy)

@@ -99,12 +99,15 @@ class _ThreadLoop(threading.local):
 
 
 _thread = _ThreadLoop()
+# Every thread's runner loop, so a fork can keep the ones whose threads it drops.
+_loops: "weakref.WeakSet[asyncio.AbstractEventLoop]" = weakref.WeakSet()
 
 
 def _thread_loop() -> asyncio.AbstractEventLoop:
     loop = _thread.loop
     if loop is None or loop.is_closed():
         loop = _thread.loop = asyncio.new_event_loop()
+        _loops.add(loop)
     return loop
 
 
@@ -173,14 +176,35 @@ def close_thread_loop() -> None:
         loop.close()
 
 
+def register_at_fork(**hooks: Callable[[], object]) -> None:
+    """``os.register_at_fork`` where the platform can fork (not Windows).
+
+    :param hooks: ``before``, ``after_in_parent`` and ``after_in_child``.
+    """
+    if hasattr(os, "register_at_fork"):
+        os.register_at_fork(**hooks)
+
+
 # What a forked child inherited, kept so it is never garbage collected. Collecting
-# the parent's loop closes it, and closing unregisters its self-pipe from the epoll
-# instance the child shares with the parent, after which the parent's loop is never
-# woken by another thread again.
+# a parent's loop closes it, and closing unregisters its self-pipe from the epoll
+# instance the child shares with the parent, after which that loop is never woken
+# by another thread again. That holds for every thread's loop: the child drops the
+# other threads' thread-local state, so their loops are held from before the fork.
 _inherited: list[object] = []
+_held_across_fork: list[asyncio.AbstractEventLoop] = []
+
+
+def _before_fork() -> None:
+    _held_across_fork[:] = list(_loops)
+
+
+def _after_fork_in_parent() -> None:
+    _held_across_fork.clear()
 
 
 def _after_fork_in_child() -> None:
+    _inherited.extend(_held_across_fork)
+    _held_across_fork.clear()
     _inherited.append(_thread.loop)
     _thread.loop = None
     for local in list(_instances):
@@ -189,4 +213,8 @@ def _after_fork_in_child() -> None:
 
 
 atexit.register(close_thread_loop)
-os.register_at_fork(after_in_child=_after_fork_in_child)
+register_at_fork(
+    before=_before_fork,
+    after_in_parent=_after_fork_in_parent,
+    after_in_child=_after_fork_in_child,
+)

@@ -48,6 +48,7 @@ from opik.rest_api.types import PromptVersionDetail
 
 from ol_llm import tracing
 from ol_llm.attribution import DegradedReason
+from ol_llm.loops import register_at_fork
 from ol_llm.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -451,6 +452,17 @@ class _Lookup:
 
 _inflight_lock = threading.Lock()
 _inflight: dict[_Lookup, Future[BasePrompt | None]] = {}
+
+
+def _after_fork_in_child() -> None:
+    # The parent's fetch threads didn't survive the fork, so their futures would
+    # never resolve, and a parent thread may have held the lock.
+    global _inflight_lock, _inflight  # noqa: PLW0603
+    _inflight_lock = threading.Lock()
+    _inflight = {}
+
+
+register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def _fetch(lookup: _Lookup) -> BasePrompt | None:
