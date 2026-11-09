@@ -36,7 +36,13 @@ from pydantic_ai.exceptions import ContentFilterError, UnexpectedModelBehavior
 from pydantic_ai.usage import RequestUsage
 
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution
-from ol_llm.catalog import CatalogEntry, embedding_entry, status_tags
+from ol_llm.catalog import (
+    CatalogEntry,
+    UseCaseCache,
+    embedding_entry,
+    is_cataloged_embedder,
+    status_tags,
+)
 from ol_llm.loops import LoopLocal, register_at_fork, run_coroutine
 from ol_llm.models import (
     classify_failure,
@@ -45,6 +51,7 @@ from ol_llm.models import (
     instrumentation_settings,
     provider_factory,
     retrying,
+    reuse_or_build,
 )
 from ol_llm.policy import CallPolicy, UseCase, resolve_policy
 from ol_llm.settings import Settings, get_settings
@@ -65,7 +72,9 @@ _model_override: ContextVar[EmbeddingModel | None] = ContextVar(
 # was built with: each build creates provider clients, and calls should reuse them.
 # The lock keeps two threads' first calls from building one twice, as for
 # ol_llm.models.shared_model.
-_shared_embedders: dict[tuple[UseCase, int | None], tuple[Settings, Embedder]] = {}
+_shared_embedders: UseCaseCache[
+    tuple[UseCase, int | None], tuple[Settings, Embedder]
+] = UseCaseCache(is_cataloged_embedder)
 _shared_embedders_lock = threading.Lock()
 
 
@@ -323,9 +332,9 @@ def shared_embedder(use_case: UseCase, dimensions: int | None = None) -> Embedde
 
     Built on the first call for a use case and vector length and reused on every
     thread and event loop, since ``PolicyEmbeddingModel`` keeps a provider model
-    per loop. An embedder is rebuilt after ``configure`` replaces the settings. Under
-    ``override_embedding_models`` every call builds a new one, so an override never
-    outlives its block.
+    per loop. An embedder is rebuilt after ``configure`` replaces the settings, or
+    once it has fallen out of ``UseCaseCache``. Under ``override_embedding_models``
+    every call builds a new one, so an override never outlives its block.
 
     :param use_case: the call site.
     :param dimensions: the vector length to ask for, as for ``build_embedder``.
@@ -337,13 +346,12 @@ def shared_embedder(use_case: UseCase, dimensions: int | None = None) -> Embedde
         return build_embedder(use_case, dimensions=dimensions)
     settings = get_settings()
     with _shared_embedders_lock:
-        cached = _shared_embedders.get((use_case, dimensions))
-        if cached is None or cached[0] is not settings:
-            embedder = build_embedder(
-                use_case, dimensions=dimensions, settings=settings
-            )
-            cached = _shared_embedders[use_case, dimensions] = (settings, embedder)
-    return cached[1]
+        return reuse_or_build(
+            _shared_embedders,
+            (use_case, dimensions),
+            settings,
+            lambda: build_embedder(use_case, dimensions=dimensions, settings=settings),
+        )
 
 
 def _start(
@@ -423,7 +431,10 @@ async def embed(
         differently, so a default would be silently wrong for one of them.
     :param dimensions: the vector length to ask for, for a model that can shorten
         its vectors. Omitted, the model returns its default length, which for a
-        listed model is the catalog entry's ``dimensions``.
+        listed model is the catalog entry's ``dimensions``. Must be defined by the
+        application, not taken from a request: the embedder for each length is
+        cached, and only the catalog's length is kept apart from what callers can
+        evict.
     :param attribution: the per-call attribution fields. The user id also reaches
         OpenAI and Azure as the request's ``user``; the other providers have no
         such field.
@@ -464,9 +475,10 @@ def embed_sync(
 ) -> EmbedResult:
     """Embed texts synchronously, for Celery tasks and Dagster assets.
 
-    Takes the same arguments as ``embed`` and runs it on the thread's ol-llm event
-    loop (see ``run_coroutine``). It cannot be called while an event loop is
-    running in the thread; use ``embed`` there.
+    Takes the same arguments as ``embed``, with ``dimensions`` likewise defined by
+    the application, and runs it on the thread's ol-llm event loop (see
+    ``run_coroutine``). It cannot be called while an event loop is running in the
+    thread; use ``embed`` there.
 
     :returns: the result.
     :rtype: EmbedResult

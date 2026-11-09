@@ -28,7 +28,15 @@ from ol_llm import (
     embeddings,
     tracing,
 )
-from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
+from ol_llm.catalog import (
+    CHECKED_USE_CASES_MAX,
+    UNCATALOGED_USE_CASES_MAX,
+    Catalog,
+    CatalogEntry,
+    UseCaseCache,
+    is_cataloged_embedder,
+    load_catalog,
+)
 from ol_llm.embeddings import PolicyEmbeddingModel, build_embedder, shared_embedder
 from ol_llm.settings import GatewayRoute
 from ol_llm.testing import override_embedding_models, tracing_disabled
@@ -207,6 +215,53 @@ def test_first_calls_on_several_threads_build_the_embedder_once(
 
     assert len(built) == 1
     assert found == built * 4
+
+
+def test_uncataloged_use_cases_never_evict_a_cataloged_embedder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller cycling unlisted model ids can't push out the app's own use cases"""
+    fresh = UseCaseCache(is_cataloged_embedder)
+    monkeypatch.setattr(embeddings, "_shared_embedders", fresh)
+    monkeypatch.setattr(embeddings, "build_embedder", lambda *_, **__: object())
+    cataloged = shared_embedder(SEARCH)
+
+    for n in range(CHECKED_USE_CASES_MAX + 1):
+        shared_embedder(
+            UseCase(
+                app="mit-learn",
+                name="search-query",
+                profile="request",
+                model=f"openai:unlisted-{n}",
+            )
+        )
+
+    assert shared_embedder(SEARCH) is cataloged
+    assert fresh.sizes() == (1, UNCATALOGED_USE_CASES_MAX)
+
+
+def test_request_dimensions_never_evict_a_cataloged_embedder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller cycling vector lengths can't push out the app's own embedders"""
+    monkeypatch.setattr(embeddings, "build_embedder", lambda *_, **__: object())
+    embeddings._shared_embedders.clear()  # noqa: SLF001
+    try:
+        cataloged = shared_embedder(SEARCH)
+        for dimensions in range(1, CHECKED_USE_CASES_MAX + 2):
+            shared_embedder(SEARCH, dimensions)
+
+        assert shared_embedder(SEARCH) is cataloged
+        assert embeddings._shared_embedders.sizes() == (  # noqa: SLF001
+            1,
+            UNCATALOGED_USE_CASES_MAX,
+        )
+        listed = load_catalog().get(MODEL)
+        assert listed is not None
+        shared_embedder(SEARCH, listed.dimensions)
+        assert embeddings._shared_embedders.sizes()[0] == 2  # noqa: SLF001
+    finally:
+        embeddings._shared_embedders.clear()  # noqa: SLF001
 
 
 @pytest.mark.usefixtures("provider_env")

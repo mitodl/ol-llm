@@ -18,6 +18,20 @@ _ENV_PREFIX = "OL_LLM"
 _RESERVED_NAMES = frozenset({"request", "batch"})
 _NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
 
+MODEL_ID_MAX_CHARS = 512
+"""The longest model id a use case accepts.
+
+An application can build a use case from a request's model id, so the id is caller
+input. 512 matches the longest id learn-ai stores (``LLMModel.litellm_id``).
+"""
+
+MAX_FALLBACK_MODELS = 8
+"""The most fallback models a use case may name.
+
+An application can build a use case from a request, so the chain is caller input,
+and each fallback is a model built, checked and possibly called.
+"""
+
 
 @dataclass(frozen=True, kw_only=True)
 class CallPolicy:
@@ -45,19 +59,25 @@ PROFILE_DEFAULTS: Mapping[Profile, CallPolicy] = {
 class UseCase:
     """One LLM call site, declared once as a module-level constant.
 
+    Of its fields, only ``model`` may come from request input, e.g. a chat request
+    naming its model. ``fallback_models`` and every other field must be defined by
+    the application: ol-llm keeps a use case whose models the catalog all lists in
+    a cache tier callers can't evict, which assumes there are only so many of them.
+
     :param app: the application, e.g. ``learn-ai``. Becomes the Opik project.
     :param name: the use case, e.g. ``course-translation``: lowercase letters, digits,
         and hyphens. Names the environment overrides, so it may not be ``request`` or
         ``batch``, and goes in a request header.
     :param profile: ``request`` for a user waiting on the answer, ``batch`` for
         pipelines and background jobs.
-    :param model: the model id in PydanticAI form, ``provider:model``. The model
-        catalog (``ol_llm.catalog``) need not list it, but must not list it as
-        retired.
+    :param model: the model id in PydanticAI form, ``provider:model``, at most
+        ``MODEL_ID_MAX_CHARS`` characters. The model catalog (``ol_llm.catalog``)
+        need not list it, but must not list it as retired.
     :param fallback_models: model ids tried in order once the primary has spent its
-        retries on a rate limit or an outage. Empty means no fallback, and must be
-        empty when the primary's route falls back on its own. That is checked only
-        for a primary the catalog lists, since the catalog records the route.
+        retries on a rate limit or an outage, at most ``MAX_FALLBACK_MODELS``.
+        Empty means no fallback, and must be empty when the primary's route falls
+        back on its own. That is checked only for a primary the catalog lists,
+        since the catalog records the route.
     :param timeout_seconds: overrides the profile default; needs ``policy_reason``.
     :param max_retries: overrides the profile default; needs ``policy_reason``.
     :param max_backoff_seconds: overrides the profile default; needs
@@ -89,7 +109,9 @@ class UseCase:
         """Validate the declaration so a bad one fails at import, not on first call.
 
         :raises ValueError: on a malformed or reserved name, an unknown profile, a
-            policy override without a reason, or an out-of-range value.
+            model id longer than ``MODEL_ID_MAX_CHARS``, more than
+            ``MAX_FALLBACK_MODELS`` fallbacks, a policy override without a reason, or
+            an out-of-range value.
         """
         if not self.app:
             msg = "UseCase.app must not be empty"
@@ -117,6 +139,23 @@ class UseCase:
             msg = "UseCase.output_retries must not be negative"
             raise ValueError(msg)
         object.__setattr__(self, "fallback_models", tuple(self.fallback_models))
+        if len(self.fallback_models) > MAX_FALLBACK_MODELS:
+            msg = (
+                f"UseCase.fallback_models may name at most {MAX_FALLBACK_MODELS}, "
+                f"not {len(self.fallback_models)}"
+            )
+            raise ValueError(msg)
+        for field_name, model_id in (
+            ("model", self.model),
+            *(("fallback_models", fallback) for fallback in self.fallback_models),
+        ):
+            if len(model_id) > MODEL_ID_MAX_CHARS:
+                # The id may come from a request, so it is not repeated here.
+                msg = (
+                    f"UseCase.{field_name} ids must be at most {MODEL_ID_MAX_CHARS} "
+                    f"characters, not {len(model_id)}"
+                )
+                raise ValueError(msg)
         object.__setattr__(self, "_env_name", self.name.upper().replace("-", "_"))
         _check_policy_values(
             f"use case {self.name!r}",
