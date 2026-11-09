@@ -3,8 +3,10 @@
   "extends": ["local>mitodl/.github:renovate-config"],
   "packageRules": [
     {
-      "description": "opik is pinned exactly because consumers slim it with uv override-dependencies. A bump always gets human review, and the slimmed-install smoke test in python.yml has to pass first.",
+      "description": "opik is pinned exactly because consumers slim it with uv override-dependencies, so they also inherit the version caps of the pinned release. A monthly bump keeps those caps close to current. A bump always gets human review, updates the documented cap overrides, and the slimmed-install smoke test in python.yml has to pass first.",
+      "matchDatasources": ["pypi"],
       "matchDepNames": ["opik"],
+      "schedule": ["* * 1 * *"],
       "automerge": false
     }
   ]

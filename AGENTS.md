@@ -27,6 +27,15 @@ uv run prek run --all-files                     # the same hooks CI runs
   anything imports opik. Nothing may import opik ahead of it.
 - `opik` is pinned exactly. Bumping it means the smoke test must still pass with the overrides
   in `python/smoke/pyproject.toml`, which are the overrides consumers copy from the README.
+- `opik` is bumped once a month (the Renovate rule in `renovate.json` opens the PR on the 1st),
+  so the version caps it puts on its dependencies stay close to current. On a bump, read the new
+  release's caps from its metadata:
+  `curl -s https://pypi.org/pypi/opik/<version>/json | jq -r '.info.requires_dist[] | select(contains("<="))'`.
+  Replace the cap overrides in the README's "Overriding opik's version caps" section and in
+  `python/smoke/pyproject.toml` with one entry per capped package the slimming list does not
+  already drop, written as the range opik and ol-llm need without the cap (e.g.
+  `"pydantic>=2.14,<3"`, `"sentry_sdk>=2.0.0"`), and keep the smoke test
+  passing with them. Drop them once comet-ml/opik#9491 moves the caps into an extra.
 - Do not add litellm as a dependency.
 - No async client is created outside a `LoopLocal` (`ol_llm/loops.py`) with a close function,
   so the runner can close it and a forked child drops it. New loop-local resources join the
