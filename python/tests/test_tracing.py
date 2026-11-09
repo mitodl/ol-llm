@@ -297,12 +297,22 @@ def test_a_different_configuration_after_use_is_refused_and_not_kept(
     assert tracer_provider("mit-learn") is provider
 
 
-def test_disabled_tracing_builds_no_provider_and_no_hook(
+def test_disabled_tracing_builds_no_provider_but_still_hooks_the_sdk(
     hooks: list[HttpxClientHook],
 ) -> None:
     configure_tracing(TracingConfig(enabled=False, keycloak=KEYCLOAK))
 
     assert tracer_provider("mit-learn") is None
+    tokens = sdk_auth(hooks).tokens
+    assert tokens is not None
+    assert tokens is tracing._state().tokens  # noqa: SLF001
+
+
+def test_disabled_tracing_without_keycloak_adds_no_hook(
+    hooks: list[HttpxClientHook],
+) -> None:
+    configure_tracing(TracingConfig(enabled=False))
+
     assert hooks == []
 
 
