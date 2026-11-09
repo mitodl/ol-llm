@@ -45,20 +45,23 @@ dependencies = [
 
 [project.optional-dependencies]
 # The default construction path for agents and single calls.
-pydantic-ai = ["pydantic-ai-slim>=2.60,<3"]
+pydantic-ai = ["pydantic-ai-slim>=2.66,<3"]
 # traced_chat, for call sites that keep their LangChain or LangGraph chat models.
 langchain = ["langchain-core>=1.1,<2"]
 # Provider SDKs, each through PydanticAI's own extra, so a provider extra also
 # installs PydanticAI.
-anthropic = ["pydantic-ai-slim[anthropic]>=2.60,<3"]
-bedrock = ["pydantic-ai-slim[bedrock]>=2.60,<3"]
-google = ["pydantic-ai-slim[google]>=2.60,<3"]
-mistral = ["pydantic-ai-slim[mistral]>=2.60,<3"]
-openai = ["pydantic-ai-slim[openai]>=2.60,<3"]
+anthropic = ["pydantic-ai-slim[anthropic]>=2.66,<3"]
+bedrock = ["pydantic-ai-slim[bedrock]>=2.66,<3"]
+google = ["pydantic-ai-slim[google]>=2.66,<3"]
+mistral = ["pydantic-ai-slim[mistral]>=2.66,<3"]
+openai = ["pydantic-ai-slim[openai]>=2.66,<3"]
 # PydanticAI's first-party capabilities: in-session memory, compaction, and
 # conversation search. Each harness release pins pydantic-ai-slim exactly, so
 # this extra also fixes the PydanticAI version. 0.x: pinned to a minor series.
-harness = ["pydantic-ai-harness>=0.60,<0.61"]
+# 0.66 fixes the secret-redaction ReDoS (GHSA-mfx5-pc32-32m8), and slim 2.66
+# fixes eight that affect 2.65 and earlier (GHSA-m5vj-8mcw-82qx and others),
+# hence the 2.66 floor on every extra above.
+harness = ["pydantic-ai-harness>=0.66,<0.67"]
 # Client for the shared memory service (cross-session recall and user-scoped
 # facts). Hindsight is the leading candidate and its PoC is still open, so this
 # extra may change backend before the memory interface ships.
