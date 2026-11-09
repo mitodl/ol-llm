@@ -1,5 +1,6 @@
 import pytest
 from ol_llm.policy import (
+    MAX_FALLBACK_MODELS,
     MODEL_ID_MAX_CHARS,
     CallPolicy,
     UseCase,
@@ -71,6 +72,20 @@ def test_a_model_id_at_the_limit_is_accepted() -> None:
     model_id = "openai:" + "m" * (MODEL_ID_MAX_CHARS - len("openai:"))
 
     assert use_case(model=model_id, fallback_models=[model_id]).model == model_id
+
+
+def test_too_many_fallback_models_are_refused() -> None:
+    """A use case built from a request can't name an arbitrarily long chain"""
+    fallbacks = [f"openai:fallback-{n}" for n in range(MAX_FALLBACK_MODELS + 1)]
+
+    with pytest.raises(ValueError, match=f"at most {MAX_FALLBACK_MODELS}, not 9"):
+        use_case(fallback_models=fallbacks)
+
+
+def test_fallback_models_at_the_limit_are_accepted() -> None:
+    fallbacks = [f"openai:fallback-{n}" for n in range(MAX_FALLBACK_MODELS)]
+
+    assert len(use_case(fallback_models=fallbacks).fallback_models) == len(fallbacks)
 
 
 def test_environment_overrides_resolve_in_order() -> None:

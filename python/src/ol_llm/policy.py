@@ -25,6 +25,13 @@ An application can build a use case from a request's model id, so the id is call
 input. 512 matches the longest id learn-ai stores (``LLMModel.litellm_id``).
 """
 
+MAX_FALLBACK_MODELS = 8
+"""The most fallback models a use case may name.
+
+An application can build a use case from a request, so the chain is caller input,
+and each fallback is a model built, checked and possibly called.
+"""
+
 
 @dataclass(frozen=True, kw_only=True)
 class CallPolicy:
@@ -62,9 +69,10 @@ class UseCase:
         ``MODEL_ID_MAX_CHARS`` characters. The model catalog (``ol_llm.catalog``)
         need not list it, but must not list it as retired.
     :param fallback_models: model ids tried in order once the primary has spent its
-        retries on a rate limit or an outage. Empty means no fallback, and must be
-        empty when the primary's route falls back on its own. That is checked only
-        for a primary the catalog lists, since the catalog records the route.
+        retries on a rate limit or an outage, at most ``MAX_FALLBACK_MODELS``.
+        Empty means no fallback, and must be empty when the primary's route falls
+        back on its own. That is checked only for a primary the catalog lists,
+        since the catalog records the route.
     :param timeout_seconds: overrides the profile default; needs ``policy_reason``.
     :param max_retries: overrides the profile default; needs ``policy_reason``.
     :param max_backoff_seconds: overrides the profile default; needs
@@ -96,8 +104,9 @@ class UseCase:
         """Validate the declaration so a bad one fails at import, not on first call.
 
         :raises ValueError: on a malformed or reserved name, an unknown profile, a
-            model id longer than ``MODEL_ID_MAX_CHARS``, a policy override without a
-            reason, or an out-of-range value.
+            model id longer than ``MODEL_ID_MAX_CHARS``, more than
+            ``MAX_FALLBACK_MODELS`` fallbacks, a policy override without a reason, or
+            an out-of-range value.
         """
         if not self.app:
             msg = "UseCase.app must not be empty"
@@ -125,6 +134,12 @@ class UseCase:
             msg = "UseCase.output_retries must not be negative"
             raise ValueError(msg)
         object.__setattr__(self, "fallback_models", tuple(self.fallback_models))
+        if len(self.fallback_models) > MAX_FALLBACK_MODELS:
+            msg = (
+                f"UseCase.fallback_models may name at most {MAX_FALLBACK_MODELS}, "
+                f"not {len(self.fallback_models)}"
+            )
+            raise ValueError(msg)
         for field_name, model_id in (
             ("model", self.model),
             *(("fallback_models", fallback) for fallback in self.fallback_models),
