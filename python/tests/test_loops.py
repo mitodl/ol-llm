@@ -453,6 +453,40 @@ def test_concurrent_first_bedrock_calls_build_one_client(
     assert clients[0] is clients[1]
 
 
+@pytest.mark.usefixtures("provider_env")
+def test_a_bedrock_client_never_uses_boto3s_default_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Each model's factory builds its own client, possibly on several threads at once.
+    import boto3  # noqa: PLC0415
+
+    def shared(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("built from boto3's default session")
+
+    monkeypatch.setattr(boto3, "_get_default_session", shared)
+    use_case = UseCase(
+        app="mit-learn", name="summary", profile="request", model=PRIMARY
+    )
+
+    assert models._bedrock_client(resolve_policy(use_case)) is not None  # noqa: SLF001
+
+
+def test_no_loop_is_created_between_the_snapshot_and_the_fork() -> None:
+    # Later before-fork hooks (logging's among them) can release the GIL.
+    loops._before_fork()  # noqa: SLF001
+    try:
+        with ThreadPoolExecutor(1) as worker:
+            first_call = worker.submit(run_coroutine, asyncio.sleep(0))
+            time.sleep(0.2)
+            assert not first_call.done()
+            loops._after_fork_in_parent()  # noqa: SLF001
+            first_call.result(timeout=5)
+            worker.submit(close_thread_loop).result()
+    finally:
+        if loops._loops_lock.locked():  # noqa: SLF001
+            loops._loops_lock.release()  # noqa: SLF001
+
+
 def test_without_register_at_fork_no_hook_is_registered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

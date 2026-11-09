@@ -103,11 +103,17 @@ _thread = _ThreadLoop()
 _loops: "weakref.WeakSet[asyncio.AbstractEventLoop]" = weakref.WeakSet()
 
 
+# Held from the snapshot before a fork until it is done, so no thread creates a
+# loop the snapshot missed.
+_loops_lock = threading.Lock()
+
+
 def _thread_loop() -> asyncio.AbstractEventLoop:
     loop = _thread.loop
     if loop is None or loop.is_closed():
-        loop = _thread.loop = asyncio.new_event_loop()
-        _loops.add(loop)
+        with _loops_lock:
+            loop = _thread.loop = asyncio.new_event_loop()
+            _loops.add(loop)
     return loop
 
 
@@ -195,14 +201,18 @@ _held_across_fork: list[asyncio.AbstractEventLoop] = []
 
 
 def _before_fork() -> None:
+    _loops_lock.acquire()
     _held_across_fork[:] = list(_loops)
 
 
 def _after_fork_in_parent() -> None:
     _held_across_fork.clear()
+    _loops_lock.release()
 
 
 def _after_fork_in_child() -> None:
+    global _loops_lock  # noqa: PLW0603
+    _loops_lock = threading.Lock()
     _inherited.extend(_held_across_fork)
     _held_across_fork.clear()
     _inherited.append(_thread.loop)

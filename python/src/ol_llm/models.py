@@ -882,7 +882,9 @@ def _bedrock_client(policy: CallPolicy) -> Any:  # noqa: ANN401
         connect_timeout=policy.timeout_seconds,
         retries={"total_max_attempts": 1},
     )
-    return boto3.client("bedrock-runtime", config=config)
+    # A session of its own: boto3's default session isn't thread-safe, and other
+    # models' factories build their clients on other threads at the same time.
+    return boto3.session.Session().client("bedrock-runtime", config=config)
 
 
 def _bedrock_provider(client: Any) -> Provider[Any]:  # noqa: ANN401
@@ -956,10 +958,8 @@ def provider_factory(
 
     It runs again for each event loop a model's requests run on (see
     ``PolicyModel``). The boto3 client is synchronous, so every loop in a process
-    shares the first one built there, built under a per-process lock: creating
-    clients from boto3's default session on several threads at once is not
-    thread-safe. A forked child builds its own rather than share the parent's
-    pooled connection.
+    shares the first one built there, under a per-process lock. A forked child
+    builds its own rather than share the parent's pooled connection.
     """
     bedrock_clients: dict[int, Any] = {}
     # One per process, so a child never waits on a lock held at the fork.
