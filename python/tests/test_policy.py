@@ -1,5 +1,11 @@
 import pytest
-from ol_llm.policy import CallPolicy, UseCase, resolve_policy, worst_case_seconds
+from ol_llm.policy import (
+    MODEL_ID_MAX_CHARS,
+    CallPolicy,
+    UseCase,
+    resolve_policy,
+    worst_case_seconds,
+)
 
 
 def use_case(**overrides: object) -> UseCase:
@@ -49,6 +55,22 @@ def test_profile_names_are_reserved(name: str) -> None:
 def test_unknown_profile_is_refused() -> None:
     with pytest.raises(ValueError, match="profile"):
         use_case(profile="interactive")
+
+
+@pytest.mark.parametrize("field", ["model", "fallback_models"])
+def test_an_overlong_model_id_is_refused(field: str) -> None:
+    """A model id from a request can't be arbitrarily long"""
+    model_id = "openai:" + "m" * (MODEL_ID_MAX_CHARS - len("openai:") + 1)
+    value = model_id if field == "model" else ["openai:gpt-4o-mini", model_id]
+
+    with pytest.raises(ValueError, match=f"at most {MODEL_ID_MAX_CHARS} characters"):
+        use_case(**{field: value})
+
+
+def test_a_model_id_at_the_limit_is_accepted() -> None:
+    model_id = "openai:" + "m" * (MODEL_ID_MAX_CHARS - len("openai:"))
+
+    assert use_case(model=model_id, fallback_models=[model_id]).model == model_id
 
 
 def test_environment_overrides_resolve_in_order() -> None:
