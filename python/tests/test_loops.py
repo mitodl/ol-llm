@@ -48,6 +48,7 @@ from ol_llm import (
     tracing,
 )
 from ol_llm import settings as settings_module
+from ol_llm.catalog import UseCaseCache, check_chat_model
 from ol_llm.models import shared_model
 from ol_llm.policy import resolve_policy
 from ol_llm.settings import GatewayRoute, Settings, configure
@@ -395,10 +396,13 @@ def test_a_worker_threads_loop_still_wakes_after_a_child_collects_garbage() -> N
         (settings_module, "_lock"),
         (prompts, "_inflight_lock"),
         (tracing, "_lock"),
+        (models._shared_models, "_lock"),  # noqa: SLF001
+        (embeddings._shared_embedders, "_lock"),  # noqa: SLF001
+        (check_chat_model.cache, "_lock"),
     ],
 )
 def test_a_lock_another_thread_holds_at_the_fork_is_free_in_the_child(
-    module: ModuleType, name: str
+    module: ModuleType | UseCaseCache[Any, Any], name: str
 ) -> None:
     holding, release = threading.Event(), threading.Event()
 

@@ -12,12 +12,12 @@ import os
 import random
 import sys
 import threading
-from collections import OrderedDict
 from collections.abc import (
     AsyncGenerator,
     Awaitable,
     Callable,
     Generator,
+    Hashable,
     Iterator,
     Mapping,
     Sequence,
@@ -80,8 +80,8 @@ from pydantic_ai.usage import RequestUsage, UsageLimits
 
 from ol_llm.attribution import USE_CASE_HEADER, Attribution
 from ol_llm.catalog import (
-    CHECKED_USE_CASES_MAX,
     CatalogEntry,
+    UseCaseCache,
     catalog_entries,
     status_tags,
 )
@@ -101,7 +101,7 @@ from ol_llm.tracing import include_content, tracer_provider
 
 OutputT = TypeVar("OutputT")
 _T = TypeVar("_T")
-_K = TypeVar("_K")
+_K = TypeVar("_K", bound=Hashable)
 _NO_DEPS: type[None] = type(None)
 DepsT = TypeVar("DepsT")
 
@@ -191,7 +191,7 @@ async def close_provider_model(model: Model | EmbeddingModel) -> None:
 # The models complete runs on, by use case, with the settings each was built with.
 # The lock keeps two threads' first calls from building a use case twice, which for
 # Bedrock would also create boto3 clients concurrently from the default session.
-_shared_models: OrderedDict[UseCase, tuple[Settings, Model]] = OrderedDict()
+_shared_models: UseCaseCache[UseCase, tuple[Settings, Model]] = UseCaseCache()
 _shared_models_lock = threading.Lock()
 
 
@@ -205,22 +205,22 @@ register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def reuse_or_build(
-    shared: OrderedDict[_K, tuple[Settings, _T]],
+    shared: UseCaseCache[_K, tuple[Settings, _T]],
     key: _K,
+    use_case: UseCase,
     settings: Settings,
     build: Callable[[], _T],
 ) -> _T:
     """Return the value kept for a key, built anew if missing or under old settings.
 
-    Keeps the ``CHECKED_USE_CASES_MAX`` most recently used keys. An application can
-    build a use case from a request's model id, so without a bound every distinct id
-    a caller sent would keep its clients for the life of the process. An evicted
-    value is dropped, as one replaced after ``configure`` is: a call still using it
-    keeps it until that call ends, and its loop-local clients are not closed.
+    A value ``shared`` drops (see ``UseCaseCache``) is dropped as one replaced after
+    ``configure`` is: a call still using it keeps it until that call ends, and its
+    loop-local clients are not closed.
 
     :param shared: the values, by key, with the settings each was built with. The
-        caller holds the lock that guards it.
+        caller holds the lock that keeps two threads from building one twice.
     :param key: what the value is built for.
+    :param use_case: the use case the key is for.
     :param settings: the settings in force.
     :param build: builds the value under ``settings``.
     :returns: the value.
@@ -228,10 +228,8 @@ def reuse_or_build(
     """
     kept = shared.get(key)
     if kept is None or kept[0] is not settings:
-        kept = shared[key] = (settings, build())
-    shared.move_to_end(key)
-    if len(shared) > CHECKED_USE_CASES_MAX:
-        shared.popitem(last=False)
+        kept = (settings, build())
+        shared.put(key, use_case, kept)
     return kept[1]
 
 
@@ -1487,8 +1485,8 @@ def shared_model(use_case: UseCase) -> Model:
     Built on the first call for a use case and reused on every thread and event
     loop, since ``PolicyModel`` keeps a provider model per loop. A model is rebuilt
     after ``configure`` replaces the settings, or once its use case has fallen out
-    of the ``CHECKED_USE_CASES_MAX`` most recently used. Under ``override_models``
-    every call builds a new one, so an override never outlives its block.
+    of ``UseCaseCache``. Under ``override_models`` every call builds a new one, so an
+    override never outlives its block.
 
     :param use_case: the call site.
     :returns: the model.
@@ -1501,6 +1499,7 @@ def shared_model(use_case: UseCase) -> Model:
     with _shared_models_lock:
         return reuse_or_build(
             _shared_models,
+            use_case,
             use_case,
             settings,
             lambda: build_model(use_case, settings=settings),

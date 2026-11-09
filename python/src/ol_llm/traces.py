@@ -18,7 +18,6 @@ import traceback
 from collections.abc import Awaitable, Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Any, TypeVar
 
 import opik
@@ -31,7 +30,7 @@ from opik.decorator.tracker import OpikTrackDecorator
 from opik.types import ErrorInfoDict
 
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution, TraceFields, trace_fields
-from ol_llm.catalog import CHECKED_USE_CASES_MAX, embedding_entry, status_tags
+from ol_llm.catalog import CachedCheck, embedding_entry, status_tags
 from ol_llm.policy import UseCase, resolve_policy
 from ol_llm.prompts import ManagedPrompt, attach_prompt
 from ol_llm.settings import get_settings
@@ -202,11 +201,12 @@ class TracedCall:
         )
 
 
-@lru_cache(maxsize=CHECKED_USE_CASES_MAX)
+@CachedCheck
 def _model_tags(use_case: UseCase) -> tuple[str, ...]:
     """Check a use case's embedding model once, as ``embed`` does per embedder.
 
-    A rejected use case raises every time; an unlisted or deprecated one warns once.
+    A rejected use case raises every time; an unlisted or deprecated one warns once,
+    until its use case falls out of ``UseCaseCache``.
     """
     return status_tags([embedding_entry(use_case)])
 

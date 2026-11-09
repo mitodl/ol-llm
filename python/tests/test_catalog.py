@@ -14,8 +14,11 @@ from ol_llm import UseCase, run_sync
 from ol_llm.catalog import (
     CHECKED_USE_CASES_MAX,
     TOKENS_PER_MTOK,
+    UNCATALOGED_USE_CASES_MAX,
     Catalog,
     CatalogEntry,
+    ModelKind,
+    UseCaseCache,
     check_chat_model,
     check_model_ids,
     load_catalog,
@@ -134,16 +137,44 @@ def test_unlisted_model_id_is_logged_escaped(caplog: pytest.LogCaptureFixture) -
     assert model_id not in caplog.text
 
 
-def test_check_chat_model_cache_is_bounded() -> None:
-    """Distinct model ids from callers don't grow the cache without limit"""
+def test_uncataloged_use_cases_never_evict_a_cataloged_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller cycling unlisted model ids can't push out the app's own use cases"""
+    checked: list[UseCase] = []
+    entries = catalog_module.catalog_entries
+
+    def counting(checking: UseCase, *, kind: ModelKind) -> list[CatalogEntry | None]:
+        checked.append(checking)
+        return entries(checking, kind=kind)
+
+    monkeypatch.setattr(catalog_module, "catalog_entries", counting)
+    cataloged = use_case("openai:gpt-4o-mini")
     check_chat_model.cache_clear()
     try:
+        check_chat_model(cataloged)
         for n in range(CHECKED_USE_CASES_MAX + 1):
             check_chat_model(use_case(f"openai:unlisted-{n}"))
+        check_chat_model(cataloged)
 
-        assert check_chat_model.cache_info().currsize == CHECKED_USE_CASES_MAX
+        assert checked.count(cataloged) == 1
+        assert check_chat_model.cache.sizes() == (1, UNCATALOGED_USE_CASES_MAX)
     finally:
         check_chat_model.cache_clear()
+
+
+def test_the_uncataloged_tier_keeps_the_most_recently_used() -> None:
+    cache: UseCaseCache[str, int] = UseCaseCache()
+    ids = [f"openai:unlisted-{n}" for n in range(UNCATALOGED_USE_CASES_MAX + 1)]
+    for n, model_id in enumerate(ids[:-1]):
+        cache.put(model_id, use_case(model_id), n)
+    assert cache.get(ids[0]) == 0
+
+    cache.put(ids[-1], use_case(ids[-1]), -1)
+
+    assert cache.get(ids[0]) == 0
+    assert cache.get(ids[1]) is None
+    assert cache.sizes() == (0, UNCATALOGED_USE_CASES_MAX)
 
 
 def test_unlisted_fallback_builds() -> None:

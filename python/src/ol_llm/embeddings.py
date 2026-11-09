@@ -16,7 +16,6 @@ another size, are not comparable, so changing either means re-embedding.
 
 import json
 import threading
-from collections import OrderedDict
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -37,7 +36,7 @@ from pydantic_ai.exceptions import ContentFilterError, UnexpectedModelBehavior
 from pydantic_ai.usage import RequestUsage
 
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution
-from ol_llm.catalog import CatalogEntry, embedding_entry, status_tags
+from ol_llm.catalog import CatalogEntry, UseCaseCache, embedding_entry, status_tags
 from ol_llm.loops import LoopLocal, register_at_fork, run_coroutine
 from ol_llm.models import (
     classify_failure,
@@ -67,9 +66,9 @@ _model_override: ContextVar[EmbeddingModel | None] = ContextVar(
 # was built with: each build creates provider clients, and calls should reuse them.
 # The lock keeps two threads' first calls from building one twice, as for
 # ol_llm.models.shared_model.
-_shared_embedders: OrderedDict[
+_shared_embedders: UseCaseCache[
     tuple[UseCase, int | None], tuple[Settings, Embedder]
-] = OrderedDict()
+] = UseCaseCache()
 _shared_embedders_lock = threading.Lock()
 
 
@@ -328,9 +327,8 @@ def shared_embedder(use_case: UseCase, dimensions: int | None = None) -> Embedde
     Built on the first call for a use case and vector length and reused on every
     thread and event loop, since ``PolicyEmbeddingModel`` keeps a provider model
     per loop. An embedder is rebuilt after ``configure`` replaces the settings, or
-    once it has fallen out of the ``CHECKED_USE_CASES_MAX`` most recently used. Under
-    ``override_embedding_models`` every call builds a new one, so an override never
-    outlives its block.
+    once it has fallen out of ``UseCaseCache``. Under ``override_embedding_models``
+    every call builds a new one, so an override never outlives its block.
 
     :param use_case: the call site.
     :param dimensions: the vector length to ask for, as for ``build_embedder``.
@@ -345,6 +343,7 @@ def shared_embedder(use_case: UseCase, dimensions: int | None = None) -> Embedde
         return reuse_or_build(
             _shared_embedders,
             (use_case, dimensions),
+            use_case,
             settings,
             lambda: build_embedder(use_case, dimensions=dimensions, settings=settings),
         )

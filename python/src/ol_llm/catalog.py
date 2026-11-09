@@ -18,15 +18,18 @@ import argparse
 import json
 import logging
 import sys
+import threading
 import tomllib
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+import weakref
+from collections import OrderedDict
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
-from functools import cache, lru_cache
+from functools import cache, update_wrapper
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Generic, Literal, Self, TypeVar
 
 from pydantic import (
     BaseModel,
@@ -36,6 +39,7 @@ from pydantic import (
     model_validator,
 )
 
+from ol_llm.loops import register_at_fork
 from ol_llm.policy import UseCase
 
 ModelKind = Literal["chat", "embedding"]
@@ -44,10 +48,17 @@ Route = Literal["direct", "gateway"]
 
 TOKENS_PER_MTOK = 1_000_000
 
-# How many use cases a process remembers having checked, and keeps a shared model or
-# embedder for. An application can build a use case from a request's model id, so
-# an unbounded cache grows with every distinct id a caller sends.
+# How many use cases whose models the catalog all lists a process keeps checks, models
+# and embedders for (``UseCaseCache``). An application declares those, so there are
+# only so many; this is a safety net, not a window callers can cycle through.
 CHECKED_USE_CASES_MAX = 1024
+
+# How many use cases naming a model the catalog does not list a process keeps checks,
+# models and embedders for. An application can build a use case from a request's
+# model id, so a caller can make as many of these as it sends ids. Kept apart and
+# few, they can't evict the application's own use cases, which would then rebuild
+# their clients under the lock every first call shares.
+UNCATALOGED_USE_CASES_MAX = 64
 
 CATALOG_RESOURCE = "catalog.toml"
 PRICE_RULE_GROUP = "ol_llm_model_prices"
@@ -295,15 +306,144 @@ def status_tags(entries: Iterable[CatalogEntry | None]) -> tuple[str, ...]:
     return tuple(f"model_status:{status}" for status in sorted(statuses))
 
 
-@lru_cache(maxsize=CHECKED_USE_CASES_MAX)
+_K = TypeVar("_K", bound=Hashable)
+_V = TypeVar("_V")
+
+# Weak, so a cache a test replaces is not kept alive for the fork hook.
+_caches: "weakref.WeakSet[UseCaseCache[Any, Any]]" = weakref.WeakSet()
+
+
+def is_cataloged(use_case: UseCase) -> bool:
+    """Return whether the catalog lists every model the use case names.
+
+    :param use_case: the call site.
+    :returns: ``True`` when it lists them all.
+    :rtype: bool
+    """
+    catalog = load_catalog()
+    return all(catalog.get(model_id) is not None for model_id in use_case.model_ids)
+
+
+class UseCaseCache(Generic[_K, _V]):
+    """Values kept per use case, in two tiers so a caller can't evict an app's own.
+
+    A use case whose models the catalog all lists (``is_cataloged``) keeps its value
+    in a tier of up to ``CHECKED_USE_CASES_MAX``. Any other use case may come from a
+    request's model id, so its value goes in a tier of the
+    ``UNCATALOGED_USE_CASES_MAX`` most recently used. Each tier drops its least
+    recently used value once it is full.
+    """
+
+    def __init__(self) -> None:
+        """Start empty."""
+        self._lock = threading.Lock()
+        self._cataloged: OrderedDict[_K, _V] = OrderedDict()
+        self._uncataloged: OrderedDict[_K, _V] = OrderedDict()
+        _caches.add(self)
+
+    def get(self, key: _K) -> _V | None:
+        """Return the value kept for a key, or ``None``, and mark it recently used.
+
+        :param key: what the value was kept for.
+        :returns: the value, or ``None``.
+        :rtype: _V | None
+        """
+        with self._lock:
+            for tier in (self._cataloged, self._uncataloged):
+                if key in tier:
+                    tier.move_to_end(key)
+                    return tier[key]
+        return None
+
+    def put(self, key: _K, use_case: UseCase, value: _V) -> None:
+        """Keep a value, in the tier its use case belongs to.
+
+        :param key: what the value is for.
+        :param use_case: the use case the key is for, which picks the tier.
+        :param value: the value.
+        """
+        if is_cataloged(use_case):
+            tier, most = self._cataloged, CHECKED_USE_CASES_MAX
+        else:
+            tier, most = self._uncataloged, UNCATALOGED_USE_CASES_MAX
+        with self._lock:
+            tier[key] = value
+            tier.move_to_end(key)
+            if len(tier) > most:
+                tier.popitem(last=False)
+
+    def get_or_build(self, key: _K, use_case: UseCase, build: Callable[[], _V]) -> _V:
+        """Return the value kept for a key, building and keeping it if there is none.
+
+        A build that raises keeps nothing, so the next call builds again.
+
+        :param key: what the value is for.
+        :param use_case: the use case the key is for, which picks the tier.
+        :param build: builds the value.
+        :returns: the value.
+        :rtype: _V
+        """
+        value = self.get(key)
+        if value is None:
+            value = build()
+            self.put(key, use_case, value)
+        return value
+
+    def sizes(self) -> tuple[int, int]:
+        """Return how many values each tier keeps: cataloged, then uncataloged."""
+        with self._lock:
+            return len(self._cataloged), len(self._uncataloged)
+
+    def clear(self) -> None:
+        """Drop every value."""
+        with self._lock:
+            self._cataloged.clear()
+            self._uncataloged.clear()
+
+
+def _after_fork_in_child() -> None:
+    # A parent thread may have held a cache's lock at the fork, and won't release it
+    # here.
+    for kept in list(_caches):
+        kept._lock = threading.Lock()  # noqa: SLF001
+
+
+register_at_fork(after_in_child=_after_fork_in_child)
+
+
+class CachedCheck(Generic[_V]):
+    """A use case check that runs once per use case, kept in a ``UseCaseCache``.
+
+    A check that raises keeps nothing, so a rejected use case raises every time.
+
+    :param check: the check.
+    """
+
+    def __init__(self, check: Callable[[UseCase], _V]) -> None:
+        """Wrap the check."""
+        self._check = check
+        self.cache: UseCaseCache[UseCase, _V] = UseCaseCache()
+        update_wrapper(self, check)
+
+    def __call__(self, use_case: UseCase) -> _V:
+        """Return the check's result for the use case, running it on a miss."""
+        return self.cache.get_or_build(
+            use_case, use_case, lambda: self._check(use_case)
+        )
+
+    def cache_clear(self) -> None:
+        """Forget every result, so the next call for each use case checks again."""
+        self.cache.clear()
+
+
+@CachedCheck
 def check_chat_model(use_case: UseCase) -> tuple[str, ...]:
     """Check a chat use case's models against the catalog, as ``build_model`` does.
 
     For call sites that build their own chat client, e.g. a LangChain chat model,
     at the point they build it. ``traced_chat`` runs it too and tags its trace with
     the result. A rejected use case raises every time; an unlisted or deprecated
-    model warns once, until its use case falls out of the last
-    ``CHECKED_USE_CASES_MAX`` checked.
+    model warns once, until its use case falls out of ``UseCaseCache``.
 
     :param use_case: the call site.
     :returns: the ``model_status`` trace tags, from ``status_tags``.
