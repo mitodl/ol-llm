@@ -157,11 +157,12 @@ opik_model = "claude-sonnet-5"
 input_usd_per_mtok = "2.00"
 output_usd_per_mtok = "10.00"
 
-# Priced by prompt length: $0.50/$2.50 above 100,000 prompt tokens. Opik 2.2.94 has
-# no price for it.
+# Priced by prompt length: $0.50/$2.50 above 100,000 prompt tokens.
 [[model]]
 id = "anthropic:claude-haiku-5-5"
 kind = "chat"
+opik_provider = "anthropic"
+opik_model = "claude-haiku-5-5"
 input_usd_per_mtok = "0.10"
 output_usd_per_mtok = "0.50"
 
@@ -176,10 +177,12 @@ input_usd_per_mtok = "1.00"
 output_usd_per_mtok = "5.00"
 
 # A US cross-region profile, priced 10% above the global one, and by prompt length
-# like the direct model. Opik 2.2.94 has no price for it.
+# like the direct model.
 [[model]]
 id = "bedrock:us.anthropic.claude-haiku-5-5"
 kind = "chat"
+opik_provider = "bedrock"
+opik_model = "us.anthropic.claude-haiku-5-5"
 input_usd_per_mtok = "0.11"
 output_usd_per_mtok = "0.55"
 
