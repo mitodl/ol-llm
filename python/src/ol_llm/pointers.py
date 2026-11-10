@@ -79,7 +79,8 @@ class PromptPointers(pydantic.BaseModel):
 
     :param project: the app's Opik project, which holds the prompts.
     :param exports: the directory of committed embedded defaults; ``load``
-        resolves it against the pointer file's directory.
+        resolves it against the pointer file's directory, which it must stay
+        beneath.
     :param prompts: prompt name to the version production runs.
     """
 
@@ -97,7 +98,8 @@ class PromptPointers(pydantic.BaseModel):
         :returns: the pointers, with ``exports`` resolved against the file's
             directory.
         :rtype: PromptPointers
-        :raises PointerError: if the file cannot be read or is not a pointer file.
+        :raises PointerError: if the file cannot be read, is not a pointer file,
+            or its ``exports`` is not a directory beneath the file's own.
         """
         try:
             pointers = cls.model_validate(
@@ -106,7 +108,14 @@ class PromptPointers(pydantic.BaseModel):
         except (OSError, tomllib.TOMLDecodeError, pydantic.ValidationError) as exc:
             msg = f"{path} is not a prompt pointer file: {exc}"
             raise PointerError(msg) from exc
-        return pointers.model_copy(update={"exports": path.parent / pointers.exports})
+        exports = pointers.exports
+        if exports.is_absolute() or not exports.parts or ".." in exports.parts:
+            msg = (
+                f"{path}: exports must be a directory beneath the pointer file's, "
+                f"not {str(exports)!r}"
+            )
+            raise PointerError(msg)
+        return pointers.model_copy(update={"exports": path.parent / exports})
 
 
 def resolve(pointers: PromptPointers) -> dict[str, ManagedPrompt[Any]]:
@@ -219,8 +228,8 @@ def export(pointers: PromptPointers) -> list[Path]:
     """Write each pointed version's template to ``<exports>/<name>.json``.
 
     The person moving a pointer runs it and commits the result with the pointer
-    change, so the embedded default is reviewed text. The directory belongs to the
-    pointer file: an export for a prompt it no longer names is removed.
+    change, so the embedded default is reviewed text. An earlier export for a prompt
+    the file no longer names is removed; other files in the directory are left.
 
     :param pointers: the pointer file.
     :returns: the files written.
@@ -281,7 +290,7 @@ def check_exports(
         except FileNotFoundError:
             problems.append(f"{name}: no export at {path}")
             continue
-        except (ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError):
             problems.append(f"{name}: {path} is not an export ol-llm-prompts wrote")
             continue
         if exported.version != prompt.version:
@@ -329,12 +338,30 @@ def _read_export(path: Path) -> TextTemplate | ChatTemplate:
 
 
 def _unpointed_exports(pointers: PromptPointers) -> list[Path]:
+    """List this project's exports for prompts the file no longer names.
+
+    Only a file ``export`` wrote for this project counts, so ``package.json`` or
+    another project's export beside it is never reported or removed.
+    """
     if not pointers.exports.is_dir():
         return []
     return sorted(
         path
         for path in pointers.exports.glob("*.json")
-        if path.stem not in pointers.prompts
+        if path.stem not in pointers.prompts and _is_export(path, pointers.project)
+    )
+
+
+def _is_export(path: Path, project: str) -> bool:
+    try:
+        exported = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(exported, dict)
+        and exported.get("project") == project
+        and exported.get("name") == path.stem
+        and ("template" in exported or "messages" in exported)
     )
 
 

@@ -71,6 +71,17 @@ def test_a_malformed_pointer_file_is_refused(
         PromptPointers.load(path)
 
 
+@pytest.mark.parametrize("exports", ["/etc", ".", "..", "prompts/../..", ""])
+def test_exports_outside_the_pointer_files_directory_are_refused(
+    tmp_path: Path, exports: str
+) -> None:
+    path = tmp_path / "prompts.toml"
+    path.write_text(f'project = "x"\nexports = "{exports}"\n[prompts]\ns = "v1"\n')
+
+    with pytest.raises(PointerError, match="exports must be a directory beneath"):
+        PromptPointers.load(path)
+
+
 # Promotion
 
 
@@ -182,10 +193,18 @@ def test_an_export_removes_a_prompt_the_pointers_no_longer_name(
     prompt_library.add("tutor", CHAT)
     export(pointers(tmp_path, summary="v1", tutor="v1"))
     (tmp_path / "notes.txt").write_text("kept")
+    (tmp_path / "package.json").write_text('{"name": "package"}')
+    other = json.loads((tmp_path / "tutor.json").read_text()) | {"project": "other"}
+    (tmp_path / "glossary.json").write_text(json.dumps(other | {"name": "glossary"}))
 
     export(pointers(tmp_path, summary="v1"))
 
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["notes.txt", "summary.json"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "glossary.json",
+        "notes.txt",
+        "package.json",
+        "summary.json",
+    ]
 
 
 def test_exports_that_match_the_pointers_pass(
@@ -212,6 +231,8 @@ def test_every_export_that_does_not_match_is_reported(
     (tmp_path / "tutor.json").write_text("{not json")
     moved = pointers(tmp_path, summary="v2", glossary="v1", tutor="v1", intro="v1")
 
+    (tmp_path / "package.json").write_text('{"name": "package"}')
+
     assert check_exports(moved, resolve(moved)) == [
         "retired.json is for a prompt the pointer file does not name",
         "summary: the export is v1, the pointer says v2",
@@ -219,6 +240,19 @@ def test_every_export_that_does_not_match_is_reported(
         f"tutor: {tmp_path / 'tutor.json'} is not an export ol-llm-prompts wrote",
         f"intro: no export at {tmp_path / 'intro.json'}",
     ]
+
+
+def test_an_exports_path_that_is_a_file_is_reported(
+    prompt_library: PromptLibrary, tmp_path: Path
+) -> None:
+    prompt_library.add("summary", "one")
+    (tmp_path / "prompts").write_text("not a directory")
+    pointed = pointers(tmp_path / "prompts", summary="v1")
+
+    [problem] = check_exports(pointed, resolve(pointed))
+
+    assert problem.startswith("summary: ")
+    assert problem.endswith("is not an export ol-llm-prompts wrote")
 
 
 # The command

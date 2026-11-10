@@ -52,9 +52,10 @@ ol-llm-prompts promote prompts.toml                          # move production t
 ```
 
 `export` writes `<exports>/<name>.json` for each prompt: the pointed version's template (or
-messages, for a chat prompt), its type, version, and template hash. The directory belongs to
-the pointer file, so it also removes the export of a prompt the file no longer names. The app
-reads an export with `load_default` and passes it to `get_prompt`:
+messages, for a chat prompt), its type, version, and template hash. It also removes its own
+earlier export of a prompt the file no longer names and leaves every other file. `exports` must
+be a directory beneath the pointer file's. The app reads an export with `load_default` and
+passes it to `get_prompt`:
 
 ```python
 PROMPTS_DIR = Path(__file__).parent / "prompts"
