@@ -208,11 +208,14 @@ should return a partial one unchanged.
 ### Prompts
 
 Prompts live in the app's Opik project and are fetched by environment label. Each call site
-passes an embedded default: the text of the version production points at, exported into the
-image at build time.
+passes an embedded default: the text of the version production points at, which
+`ol-llm-prompts export` writes into the image at build time
+([prompt promotion](../docs/prompt-promotion.md)).
 
 ```python
-SUMMARY_PROMPT = ol_llm.TextTemplate(template=EXPORTED_TEXT, version="v7")
+SUMMARY_PROMPT = ol_llm.load_default(
+    "content-summary", directory=PROMPTS_DIR, template=ol_llm.TextTemplate
+)
 
 
 def summarize(text: str, audience: str) -> Summary:
@@ -265,14 +268,19 @@ are built on in place of the version. A run that fell back to the embedded defau
 the same key as one that fetched the same text, so an Opik outage does not trigger
 reprocessing.
 
-The CI jobs use `ol_llm.create_prompt(name, template, project_name=...)`, which adds a version
-only when the text or template type changed, and `ol_llm.promote_prompt(name, version="v7",
-environment="production", project_name=...)`, which moves one label and leaves the version's
-other labels in place. Opik seeds only `development`, `staging`, and `production`; create `ci`
-and `qa` once per instance before promoting to them. `ol_llm.fetch_prompt(name,
-project_name=..., version="v7")` (or `environment="production"`) reads one version back, text
-or chat, with no embedded default, cache, or fallback, and returns `None` when Opik has no such
-version or label, so a CI job can refuse a pointer to a version that does not exist.
+Production moves by pull request: the app's pointer file names the version production runs,
+per prompt, and `ol-llm-prompts` checks it on the pull request, moves the `production` label
+on merge, and exports the embedded defaults at build. [Prompt promotion](../docs/prompt-promotion.md)
+has the file format and the workflow to call.
+
+Underneath, `ol_llm.create_prompt(name, template, project_name=...)` adds a version only when
+the text or template type changed, and `ol_llm.promote_prompt(name, version="v7",
+environment="production", project_name=...)` moves one label and leaves the version's other
+labels in place. Opik seeds only `development`, `staging`, and `production`; create `ci` and
+`qa` once per instance before promoting to them. `ol_llm.fetch_prompt(name, project_name=...,
+version="v7")` (or `environment="production"`) reads one version back, text or chat, with no
+embedded default, cache, or fallback, and returns `None` when Opik has no such version or
+label.
 
 ### Embeddings
 

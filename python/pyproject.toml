@@ -74,6 +74,7 @@ memory = ["hindsight-client>=1.2,<1.3"]
 [project.scripts]
 ol-llm-catalog = "ol_llm.catalog:main"
 ol-llm-eval = "ol_llm.evaluation:main"
+ol-llm-prompts = "ol_llm.pointers:main"
 
 [project.urls]
 Homepage = "https://github.com/mitodl/ol-llm"

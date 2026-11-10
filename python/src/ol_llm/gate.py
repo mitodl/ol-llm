@@ -8,9 +8,8 @@ the owning team reviews like code (spec §5.1 item 3)::
     mode = "advisory"                   # until the owner trusts the thresholds
     suite = "feedback_summary_eval:suite"
     judge_model = "bedrock:us.anthropic.claude-sonnet-5"
-
-    [prompts]                           # the version production runs, per prompt
-    feedback-summary = "v4"
+    pointers = "../prompts.toml"        # the app's pointer file, from this file
+    prompts = ["feedback-summary"]      # tested at the version it points at
 
     [dataset]
     name = "feedback-summary-golden"
@@ -37,6 +36,11 @@ the owning team reviews like code (spec §5.1 item 3)::
 returns a ``Suite``: the task under test and its metrics. The module is imported
 with the declaration's directory first on ``sys.path``, so it can sit beside the
 declaration or be part of the app's installed package.
+
+The versions under test come from the app's pointer file (``ol_llm.pointers``),
+which must name the same Opik project as ``app``. A pull request that promotes a
+prompt changes its pointer, so its gate runs the new version, and merging it moves
+the ``production`` label to the version the gate ran.
 
 ``run_gate`` fetches the pinned prompt versions, checks the dataset and its pinned
 version exist (seeding the declared file first), runs ``evaluate`` tagged with the
@@ -98,6 +102,7 @@ from ol_llm.evaluation import (
     score_report,
     seed_dataset,
 )
+from ol_llm.pointers import PointerError, PromptName, PromptPointers, VersionName
 from ol_llm.prompts import ManagedPrompt, fetch_prompt
 
 if TYPE_CHECKING:
@@ -115,9 +120,6 @@ GATE_ERROR_STATUS = 2
 """What ``ol-llm-eval gate`` exits with when the gate cannot run."""
 
 _PAGE_SIZE = 100
-
-VersionName = Annotated[str, pydantic.StringConstraints(pattern=r"^v[1-9][0-9]*$")]
-"""An Opik prompt or dataset version, e.g. ``v3``."""
 
 
 class GateConfigurationError(Exception):
@@ -167,8 +169,9 @@ class GateDeclaration(pydantic.BaseModel):
     :param suite: ``module:attribute`` of the callable that builds the ``Suite``.
     :param judge_model: the judge's model id, when a metric needs a judge. It
         should not be the model under test (spec §5.1 item 7).
-    :param prompts: prompt name to the version under test: on a pull request
-        that changes it, the new version; otherwise production's.
+    :param prompts: prompt name to the version under test, from the pointer
+        file: on a pull request that changes a pointer, the new version;
+        otherwise production's.
     :param dataset: the dataset and its pinned version.
     :param thresholds: what passing means, one per metric.
     :param pairwise: judge each answer against the baseline's; needs
@@ -182,7 +185,7 @@ class GateDeclaration(pydantic.BaseModel):
     mode: GateMode = "advisory"
     suite: Annotated[str, pydantic.StringConstraints(pattern=r"^[\w.]+:[\w.]+$")]
     judge_model: str | None = None
-    prompts: Annotated[dict[str, VersionName], pydantic.Field(min_length=1)]
+    prompts: Annotated[dict[PromptName, VersionName], pydantic.Field(min_length=1)]
     dataset: DatasetPin
     thresholds: Annotated[list[Threshold], pydantic.Field(min_length=1)]
     pairwise: PairwiseDeclaration | None = None
@@ -232,15 +235,36 @@ class GateDeclaration(pydantic.BaseModel):
         """Read a declaration from a TOML file.
 
         :param path: the file.
-        :returns: the declaration, with ``dataset.file`` resolved against the
-            file's directory.
+        :returns: the declaration, with each prompt at the version the pointer
+            file names and ``dataset.file`` resolved against the file's directory.
         :rtype: GateDeclaration
         :raises pydantic.ValidationError: if the file does not declare a gate.
         :raises tomllib.TOMLDecodeError: if the file is not TOML.
+        :raises PointerError: if the pointer file is missing, is for another
+            project, or has no pointer for a declared prompt.
         """
-        declaration = cls.model_validate(
-            tomllib.loads(path.read_text(encoding="utf-8"))
-        )
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+        declared = raw.pop("pointers", None)
+        names = raw.get("prompts")
+        if not isinstance(declared, str) or not isinstance(names, list):
+            msg = (
+                "A gate reads its prompts' versions from the app's pointer file: "
+                'declare pointers = "<path from this file>" and '
+                'prompts = ["<name>", ...]'
+            )
+            raise PointerError(msg)
+        pointers = PromptPointers.load(path.parent / declared)
+        if pointers.project != raw.get("app"):
+            msg = (
+                f"The pointer file {declared} is for project {pointers.project!r}, "
+                f"not the gate's app {raw.get('app')!r}"
+            )
+            raise PointerError(msg)
+        if missing := [name for name in names if name not in pointers.prompts]:
+            msg = f"The pointer file {declared} has no pointer for {missing}"
+            raise PointerError(msg)
+        raw["prompts"] = {name: pointers.prompts[name] for name in names}
+        declaration = cls.model_validate(raw)
         if declaration.dataset.file is None:
             return declaration
         pin = declaration.dataset.model_copy(
@@ -854,7 +878,12 @@ def gate_command(
     """
     try:
         declaration = GateDeclaration.load(path)
-    except (OSError, tomllib.TOMLDecodeError, pydantic.ValidationError) as exc:
+    except (
+        OSError,
+        tomllib.TOMLDecodeError,
+        pydantic.ValidationError,
+        PointerError,
+    ) as exc:
         return _cannot_run(path, exc, report)
     try:
         outcome = run_gate(

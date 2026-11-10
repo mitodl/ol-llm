@@ -9,7 +9,19 @@ requests and posts the result.
 
 ## The declaration
 
-A TOML file next to the prompt, owned by the app team:
+The versions under test come from the app's [pointer file](prompt-promotion.md), the one file
+that says which version production runs:
+
+```toml
+project = "dagster-ml"
+
+[prompts]
+feedback-summary = "v4"
+```
+
+The gate is a TOML file next to the prompt, owned by the app team. It names the pointer file
+(relative to itself) and the prompts it tests, and `app` must be the pointer file's
+`project`:
 
 ```toml
 app = "dagster-ml"                       # the app's Opik project
@@ -17,9 +29,8 @@ use_case = "feedback-summary"
 mode = "advisory"                        # every gate starts advisory
 suite = "feedback_summary_eval:suite"    # module:attribute
 judge_model = "bedrock:us.anthropic.claude-sonnet-5"
-
-[prompts]                                # the version under test, per prompt
-feedback-summary = "v4"
+pointers = "../prompts.toml"             # the app's pointer file
+prompts = ["feedback-summary"]           # tested at the version it points at
 
 [dataset]
 name = "feedback-summary-golden"
@@ -41,9 +52,9 @@ maximum = 0.3
 tolerance = 0.05
 ```
 
-`[prompts]` holds the version production runs. A pull request that promotes a prompt changes
-that number, so its gate runs the new version; a model or configuration change runs the
-production version unchanged.
+A pull request that promotes a prompt changes its pointer, so its gate runs the new version,
+and merging it moves `production` to the version the gate ran. A model or configuration change
+runs the production version unchanged.
 
 A threshold takes a `minimum`, a `maximum`, a `tolerance`, or a combination. `tolerance` is
 measured from the baseline in the direction that is worse: down for a metric where higher is
@@ -54,10 +65,6 @@ left unscored fails its metric, and so does a mean that is not a number.
 
 Until there is a baseline, a tolerance-only threshold is reported as `not compared`, which is
 neither a pass nor a miss.
-
-`[prompts]` duplicates the pointer file the promotion job reads (lifecycle spec §2.3 item 2),
-and ol-llm does not define that file's format yet. Until it does, a pull request that promotes
-a prompt changes both, and nothing checks that they agree.
 
 ## The suite
 
@@ -194,11 +201,13 @@ on:
   pull_request:
     paths:
       - "dg_projects/ml/ml/lib/summarize.py"
+      - "dg_projects/ml/prompts.toml"
       - "dg_projects/ml/evaluation/**"
   push:
     branches: [main]
     paths:
       - "dg_projects/ml/ml/lib/summarize.py"
+      - "dg_projects/ml/prompts.toml"
       - "dg_projects/ml/evaluation/**"
   workflow_dispatch:
 

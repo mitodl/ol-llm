@@ -1,0 +1,87 @@
+# Reusable: acts on an app's prompt pointer file (`ol-llm-prompts`). On a pull request
+# it checks that every pointed version exists in Opik. On any other event it moves the
+# production label to the pointed versions, reading the pointer file from the default
+# branch's head and running one promotion per repository and pointer file at a time,
+# so two merges close together cannot finish out of order and move a label back
+# (lifecycle spec §2.3). docs/prompt-promotion.md has the file format and a caller.
+name: prompt promotion
+
+on:
+  workflow_call:
+    inputs:
+      pointers:
+        description: The pointer file (TOML), relative to working-directory.
+        required: true
+        type: string
+      working-directory:
+        description: The uv project that installs ol-llm.
+        type: string
+        default: "."
+      opik-url:
+        description: The Opik API URL, ending in /api.
+        required: true
+        type: string
+      opik-workspace:
+        description: The Opik workspace.
+        type: string
+        default: default
+      keycloak-token-url:
+        description: The token endpoint of the realm that issues Opik tokens.
+        required: true
+        type: string
+    secrets:
+      OPIK_KEYCLOAK_CLIENT_ID:
+        description: The promotion job's own Keycloak client, the only one meant to move production.
+        required: true
+      OPIK_KEYCLOAK_CLIENT_SECRET:
+        description: That client's secret.
+        required: true
+
+permissions: {}
+
+jobs:
+  pointers:
+    name: prompt promotion
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    concurrency:
+      # A pull request's check is superseded by its next push. A promotion is
+      # never cancelled; a newer one queues behind it and reads the newer head.
+      group: ${{ github.event_name == 'pull_request' && format('prompt-check-{0}-{1}', inputs.pointers, github.event.pull_request.number) || format('prompt-promotion-{0}-{1}', github.repository, inputs.pointers) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # A promotion reads the default branch's head when it starts, not the
+          # commit that triggered it.
+          ref: ${{ github.event_name != 'pull_request' && github.event.repository.default_branch || '' }}
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.13.7"
+      - name: Credentials are available
+        env:
+          OPIK_KEYCLOAK_CLIENT_ID: ${{ secrets.OPIK_KEYCLOAK_CLIENT_ID }}
+        run: |
+          if [ -z "$OPIK_KEYCLOAK_CLIENT_ID" ]; then
+            echo "::error::No Opik credentials. Pull requests from forks get no secrets, so the pointers cannot be checked for them."
+            exit 1
+          fi
+      - name: Install
+        working-directory: ${{ inputs.working-directory }}
+        run: uv sync --frozen
+      - name: Check or promote the pointers
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          POINTERS: ${{ inputs.pointers }}
+          COMMAND: ${{ github.event_name == 'pull_request' && 'check' || 'promote' }}
+          OPIK_URL_OVERRIDE: ${{ inputs.opik-url }}
+          OPIK_WORKSPACE: ${{ inputs.opik-workspace }}
+          OPIK_KEYCLOAK_TOKEN_URL: ${{ inputs.keycloak-token-url }}
+          OPIK_KEYCLOAK_CLIENT_ID: ${{ secrets.OPIK_KEYCLOAK_CLIENT_ID }}
+          OPIK_KEYCLOAK_CLIENT_SECRET: ${{ secrets.OPIK_KEYCLOAK_CLIENT_SECRET }}
+        # An explicit bash runs with -o pipefail, so the command's status is the step's.
+        shell: bash
+        run: uv run --frozen ol-llm-prompts "$COMMAND" "$POINTERS" | tee -a "$GITHUB_STEP_SUMMARY"
