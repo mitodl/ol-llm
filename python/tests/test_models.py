@@ -7,7 +7,7 @@ from typing import Any, Self
 import httpx
 import httpx2
 import pytest
-from ol_llm import LLMRateLimited, LLMRejected, LLMUnavailable, UseCase
+from ol_llm import LLMRateLimited, LLMRejected, LLMUnavailable, UseCase, tracing
 from ol_llm.attribution import Attribution
 from ol_llm.errors import (
     LLMBudgetExceeded,
@@ -27,6 +27,9 @@ from ol_llm.models import (
     usage_limits,
 )
 from ol_llm.testing import policy_model, tracing_disabled
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
+)
 from pydantic import BaseModel
 from pydantic_ai import Agent, DeferredToolRequests, ModelRetry, ToolOutput
 from pydantic_ai.capabilities import RaiseContentFilterError, Toolset
@@ -570,6 +573,25 @@ def test_a_failed_continuation_raises_the_primary_error(stream: bool) -> None:  
     group = caught.value.__cause__
     assert isinstance(group, FallbackExceptionGroup)
     assert [e.model for e in group.exceptions] == [FALLBACK, PRIMARY, FALLBACK]  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_retrys_span_names_the_model_that_answered(
+    exported: InMemorySpanExporter,
+    stream: bool,  # noqa: FBT001
+) -> None:
+    primary = Scripted(*always(lambda: http_error(503), 3))
+    fallback = Scripted("not json", answer=VALID)
+    with override_models(fallback_models(primary, fallback)):
+        run_for_summary(SUMMARY_WITH_FALLBACK, stream=stream)
+    tracing.flush()
+
+    requested = [
+        (span.attributes or {}).get("gen_ai.request.model")
+        for span in exported.get_finished_spans()
+        if span.name.startswith("chat ")
+    ]
+    assert requested == ["fallback", "fallback"]
 
 
 def test_a_failed_retry_raises_the_error_of_the_model_that_gave_it() -> None:

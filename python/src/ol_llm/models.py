@@ -773,8 +773,7 @@ class PolicyFallbackModel(FallbackModel):
         ids = [cast("PolicyModel", model).catalog_id for model in self.models]
         if answered_by not in ids[1:]:
             return self
-        start = ids.index(answered_by)
-        return FallbackModel(*self.models[start:], fallback_on=FALLBACK_ON)
+        return _ChainTail(self, ids.index(answered_by))
 
     async def request(
         self,
@@ -818,6 +817,32 @@ class PolicyFallbackModel(FallbackModel):
             raise primary from group
         async with _exit_with(stream_cm):
             yield stream
+
+
+@dataclass(init=False)
+class _ChainTail(FallbackModel):
+    """The members of a chain from one of them on, named as the whole chain.
+
+    Instrumentation opens a request's span under the name of the model the agent
+    holds, the whole chain, and ``FallbackModel`` names the member that answered
+    only on a span opened under its own name.
+    """
+
+    chain_name: str
+
+    def __init__(self, chain: FallbackModel, start: int) -> None:
+        """Take ``chain``'s members from ``start`` on.
+
+        :param chain: the whole chain.
+        :param start: the index of the member the request starts at.
+        """
+        super().__init__(*chain.models[start:], fallback_on=FALLBACK_ON)
+        self.chain_name = chain.model_name
+
+    @property
+    def model_name(self) -> str:
+        """The whole chain's name."""
+        return self.chain_name
 
 
 @asynccontextmanager
