@@ -81,7 +81,8 @@ direction = "higher"
 def write_gate(directory: Path, gate: str = GATE_TOML, *, version: str = "v2") -> Path:
     """Write a declaration and the pointer file it names into a directory."""
     (directory / "prompts.toml").write_text(
-        f'project = "{APP}"\n\n[prompts]\n{USE_CASE} = "{version}"\n',
+        f'project = "{APP}"\nexports = "prompts"\n\n'
+        f'[prompts]\n{USE_CASE} = "{version}"\n',
         encoding="utf-8",
     )
     path = directory / "gate.toml"
@@ -391,8 +392,16 @@ def test_a_declaration_loads_from_toml(tmp_path: Path) -> None:
             None,
             "reads its prompts' versions from the app's pointer file",
         ),
-        (GATE_TOML, f'project = "other"\n[prompts]\n{USE_CASE} = "v2"\n', "other"),
-        (GATE_TOML, f'project = "{APP}"\n[prompts]\nanother = "v2"\n', "no pointer"),
+        (
+            GATE_TOML,
+            f'project = "other"\nexports = "p"\n[prompts]\n{USE_CASE} = "v2"\n',
+            "other",
+        ),
+        (
+            GATE_TOML,
+            f'project = "{APP}"\nexports = "p"\n[prompts]\nanother = "v2"\n',
+            "no pointer",
+        ),
         (GATE_TOML.replace('"prompts.toml"', '"missing.toml"'), None, "missing.toml"),
         (
             GATE_TOML.replace(

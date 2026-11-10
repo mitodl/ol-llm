@@ -14,6 +14,7 @@ that says which version production runs:
 
 ```toml
 project = "dagster-ml"
+exports = "prompts"
 
 [prompts]
 feedback-summary = "v4"

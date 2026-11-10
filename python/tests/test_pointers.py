@@ -10,9 +10,11 @@ from ol_llm.pointers import (
     POINTER_ERROR_STATUS,
     PointerError,
     PromptPointers,
+    check_exports,
     export,
     main,
     promote,
+    resolve,
 )
 
 PROJECT = "mit-learn"
@@ -22,13 +24,13 @@ CHAT = [
 ]
 
 
-def pointers(**prompts: str) -> PromptPointers:
-    return PromptPointers(project=PROJECT, prompts=prompts)
+def pointers(exports: Path = Path("unused"), **prompts: str) -> PromptPointers:
+    return PromptPointers(project=PROJECT, exports=exports, prompts=prompts)
 
 
 def write(tmp_path: Path, **prompts: str) -> Path:
     path = tmp_path / "prompts.toml"
-    lines = [f'project = "{PROJECT}"', "", "[prompts]"]
+    lines = [f'project = "{PROJECT}"', 'exports = "prompts"', "", "[prompts]"]
     lines += [f'{name} = "{version}"' for name, version in prompts.items()]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
@@ -42,16 +44,20 @@ def test_the_documented_pointer_file_is_valid(tmp_path: Path) -> None:
     path = tmp_path / "prompts.toml"
     path.write_text(doc.split("```toml\n", 1)[1].split("```", 1)[0])
 
-    assert PromptPointers.load(path).prompts
+    loaded = PromptPointers.load(path)
+
+    assert loaded.prompts["tutor.system"] == "v7"
+    assert loaded.exports == tmp_path / "prompts"
 
 
 @pytest.mark.parametrize(
     ("text", "message"),
     [
-        ('project = "x"\n[prompts]\nsummary = "7"\n', "should match pattern"),
-        ('project = "x"\n[prompts]\n', "at least 1 item"),
-        ('project = "x"\n[prompts]\n"../escape" = "v1"\n', "should match pattern"),
-        ('project = "x"\nextra = 1\n[prompts]\nsummary = "v1"\n', "extra"),
+        ('project = "x"\nexports = "p"\n[prompts]\nsummary = "7"\n', "should match"),
+        ('project = "x"\nexports = "p"\n[prompts]\n', "at least 1 item"),
+        ('project = "x"\nexports = "p"\n[prompts]\n"../up" = "v1"\n', "should match"),
+        ('project = "x"\n[prompts]\nsummary = "v1"\n', "exports"),
+        ('project = "x"\nexports = "p"\nextra = 1\n[prompts]\ns = "v1"\n', "extra"),
         ("not toml", "Expected"),
     ],
 )
@@ -119,10 +125,9 @@ def test_promoting_to_an_unregistered_environment_says_what_to_do(
         list(promote(pointers(summary="v1"), environment="qa"))
 
 
-# Export
+# Exports
 
 
-@pytest.mark.usefixtures("prompt_library")
 def test_an_export_reads_back_as_the_embedded_default(
     prompt_library: PromptLibrary, tmp_path: Path
 ) -> None:
@@ -130,7 +135,7 @@ def test_an_export_reads_back_as_the_embedded_default(
     prompt_library.add("summary", "two {{text}}", type="jinja2")
     prompt_library.add("tutor", CHAT)
 
-    written = export(pointers(summary="v2", tutor="v1"), tmp_path / "prompts")
+    written = export(pointers(tmp_path / "prompts", summary="v2", tutor="v1"))
 
     assert [p.name for p in written] == ["summary.json", "tutor.json"]
     text = load_default(
@@ -145,12 +150,11 @@ def test_an_export_reads_back_as_the_embedded_default(
     assert exported["project"] == PROJECT
 
 
-@pytest.mark.usefixtures("prompt_library")
 def test_the_embedded_default_hashes_like_the_version_it_came_from(
     prompt_library: PromptLibrary, tmp_path: Path
 ) -> None:
     prompt_library.add("summary", "one {{text}}", environments=("production",))
-    export(pointers(summary="v1"), tmp_path)
+    export(pointers(tmp_path, summary="v1"))
     default = load_default("summary", directory=tmp_path, template=TextTemplate)
 
     fetched = get_prompt(
@@ -165,10 +169,56 @@ def test_loading_a_default_of_the_other_structure_raises(
     prompt_library: PromptLibrary, tmp_path: Path
 ) -> None:
     prompt_library.add("tutor", CHAT)
-    export(pointers(tutor="v1"), tmp_path)
+    export(pointers(tmp_path, tutor="v1"))
 
-    with pytest.raises(ValueError, match="exported as a chat prompt"):
+    with pytest.raises(TypeError, match="exported as a chat prompt"):
         load_default("tutor", directory=tmp_path, template=TextTemplate)
+
+
+def test_an_export_removes_a_prompt_the_pointers_no_longer_name(
+    prompt_library: PromptLibrary, tmp_path: Path
+) -> None:
+    prompt_library.add("summary", "one")
+    prompt_library.add("tutor", CHAT)
+    export(pointers(tmp_path, summary="v1", tutor="v1"))
+    (tmp_path / "notes.txt").write_text("kept")
+
+    export(pointers(tmp_path, summary="v1"))
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["notes.txt", "summary.json"]
+
+
+def test_exports_that_match_the_pointers_pass(
+    prompt_library: PromptLibrary, tmp_path: Path
+) -> None:
+    prompt_library.add("summary", "one")
+    prompt_library.add("tutor", CHAT)
+    pointed = pointers(tmp_path, summary="v1", tutor="v1")
+    export(pointed)
+
+    assert check_exports(pointed, resolve(pointed)) == []
+
+
+def test_every_export_that_does_not_match_is_reported(
+    prompt_library: PromptLibrary, tmp_path: Path
+) -> None:
+    for name in ("summary", "glossary", "tutor", "intro", "retired"):
+        prompt_library.add(name, "one")
+        prompt_library.add(name, "two")
+    export(pointers(tmp_path, summary="v1", glossary="v1", tutor="v1", retired="v1"))
+    # The person moving the pointers forgot to export, or edited the text by hand.
+    edited = json.loads((tmp_path / "glossary.json").read_text())
+    (tmp_path / "glossary.json").write_text(json.dumps(edited | {"template": "x"}))
+    (tmp_path / "tutor.json").write_text("{not json")
+    moved = pointers(tmp_path, summary="v2", glossary="v1", tutor="v1", intro="v1")
+
+    assert check_exports(moved, resolve(moved)) == [
+        "retired.json is for a prompt the pointer file does not name",
+        "summary: the export is v1, the pointer says v2",
+        "glossary: the export's text is not v1's",
+        f"tutor: {tmp_path / 'tutor.json'} is not an export ol-llm-prompts wrote",
+        f"intro: no export at {tmp_path / 'intro.json'}",
+    ]
 
 
 # The command
@@ -185,6 +235,23 @@ def test_check_exits_2_on_a_missing_version(
     assert "has no summary v2" in capsys.readouterr().err
 
 
+def test_check_exits_2_until_the_moved_pointer_is_exported(
+    prompt_library: PromptLibrary,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prompt_library.add("summary", "one")
+    prompt_library.add("summary", "two")
+    assert main(["export", str(write(tmp_path, summary="v1"))]) == 0
+    path = write(tmp_path, summary="v2")
+
+    assert main(["check", str(path)]) == POINTER_ERROR_STATUS
+    assert "the export is v1, the pointer says v2" in capsys.readouterr().err
+
+    assert main(["export", str(path)]) == 0
+    assert main(["check", str(path)]) == 0
+
+
 def test_check_with_an_environment_reports_drift(
     prompt_library: PromptLibrary,
     tmp_path: Path,
@@ -193,6 +260,7 @@ def test_check_with_an_environment_reports_drift(
     prompt_library.add("summary", "one", environments=("production",))
     prompt_library.add("summary", "two")
     path = write(tmp_path, summary="v2")
+    assert main(["export", str(path)]) == 0
 
     assert main(["check", str(path)]) == 0
     assert main(["check", str(path), "--environment", "production"]) == DRIFT_STATUS

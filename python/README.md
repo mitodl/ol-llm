@@ -209,7 +209,7 @@ should return a partial one unchanged.
 
 Prompts live in the app's Opik project and are fetched by environment label. Each call site
 passes an embedded default: the text of the version production points at, which
-`ol-llm-prompts export` writes into the image at build time
+`ol-llm-prompts export` writes beside the pointer file and the pointer's pull request commits
 ([prompt promotion](../docs/prompt-promotion.md)).
 
 ```python
@@ -269,8 +269,8 @@ the same key as one that fetched the same text, so an Opik outage does not trigg
 reprocessing.
 
 Production moves by pull request: the app's pointer file names the version production runs,
-per prompt, and `ol-llm-prompts` checks it on the pull request, moves the `production` label
-on merge, and exports the embedded defaults at build. [Prompt promotion](../docs/prompt-promotion.md)
+per prompt, and `ol-llm-prompts` exports the embedded defaults for the pull request to commit,
+checks both on the pull request, and moves the `production` label on merge. [Prompt promotion](../docs/prompt-promotion.md)
 has the file format and the workflow to call.
 
 Underneath, `ol_llm.create_prompt(name, template, project_name=...)` adds a version only when
