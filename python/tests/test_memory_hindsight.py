@@ -20,6 +20,7 @@ from typing import Any, TypeVar
 
 import httpx
 import pytest
+from conftest import record_sleeps
 from ol_llm import run_coroutine
 from ol_llm.memory import (
     ClientCredentialsTokens,
@@ -146,13 +147,7 @@ class Tokens:
 
 @pytest.fixture(autouse=True)
 def no_waits(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    waits: list[float] = []
-
-    async def record(delay: float) -> None:
-        waits.append(delay)
-
-    monkeypatch.setattr(hindsight_module, "_sleep", record)
-    return waits
+    return record_sleeps(monkeypatch, hindsight_module)
 
 
 def learner_notes(service: Service, app: str = "learn-ai") -> Any:  # noqa: ANN401

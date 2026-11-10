@@ -11,6 +11,7 @@ import weakref
 from collections.abc import Generator, Mapping, Sequence
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import ModuleType
 from typing import Any
 
 import ol_llm.catalog as catalog_module
@@ -321,16 +322,21 @@ def clear_policy_env(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(name)
 
 
-@pytest.fixture(autouse=True)
-def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    """Record backoff waits instead of sleeping."""
+def record_sleeps(monkeypatch: pytest.MonkeyPatch, module: ModuleType) -> list[float]:
+    """Replace ``module._sleep`` so backoff waits are recorded instead of slept."""
     recorded: list[float] = []
 
     async def record(delay: float) -> None:
         recorded.append(delay)
 
-    monkeypatch.setattr(models, "_sleep", record)
+    monkeypatch.setattr(module, "_sleep", record)
     return recorded
+
+
+@pytest.fixture(autouse=True)
+def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record backoff waits instead of sleeping."""
+    return record_sleeps(monkeypatch, models)
 
 
 @pytest.fixture
