@@ -46,7 +46,9 @@ from pydantic_ai.messages import (
     RetryPromptPart,
     TextPart,
     ToolCallPart,
+    UserPromptPart,
 )
+from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.output import NativeOutput, OutputSpec
@@ -533,6 +535,63 @@ def test_stream_all_failing_raises_the_primary_error() -> None:
         run_stream(SUMMARY_WITH_FALLBACK)
 
     assert caught.value.model == PRIMARY
+
+
+def continuing_on(model: PolicyFallbackModel, member: int) -> list[ModelMessage]:
+    """A history whose last response is suspended on one chain member's job."""
+    pinned = {"__pydantic_ai__": {"fallback_model_id": model.models[member].model_id}}
+    return [
+        ModelRequest(parts=[UserPromptPart("hi")]),
+        ModelResponse(parts=[], state="suspended", metadata=pinned),
+    ]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_failed_continuation_raises_the_primary_error(stream: bool) -> None:  # noqa: FBT001
+    primary = Scripted(*always(lambda: http_error(503)))
+    fallback = Scripted(*always(lambda: http_error(429)))
+    with override_models(fallback_models(primary, fallback)):
+        model = build_model(SUMMARY_WITH_FALLBACK)
+    assert isinstance(model, PolicyFallbackModel)
+    messages = continuing_on(model, 1)
+
+    async def request() -> None:
+        if not stream:
+            await model.request(messages, None, ModelRequestParameters())
+            return
+        async with model.request_stream(messages, None, ModelRequestParameters()):
+            pass  # pragma: no cover
+
+    with pytest.raises(LLMUnavailable) as caught:
+        asyncio.run(request())
+
+    # FallbackModel tries the member holding the job first, then the whole chain.
+    assert caught.value.model == PRIMARY
+    group = caught.value.__cause__
+    assert isinstance(group, FallbackExceptionGroup)
+    assert [e.model for e in group.exceptions] == [FALLBACK, PRIMARY, FALLBACK]  # type: ignore[attr-defined]
+
+
+def test_a_failed_retry_raises_the_error_of_the_model_that_gave_it() -> None:
+    primary = Scripted(*always(lambda: http_error(503), 3), answer=VALID)
+    fallback = Scripted("not json", *always(lambda: http_error(503)))
+    second = Scripted(*always(lambda: http_error(429)))
+    use_case = UseCase(
+        app="mit-learn",
+        name="summary",
+        profile="request",
+        model=PRIMARY,
+        fallback_models=(FALLBACK, SECOND_FALLBACK),
+    )
+    models = {
+        **fallback_models(primary, fallback),
+        SECOND_FALLBACK: FunctionModel(second, stream_function=second.stream),
+    }
+    with override_models(models), pytest.raises(LLMUnavailable) as caught:
+        run_for_summary(use_case, stream=False)
+
+    assert caught.value.model == FALLBACK
+    assert len(primary.calls) == 3
 
 
 # Agents

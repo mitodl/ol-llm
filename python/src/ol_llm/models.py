@@ -725,8 +725,8 @@ class PolicyFallbackModel(FallbackModel):
 
     Each model in the chain spends its own retries before the next is tried, and
     only rate limits and outages fall back (spec §6.4). When every model fails the
-    caller gets the error of the first model tried, with the whole group as
-    ``__cause__``.
+    caller gets the primary's error (on a retry, that of the model the retry starts
+    at), with the whole group as ``__cause__``.
 
     A request that asks the model to retry its last response (invalid output, or a
     tool's ``ModelRetry``) starts at the model that gave that response, so the retry
@@ -783,15 +783,13 @@ class PolicyFallbackModel(FallbackModel):
         model_request_parameters: ModelRequestParameters,
     ) -> ModelResponse:
         """Try each model in turn."""
+        chain = self._starting_at(messages)
         try:
             return await FallbackModel.request(
-                self._starting_at(messages),
-                messages,
-                model_settings,
-                model_request_parameters,
+                chain, messages, model_settings, model_request_parameters
             )
         except FallbackExceptionGroup as group:
-            if (primary := _primary_error(group)) is None:
+            if (primary := _primary_error(group, chain)) is None:
                 raise
             raise primary from group
 
@@ -804,8 +802,9 @@ class PolicyFallbackModel(FallbackModel):
         run_context: RunContext[Any] | None = None,
     ) -> AsyncGenerator[StreamedResponse]:
         """Open a stream on each model in turn; fall back only while opening."""
+        chain = self._starting_at(messages)
         stream_cm = FallbackModel.request_stream(
-            self._starting_at(messages),
+            chain,
             messages,
             model_settings,
             model_request_parameters,
@@ -814,7 +813,7 @@ class PolicyFallbackModel(FallbackModel):
         try:
             stream = await stream_cm.__aenter__()
         except FallbackExceptionGroup as group:
-            if (primary := _primary_error(group)) is None:
+            if (primary := _primary_error(group, chain)) is None:
                 raise
             raise primary from group
         async with _exit_with(stream_cm):
@@ -835,10 +834,23 @@ async def _exit_with(
         await stream_cm.__aexit__(None, None, None)
 
 
-def _primary_error(group: FallbackExceptionGroup) -> LLMError | None:
-    """Return a copy of the primary model's error to raise in place of the group."""
-    primary = group.exceptions[0]
-    return primary.copy() if isinstance(primary, LLMError) else None
+def _primary_error(
+    group: FallbackExceptionGroup, chain: FallbackModel
+) -> LLMError | None:
+    """Return a copy of the chain's first member's error, to raise for the group.
+
+    The first member is the primary, or on a retry the member that gave the response
+    being retried. A request continuing a suspended response (OpenAI background
+    mode) first tries the member that holds it, then the whole chain, so the group
+    can open with that member's error; the first member's own comes later.
+    """
+    first = cast("PolicyModel", chain.models[0]).catalog_id
+    errors = [
+        exc
+        for exc in group.exceptions
+        if isinstance(exc, LLMError) and exc.model == first
+    ]
+    return errors[-1].copy() if errors else None
 
 
 def _gateway_headers(route: GatewayRoute | None, use_case: UseCase) -> dict[str, str]:
