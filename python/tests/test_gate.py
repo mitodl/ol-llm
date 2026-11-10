@@ -2,7 +2,6 @@ import json
 import re
 import sys
 import textwrap
-import tomllib
 import uuid
 from collections.abc import Callable, Generator
 from datetime import UTC, datetime, timedelta
@@ -30,6 +29,7 @@ from ol_llm.gate import (
     run_gate,
 )
 from ol_llm.models import override_models
+from ol_llm.pointers import PointerError
 from ol_llm.settings import Settings
 from ol_llm.tracing import TracingConfig
 from opik.api_objects.dataset.dataset_item import DatasetItem
@@ -60,9 +60,8 @@ GATE_TOML = f"""
 app = "{APP}"
 use_case = "{USE_CASE}"
 suite = "unused:suite"
-
-[prompts]
-{USE_CASE} = "v2"
+pointers = "prompts.toml"
+prompts = ["{USE_CASE}"]
 
 [dataset]
 name = "{DATASET}"
@@ -77,6 +76,18 @@ metric = "brevity"
 tolerance = 0.1
 direction = "higher"
 """
+
+
+def write_gate(directory: Path, gate: str = GATE_TOML, *, version: str = "v2") -> Path:
+    """Write a declaration and the pointer file it names into a directory."""
+    (directory / "prompts.toml").write_text(
+        f'project = "{APP}"\nexports = "prompts"\n\n'
+        f'[prompts]\n{USE_CASE} = "{version}"\n',
+        encoding="utf-8",
+    )
+    path = directory / "gate.toml"
+    path.write_text(gate, encoding="utf-8")
+    return path
 
 
 class FakeDataset:
@@ -335,19 +346,23 @@ def experiment(  # noqa: PLR0913
 # The declaration
 
 
-def test_the_documented_declarations_are_valid() -> None:
+def test_the_documented_declarations_are_valid(tmp_path: Path) -> None:
     doc = (WORKFLOW.parents[2] / "docs" / "evaluation-gate.md").read_text()
     # The second example adds pairwise judging to the first.
-    first, second = re.findall(r"```toml\n(.*?)```", doc, flags=re.DOTALL)
+    pointers, first, second = re.findall(r"```toml\n(.*?)```", doc, flags=re.DOTALL)
     docstring = (gate_module.__doc__ or "").split("::\n", 1)[1].split("``suite``")[0]
+    # Each example names the pointer file one directory up.
+    (tmp_path / "prompts.toml").write_text(pointers, encoding="utf-8")
+    (tmp_path / "evaluation").mkdir()
+    path = tmp_path / "evaluation" / "gate.toml"
 
     for text in (first, first + second, textwrap.dedent(docstring)):
-        assert GateDeclaration.model_validate(tomllib.loads(text)).thresholds
+        path.write_text(text, encoding="utf-8")
+        assert GateDeclaration.load(path).prompts == {USE_CASE: "v4"}
 
 
 def test_a_declaration_loads_from_toml(tmp_path: Path) -> None:
-    path = tmp_path / "gate.toml"
-    path.write_text(GATE_TOML + "\n[dataset.extra]\n", encoding="utf-8")
+    path = write_gate(tmp_path, GATE_TOML + "\n[dataset.extra]\n")
     with pytest.raises(pydantic.ValidationError, match="extra"):
         GateDeclaration.load(path)
 
@@ -364,6 +379,48 @@ def test_a_declaration_loads_from_toml(tmp_path: Path) -> None:
         Threshold(metric="placeholders", minimum=1.0),
         Threshold(metric="brevity", tolerance=0.1, direction="higher"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("gate", "pointers", "message"),
+    [
+        (
+            GATE_TOML.replace(
+                f'pointers = "prompts.toml"\nprompts = ["{USE_CASE}"]',
+                f'[prompts]\n{USE_CASE} = "v2"',
+            ),
+            None,
+            "reads its prompts' versions from the app's pointer file",
+        ),
+        (
+            GATE_TOML,
+            f'project = "other"\nexports = "p"\n[prompts]\n{USE_CASE} = "v2"\n',
+            "other",
+        ),
+        (
+            GATE_TOML,
+            f'project = "{APP}"\nexports = "p"\n[prompts]\nanother = "v2"\n',
+            "no pointer",
+        ),
+        (GATE_TOML.replace('"prompts.toml"', '"missing.toml"'), None, "missing.toml"),
+        (
+            GATE_TOML.replace(
+                f'prompts = ["{USE_CASE}"]', f'prompts = [["{USE_CASE}"]]'
+            ),
+            None,
+            "reads its prompts' versions from the app's pointer file",
+        ),
+    ],
+)
+def test_a_declaration_takes_its_versions_from_the_pointer_file(
+    tmp_path: Path, gate: str, pointers: str | None, message: str
+) -> None:
+    path = write_gate(tmp_path, gate)
+    if pointers is not None:
+        (tmp_path / "prompts.toml").write_text(pointers, encoding="utf-8")
+
+    with pytest.raises(PointerError, match=message):
+        GateDeclaration.load(path)
 
 
 @pytest.mark.parametrize(
@@ -986,9 +1043,7 @@ def gate_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Generator[Path
     (tmp_path / f"{module}.py").write_text(
         "from test_gate import suite\n", encoding="utf-8"
     )
-    path = tmp_path / "gate.toml"
-    path.write_text(GATE_TOML.replace("unused:suite", f"{module}:suite"))
-    yield path
+    yield write_gate(tmp_path, GATE_TOML.replace("unused:suite", f"{module}:suite"))
     sys.modules.pop(module, None)
 
 
@@ -1040,7 +1095,7 @@ def test_the_gate_command_fails_a_malformed_declaration(tmp_path: Path) -> None:
     report = tmp_path / "report.md"
 
     assert main(["gate", str(path), "--report", str(report)]) == GATE_ERROR_STATUS
-    assert "use_case" in report.read_text()
+    assert "pointer file" in report.read_text()
 
 
 @pytest.mark.usefixtures("prompts")

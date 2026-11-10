@@ -56,6 +56,7 @@ from ol_llm.errors import (
     LLMUnavailable,
 )
 from ol_llm.loops import close_thread_loop, run_coroutine
+from ol_llm.pointers import load_default
 from ol_llm.policy import (
     CallPolicy,
     Profile,
@@ -185,6 +186,7 @@ __all__ = [
     "get_prompt",
     "get_settings",
     "load_catalog",
+    "load_default",
     "process_batch",
     "promote_prompt",
     "resolve_policy",

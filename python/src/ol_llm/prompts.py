@@ -10,7 +10,7 @@ fail.
 A cold fetch with Opik unreachable raises, after as long as the SDK's own retries
 take. ``get_prompt`` waits ``COLD_FETCH_DEADLINE_SECONDS`` for it and then returns
 the embedded default the caller passed, the text of the pointed production
-version exported into the image at build time, marked degraded with
+version committed beside the pointer file (``ol_llm.pointers``), marked degraded with
 ``embedded_prompt``. The fetch carries on in the background and fills the cache,
 so the next call gets the managed version.
 
@@ -105,7 +105,7 @@ class TextTemplate(_Template):
     :param template: the template text.
     :param type: how placeholders are written.
     :param version: the Opik version this text is, e.g. ``v7``, when known. For an
-        embedded default it is the pointed version the build exported.
+        embedded default it is the pointed version that was exported.
     """
 
     template: str
