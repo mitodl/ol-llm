@@ -604,9 +604,15 @@ class PolicyModel(WrapperModel):
         model_settings: ModelSettings | None,
         model_request_parameters: ModelRequestParameters,
     ) -> RequestUsage:
-        """Count tokens with the running loop's provider model."""
-        return await self._loop_model().count_tokens(
-            messages, model_settings, model_request_parameters
+        """Count tokens under the policy, as a request is made.
+
+        A run counts before every request when its usage limits set
+        ``count_tokens_before_request``, and the count is a provider request too.
+        """
+        settings = self._with_timeout(model_settings)
+        provider = self._loop_model()
+        return await self._retrying(
+            lambda: provider.count_tokens(messages, settings, model_request_parameters)
         )
 
     async def cancel_suspended_response(self, response: ModelResponse) -> None:
@@ -640,6 +646,15 @@ class PolicyModel(WrapperModel):
     def _retry_delay(self, exc: Exception, budget: _RetryBudget) -> float:
         return _retry_delay(exc, budget, use_case=self.use_case, model=self.catalog_id)
 
+    async def _retrying(self, attempt: Callable[[], Awaitable[_T]]) -> _T:
+        return await retrying(
+            attempt,
+            policy=self.policy,
+            profile=self.profile_name,
+            use_case=self.use_case,
+            model=self.catalog_id,
+        )
+
     async def request(
         self,
         messages: list[ModelMessage],
@@ -649,12 +664,8 @@ class PolicyModel(WrapperModel):
         """Make the request, retrying transient failures under the policy."""
         settings = self._with_timeout(model_settings)
         provider = self._loop_model()
-        response = await retrying(
-            lambda: provider.request(messages, settings, model_request_parameters),
-            policy=self.policy,
-            profile=self.profile_name,
-            use_case=self.use_case,
-            model=self.catalog_id,
+        response = await self._retrying(
+            lambda: provider.request(messages, settings, model_request_parameters)
         )
         _stamp_answered_by(response, self.catalog_id)
         return response

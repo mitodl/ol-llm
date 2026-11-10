@@ -55,7 +55,9 @@ from pydantic_ai.models import ModelRequestParameters
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.output import NativeOutput, OutputSpec
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.toolsets import FunctionToolset
+from pydantic_ai.usage import RequestUsage, UsageLimits
 
 PRIMARY = "openai:gpt-4o-mini"
 FALLBACK = "bedrock:global.anthropic.claude-haiku-4-5-20251001-v1:0"
@@ -614,6 +616,56 @@ def test_a_failed_retry_raises_the_error_of_the_model_that_gave_it() -> None:
 
     assert caught.value.model == FALLBACK
     assert len(primary.calls) == 3
+
+
+# Token counting
+
+
+class Counting(TestModel):
+    """Counts tokens once its failures are raised, recording each call's settings."""
+
+    def __init__(self, *failures: Exception) -> None:
+        super().__init__()
+        self.failures = list(failures)
+        self.counted: list[ModelSettings | None] = []
+
+    async def count_tokens(
+        self,
+        messages: list[ModelMessage],  # noqa: ARG002
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,  # noqa: ARG002
+    ) -> RequestUsage:
+        self.counted.append(model_settings)
+        if self.failures:
+            raise self.failures.pop(0)
+        return RequestUsage(input_tokens=1)
+
+
+COUNT_FIRST = UsageLimits(count_tokens_before_request=True)
+
+
+def test_token_counting_gets_the_policy_timeout_and_retries(
+    sleeps: list[float],
+) -> None:
+    counting = Counting(http_error(503))
+    with override_models(counting):
+        agent = build_agent(SUMMARY)
+        agent.run_sync("hi", model_settings={"timeout": 999}, usage_limits=COUNT_FIRST)
+
+    assert [settings["timeout"] for settings in counting.counted] == [60, 60]  # type: ignore[index]
+    assert len(sleeps) == 1
+
+
+def test_a_rejected_token_count_is_classified() -> None:
+    counting = Counting(http_error(401))
+    with (
+        override_models(counting),
+        pytest.raises(LLMRejected) as caught,
+    ):
+        build_agent(SUMMARY).run_sync("hi", usage_limits=COUNT_FIRST)
+
+    assert caught.value.status_code == 401
+    assert len(counting.counted) == 1
 
 
 # Agents
