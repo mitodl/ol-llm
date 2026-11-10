@@ -141,7 +141,7 @@ os.environ.update(
 import ol_llm  # noqa: E402
 import opik  # noqa: E402
 import sentry_sdk  # noqa: E402
-from ol_llm import evaluation  # noqa: E402
+from ol_llm import evaluation, memory  # noqa: E402
 from ol_llm.evaluation import ValidatorMetric, judge_model  # noqa: E402
 from ol_llm.models import override_models  # noqa: E402
 from ol_llm.testing import override_embedding_models  # noqa: E402
@@ -380,6 +380,21 @@ def _spans(request: Request) -> list[dict[str, str]]:
     ]
 
 
+def memory_without_its_extra() -> list[str]:
+    """ol_llm.memory works with the in-memory backend and no memory extra."""
+    config = memory.MemoryConfig(backend="in-memory", app=APP)
+    notes = memory.SyncMemory(memory.build_memory(config)).learner(
+        "learner-1", use_case="smoke"
+    )
+    notes.put("pace", "Weekends.")
+    failures = []
+    if [note.text for note in notes.list()] != ["Weekends."]:
+        failures.append("the in-memory backend lost a note")
+    if "hindsight_client_api" in sys.modules:
+        failures.append("ol_llm.memory imported hindsight-client without its backend")
+    return failures
+
+
 def main() -> int:
     """Run the checks and return a process exit status."""
     failures = []
@@ -388,6 +403,7 @@ def main() -> int:
         failures.append("opik usage analytics would report after importing ol_llm")
     failures += check()
     failures += failed_task()
+    failures += memory_without_its_extra()
     if imported := [name for name in DROPPED if name in sys.modules]:
         failures.append(f"dropped packages were imported: {imported}")
     if sentry_sdk.get_client().dsn is not None:

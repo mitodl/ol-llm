@@ -676,6 +676,127 @@ ol-llm-eval gate evaluation/feedback-summary.gate.toml --change pr-123 --report 
 [`docs/evaluation-gate.md`](../docs/evaluation-gate.md) has the declaration format and the
 reusable workflow that runs it on pull requests.
 
+### Memory
+
+`ol_llm.memory` is the one interface to learner memory (cross-session recall and durable
+facts about a learner) and general memory (facts that belong to no learner, e.g. about
+courses). The backend is chosen by configuration, not by import, so it can change without
+touching call sites: `hindsight` for the deployed service, which needs the `memory` extra,
+and `in-memory` for tests and local development, which needs none.
+
+Build one client at startup and ask it for the learner's memory at the start of each
+request, with the learner's session token as the gateway forwards it (APISIX's
+`X-Access-Token`):
+
+```python
+memory = ol_llm.memory.build_memory()  # reads OL_LLM_MEMORY_*
+
+notes = await memory.learner(session_token, use_case="tutor-recall")
+await notes.put("pace", "Has 30 minutes per weekday.")
+found = await notes.search("how much time does the learner have?", limit=3)
+everything = await notes.list()
+pace = await notes.get("pace")
+goal = await notes.get("goal", app="mit-learn")  # another app's note
+await notes.delete("pace")
+```
+
+The learner is whoever the session token belongs to. Nothing else names the learner, so
+an app can only reach the memory of a learner whose session it holds. `learner` exchanges
+the session token for a memory-service token by Keycloak standard token exchange, as the
+app's own exchange client. Exchanged tokens last 300 seconds, so call it per request and do
+not keep the handle.
+
+A learner has one memory, shared by every app. Every app reads every app's notes; an app
+writes and deletes only its own, because each note is stored under the writing app's name
+and its key (`<app>.<key>`). There is no update in place: `put` again with the same key
+replaces a note. Keys are lowercase letters, digits, `_` and `-`, and must never carry
+learner content, because the service redacts note text and metadata (emails, phone numbers,
+secrets) but not keys. Names and assessment content are not redacted, so keeping them out
+is the extraction gate's job.
+
+General memory is read with any app's learner handle (`notes.general("courses")`) and
+written only under a client-credentials grant carrying `ol-memory-general`
+(`memory.general("courses", use_case=...)`). No client holds the grant yet.
+
+Only the platform's account-deletion path forgets a learner. It runs as the platform admin
+client and deletes everything stored for the learner, for every app, in one call:
+
+```python
+removed = await memory.admin(use_case="account-deletion").forget(learner_id)
+```
+
+After a forget, writes for the learner are refused with `MemoryFenced` for an hour, so work
+still in flight cannot bring the memory back. Repeating a forget is safe, and a caller that
+gets an error must repeat it.
+
+The interface is async. Sync code (a Django view, a Celery task) wraps the client in
+`SyncMemory`, which has the same methods and runs each call on the thread's ol-llm event
+loop, as `run_coroutine` does, so the memory service's connections are reused across calls:
+
+```python
+memory = ol_llm.memory.SyncMemory(ol_llm.memory.build_memory())
+
+notes = memory.learner(session_token, use_case="tutor-recall")
+notes.put("pace", "Has 30 minutes per weekday.")
+```
+
+Do not wrap the async client in `asyncio.run` or `async_to_sync`: each call would then build
+and abandon its own connections. The library closes its connections when it shuts down a
+thread's loop, so there is nothing to close by hand.
+
+Failures raise typed errors, classified by status and type, never by message text:
+
+| Error | When | Retryable |
+| --- | --- | --- |
+| `MemoryNotFound` | `get` of a note that does not exist | no |
+| `MemoryForbidden` | a write the credential may not make, e.g. general memory with a learner token | no |
+| `MemoryFenced` | a write while the learner's memory is being forgotten | no |
+| `MemoryUnauthenticated` | the session token was refused or expired; exchange from a fresh one | no |
+| `MemoryUnavailable` (`MemoryTimeout` for a timeout) | a dropped connection, a 408, 429 or 5xx | yes |
+| `MemoryRejected` | a malformed request or a misconfigured client | no |
+| `MemoryUnsupported` | the configured backend lacks the capability | no |
+
+All of them subclass `MemoryStoreError` and carry `operation` and `status_code`. Each
+request is bounded by `OL_LLM_MEMORY_TIMEOUT_SECONDS` and is not retried, except `forget`,
+which starts over after a retryable failure, up to five attempts in all.
+
+Every operation is a span inside the calling trace, named `memory <operation>`, with the
+app, use case, environment, the `Attribution` fields, and the keys involved. Note text,
+queries, metadata and results are on the span only when `OL_LLM_TRACE_CONTENT` is on.
+
+Configuration, from the environment or as a `MemoryConfig` passed to `build_memory`:
+
+| Variable | Meaning |
+| --- | --- |
+| `OL_LLM_MEMORY_BACKEND` | `hindsight` or `in-memory`, or a backend another package registers |
+| `OL_LLM_MEMORY_APP` | the app's name as the service knows it, e.g. `learn-ai` |
+| `OL_LLM_MEMORY_URL` | the service, e.g. `http://hindsight.hindsight.svc.cluster.local:8888` |
+| `OL_LLM_MEMORY_TIMEOUT_SECONDS` | bound on each request; 10 by default |
+| `OL_LLM_MEMORY_TOKEN_URL` | the Keycloak realm's token endpoint, for every client below |
+| `OL_LLM_MEMORY_EXCHANGE_CLIENT_ID`, `_CLIENT_SECRET` | the app's exchange client, one only the app holds: learn-ai's `ol-learn-ai-client`, mit-learn's `ol-mitlearn-memory-client` |
+| `OL_LLM_MEMORY_GENERAL_CLIENT_ID`, `_CLIENT_SECRET` | a client holding the general grant, for general writes |
+| `OL_LLM_MEMORY_ADMIN_CLIENT_ID`, `_CLIENT_SECRET` | `ol-memory-admin-client`, for the forget path only |
+| `OL_LLM_MEMORY_AUDIENCE`, `OL_LLM_MEMORY_AUDIENCE_SCOPE`, `OL_LLM_MEMORY_GENERAL_SCOPE` | override the service's Keycloak names (`ol-memory-client`, `ol-memory-audience`, and `ol-memory-audience ol-memory-general`) |
+
+Each client's id and secret are set together. Leave the exchange client unset for the
+in-memory backend, which takes the session token as the learner id.
+
+Tests use the in-memory backend, which enforces the same rules as the service:
+
+```python
+store = ol_llm.memory.InMemoryStore()
+memory = ol_llm.memory.Memory(ol_llm.memory.InMemoryBackend("learn-ai", store=store))
+notes = await memory.learner("learner-1", use_case="tutor-recall")
+```
+
+A new backend implements `ol_llm.memory.MemoryBackend`, registers with
+`ol_llm.memory.register_backend` or an entry point in the `ol_llm.memory_backends` group,
+and passes the checks in `ol_llm.memory.conformance`, which the library runs against the
+in-memory backend in CI. `python/tests/test_memory_hindsight.py` runs the same checks
+against a live Hindsight when `OL_LLM_MEMORY_IT_CONFIG` names its configuration. It creates
+users and forgets them, so point it only at a disposable stack such as ol-infrastructure's
+`scripts/hindsight` harness.
+
 ### Tracing
 
 Tracing reads the variables the Opik SDK reads, so the SDK and the span exporter always send
@@ -723,7 +844,7 @@ else is opt-in:
 | `langchain` | `langchain-core` | `traced_chat`, for call sites that keep their LangChain or LangGraph chat models |
 | `openai`, `anthropic`, `bedrock`, `google`, `mistral` | the matching `pydantic-ai-slim` extra | A provider SDK; each also installs PydanticAI |
 | `harness` | `pydantic-ai-harness` | In-session memory, compaction, and conversation search. Each harness release pins PydanticAI exactly |
-| `memory` | `hindsight-client` | The shared memory service's client. Provisional: the backend is still being evaluated |
+| `memory` | `hindsight-client` | The `hindsight` backend of `ol_llm.memory`. Follows the deployed server's minor version |
 
 For example, `ol-llm[bedrock,harness]`.
 

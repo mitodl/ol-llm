@@ -54,12 +54,14 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # The error names are the contract's (spec §3.2 rule 5), shared with other languages.
 "python/src/ol_llm/errors.py" = ["N818"]
+"python/src/ol_llm/memory/errors.py" = ["N818"]
 "**/tests/**" = ["D", "INP001", "PLR2004", "S101", "S106"]
 "python/smoke/smoke_test.py" = ["T201", "INP001"]
 
 [tool.pytest.ini_options]
 markers = [
     "network: fetches from the internet; deselect offline with -m 'not network'",
+    "hindsight: writes to and forgets from a live Hindsight; skipped unless OL_LLM_MEMORY_IT_CONFIG is set",
 ]
 
 [tool.mypy]

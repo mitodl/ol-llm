@@ -412,13 +412,16 @@ EMBEDDINGS_REPLY = {
     "usage": {"prompt_tokens": 1, "total_tokens": 1},
 }
 TOKEN_REPLY = {"access_token": "token", "expires_in": 300}
+# Hindsight's answer to a recall that finds nothing.
+RECALL_REPLY: dict[str, object] = {"results": []}
 PRIMARY = "openai:gpt-4o-mini"
 # Not in the released catalog; the fixture adds it.
 GEMINI = "google:gemini-3.1-pro-preview"
 
 
 class KeepAliveProvider(BaseHTTPRequestHandler):
-    """Answers OpenAI Responses and embeddings, Gemini, and Keycloak token requests.
+    """Answers OpenAI Responses and embeddings, Gemini, Keycloak token requests, and
+    Hindsight recalls.
 
     Over persistent connections. Paths under ``/unavailable`` answer 503, so a
     chain falls back. Gemini's streaming endpoint answers with one server-sent
@@ -439,6 +442,8 @@ class KeepAliveProvider(BaseHTTPRequestHandler):
             reply: Mapping[str, object]
             if self.path.endswith("/embeddings"):
                 reply = EMBEDDINGS_REPLY
+            elif self.path.endswith("/memories/recall"):
+                reply = RECALL_REPLY
             elif self.path.endswith("/token"):
                 reply = TOKEN_REPLY
             elif "generateContent" in self.path:
