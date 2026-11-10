@@ -9,7 +9,8 @@
 # - anything else fails, rather than promoting or passing unchecked.
 #
 # The check and the drift report authenticate with the caller's read client
-# (OPIK_KEYCLOAK_CLIENT_*), the one the evaluation gate uses. Promotion runs in the
+# (OPIK_KEYCLOAK_CLIENT_*), the one the evaluation gate uses, and run ol-llm at
+# this workflow's own commit rather than the caller's code. Promotion runs in the
 # GitHub environment named by `promotion-environment` and authenticates with that
 # environment's OPIK_PROMOTION_CLIENT_* secrets, so pull request code never holds
 # the client meant to move production. docs/prompt-promotion.md has a caller.
@@ -23,7 +24,7 @@ on:
         required: true
         type: string
       working-directory:
-        description: The uv project that installs ol-llm.
+        description: The directory pointers is relative to; promotion installs ol-llm from its uv project.
         type: string
         default: "."
       opik-url:
@@ -84,13 +85,22 @@ jobs:
             echo "::error::No Opik credentials. Pull requests from forks get no secrets, so their pointers cannot be checked."
             exit 1
           fi
-      - name: Install
-        working-directory: ${{ inputs.working-directory }}
-        run: uv sync --frozen
+      # The check never installs or runs the pull request's code: it runs ol-llm
+      # at this workflow's own commit, from ol-llm's lockfile, and reads only the
+      # pointer file and the exports from the pull request, as data. Opik treats
+      # any client as a workspace admin, so code from the pull request must not
+      # run next to the read client's secret.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: mitodl/ol-llm
+          ref: ${{ job.workflow_sha }}
+          path: .ol-llm-prompts
+          persist-credentials: false
+      - name: Install ol-llm
+        run: uv sync --frozen --no-dev --package ol-llm --directory .ol-llm-prompts
       - name: Check the pointers
-        working-directory: ${{ inputs.working-directory }}
         env:
-          POINTERS: ${{ inputs.pointers }}
+          POINTERS: ${{ github.workspace }}/${{ inputs.working-directory }}/${{ inputs.pointers }}
           # A schedule also reports a production label someone moved by hand.
           DRIFT: ${{ github.event_name == 'schedule' }}
           OPIK_URL_OVERRIDE: ${{ inputs.opik-url }}
@@ -103,7 +113,8 @@ jobs:
         run: |
           flags=()
           if [ "$DRIFT" = true ]; then flags+=(--environment production); fi
-          uv run --frozen ol-llm-prompts check "$POINTERS" "${flags[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
+          uv run --frozen --no-dev --package ol-llm --directory .ol-llm-prompts \
+            ol-llm-prompts check "$POINTERS" "${flags[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
 
   promote:
     name: prompt promotion

@@ -1,0 +1,7 @@
+paths:
+  .github/workflows/prompt-promotion.yml:
+    ignore:
+      # job.workflow_sha (the reusable workflow's own commit) is documented at
+      # https://docs.github.com/en/actions/reference/workflows-and-actions/contexts
+      # but not yet in actionlint 1.7.12's schema, which knows only github.workflow_sha.
+      - 'property "workflow_sha" is not defined in object type'

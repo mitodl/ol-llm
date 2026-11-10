@@ -129,16 +129,23 @@ Each event does one thing:
   unchecked.
 
 The check and the drift report read Opik with `OPIK_KEYCLOAK_CLIENT_*`, the client the
-evaluation gate already uses on pull requests. Promotion runs in the GitHub environment
-`prompt-promotion` (the `promotion-environment` input) and takes `OPIK_PROMOTION_CLIENT_*` from
-that environment's secrets, so code from a pull request, which `check` installs and runs, never
+evaluation gate already uses on pull requests. They never install or run the pull request's
+code: the job checks out ol-llm at the reusable workflow's own commit (`job.workflow_sha`),
+installs it from ol-llm's lockfile, and reads only the pointer file and the exports from the
+pull request. A compromised dependency in a pull request (a Renovate bump, say) therefore never
+runs next to that secret.
+
+Promotion runs in the GitHub environment `prompt-promotion` (the `promotion-environment` input)
+and takes `OPIK_PROMOTION_CLIENT_*` from that environment's secrets, so no pull request job
 holds the client meant to move `production`. Create the environment with its deployment
 branches limited to the default branch, and set the two secrets on it rather than on the
 repository. The caller still passes them by name; GitHub substitutes the environment's values
 in the job that names the environment.
 
-Opik admits any authenticated client as a workspace admin, so the gate's client could move a
-label too. The drift report is what catches that.
+Opik admits any authenticated client as a workspace admin, so the read client could move a
+label too, and the evaluation gate has to run the pull request's suite code with it. Someone
+who can push a branch to the repository can also edit the calling workflow. The drift report
+is what catches a label moved any of those ways.
 
 Every prompt the app fetches should have a gate whose `paths` include the pointer file, so a
 pull request that moves a pointer also evaluates the new version. Nothing here enforces that,
