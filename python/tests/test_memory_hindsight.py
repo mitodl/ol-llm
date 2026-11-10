@@ -235,25 +235,106 @@ def test_get_of_a_missing_note_is_not_found() -> None:
     assert raised.value.operation == "get"
 
 
+def by_document(**units: list[dict[str, object]]) -> Reply:
+    """Answer a units listing with the units of the document it asks for, or all."""
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        if (document_id := request.url.params.get("document_id")) is None:
+            return page(*[u for listed in units.values() for u in listed])
+        return page(*units.get(document_id, []))
+
+    return answer
+
+
+def chunk(
+    document_id: str, text: str, index: int, **extra: object
+) -> dict[str, object]:
+    """One chunk of a long note, with the chunk id the service gives it."""
+    chunk_id = f"u-{LEARNER}_{document_id}_{index}"
+    return unit(document_id, text, chunk_id=chunk_id, **extra)
+
+
 def test_search_recalls_within_the_budget_and_keeps_the_limit() -> None:
     results = [
         {**unit(f"learn-ai.n{i}", f"Note {i}."), "scores": {"final": 1 - i / 10}}
         for i in range(4)
     ]
-    service = Service().on(
-        "POST",
-        f"{BANK}/memories/recall",
-        httpx.Response(200, json={"results": results}),
+    service = (
+        Service()
+        .on(
+            "POST",
+            f"{BANK}/memories/recall",
+            httpx.Response(200, json={"results": results}),
+        )
+        .on(
+            "GET",
+            f"{BANK}/memories/list",
+            by_document(**{f"learn-ai.n{i}": [results[i]] for i in range(4)}),
+        )
     )
     found = run(learner_notes(service).search("notes", limit=2))
 
-    assert [(n.key, n.score) for n in found] == [("n0", 1.0), ("n1", 0.9)]
+    assert [(n.key, n.text, n.score) for n in found] == [
+        ("n0", "Note 0.", 1.0),
+        ("n1", "Note 1.", 0.9),
+    ]
     assert json.loads(service.requests[0].content) == {
         "query": "notes",
         "max_tokens": 512,
         "trace": False,
         "tags_match": "any",
     }
+
+
+def test_a_chunked_note_is_read_whole_in_chunk_order() -> None:
+    # The service lists a note's chunks in no particular order; they share the
+    # note's timestamps.
+    chunks = [
+        chunk("learn-ai.essay", "Part three.", 2),
+        chunk("learn-ai.essay", "Part one.", 0, metadata={"source": "chat"}),
+        chunk("learn-ai.essay", "Part two.", 1),
+    ]
+    service = Service().on(
+        "GET", f"{BANK}/memories/list", by_document(**{"learn-ai.essay": chunks})
+    )
+    notes = learner_notes(service)
+    whole = "Part one.\nPart two.\nPart three."
+
+    assert run(notes.get("essay")).text == whole
+    assert [n.text for n in run(notes.list())] == [whole]
+
+
+def test_search_returns_each_note_once_whole_with_its_best_score() -> None:
+    results = [
+        {**chunk("learn-ai.essay", "Part two.", 1), "scores": {"final": 0.9}},
+        {**unit("mit-learn.goal", "A certificate."), "scores": {"final": 0.8}},
+        {**chunk("learn-ai.essay", "Part one.", 0), "scores": {"final": 0.7}},
+        {**unit("learn-ai.pace", "Weekends."), "scores": {"final": 0.6}},
+    ]
+    service = (
+        Service()
+        .on(
+            "POST",
+            f"{BANK}/memories/recall",
+            httpx.Response(200, json={"results": results}),
+        )
+        .on(
+            "GET",
+            f"{BANK}/memories/list",
+            by_document(
+                **{
+                    "learn-ai.essay": [results[0], results[2]],
+                    "mit-learn.goal": [results[1]],
+                }
+            ),
+        )
+    )
+    found = run(learner_notes(service).search("essay", limit=2))
+
+    assert [(n.app, n.key, n.text, n.score) for n in found] == [
+        ("learn-ai", "essay", "Part one.\nPart two.", 0.9),
+        ("mit-learn", "goal", "A certificate.", 0.8),
+    ]
 
 
 def test_delete_removes_the_apps_document_and_tolerates_a_missing_one() -> None:
@@ -298,6 +379,15 @@ def test_a_refused_write_raises_by_status(status: int, error: type[Exception]) -
     assert type(raised.value) is error
     assert raised.value.status_code == status  # type: ignore[attr-defined]
     assert len(service.requests) == 1
+
+
+def test_an_error_message_leaves_out_the_response_body() -> None:
+    echoed = {"detail": [{"loc": ["body"], "input": {"content": "Weekends."}}]}
+    service = Service().on("POST", f"{BANK}/memories", httpx.Response(422, json=echoed))
+    with pytest.raises(MemoryRejected) as raised:
+        run(learner_notes(service).put("pace", "Weekends."))
+    assert "Weekends" not in str(raised.value)
+    assert "422" in str(raised.value)
 
 
 def test_a_timeout_is_retryable() -> None:
@@ -379,13 +469,42 @@ def test_service_calls_need_tokens() -> None:
         backend.admin(ServiceCredential(None))
 
 
-@pytest.mark.parametrize("tags", [[], ["app:learn-ai", "app:mit-learn"]])
-def test_a_note_without_exactly_one_writer_fails_loudly(tags: list[str]) -> None:
-    service = Service().on(
-        "GET", f"{BANK}/memories/list", page(unit("learn-ai.pace", "x", tags=tags))
+@pytest.mark.parametrize(
+    "stray",
+    [
+        unit("learn-ai.pace", "secret text", tags=[]),
+        unit("learn-ai.pace", "secret text", tags=["app:learn-ai", "app:mit-learn"]),
+        unit("other.pace", "secret text", tags=["app:learn-ai"]),
+        {"id": "observation-1", "text": "secret text", "tags": None},
+    ],
+)
+def test_a_unit_no_app_wrote_is_skipped_and_logged_without_its_text(
+    stray: dict[str, object], caplog: pytest.LogCaptureFixture
+) -> None:
+    kept = unit("mit-learn.goal", "A certificate.")
+    service = (
+        Service()
+        .on("GET", f"{BANK}/memories/list", page(stray, kept))
+        .on(
+            "POST",
+            f"{BANK}/memories/recall",
+            httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {**stray, "scores": {"final": 1.0}},
+                        {**kept, "scores": {"final": 0.5}},
+                    ]
+                },
+            ),
+        )
     )
-    with pytest.raises(ValueError, match="app tags"):
-        run(learner_notes(service).list())
+    notes = learner_notes(service)
+
+    assert [n.key for n in run(notes.list())] == ["goal"]
+    assert [n.key for n in run(notes.search("anything"))] == ["goal"]
+    assert str(stray["id"]) in caplog.text
+    assert "secret text" not in caplog.text
 
 
 # -- forget -----------------------------------------------------------------------
@@ -515,6 +634,33 @@ def test_forget_starts_over_after_a_failure_that_can_clear(
     admin = service.backend().admin(ServiceCredential(Tokens("admin-token")))
     assert run(admin.forget(LEARNER)) == 2
     assert no_waits == [hindsight_module.FORGET_BACKOFF_SECONDS]
+
+
+def test_forget_does_not_start_over_after_a_drain_times_out(
+    no_waits: list[float], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(hindsight_module, "DRAIN_TIMEOUT_SECONDS", -1.0)
+    service = (
+        Service()
+        .on(
+            "DELETE",
+            f"{BANK}/memories",
+            httpx.Response(200, json={"success": True, "deleted_count": 1}),
+        )
+        .on("GET", f"{BANK}/operations", operations("op-1"))
+        .on(
+            "DELETE",
+            f"{BANK}/operations/op-1",
+            httpx.Response(409, json={"detail": "already processing"}),
+        )
+    )
+    admin = service.backend().admin(ServiceCredential(Tokens("admin-token")))
+    with pytest.raises(MemoryTimeout) as raised:
+        run(admin.forget(LEARNER))
+
+    assert raised.value.retryable
+    assert service.seen().count(("DELETE", f"{BANK}/memories")) == 1
+    assert no_waits == []
 
 
 def test_forget_gives_up_after_its_attempts(no_waits: list[float]) -> None:

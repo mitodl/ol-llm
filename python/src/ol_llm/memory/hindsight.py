@@ -17,7 +17,9 @@ retries on 429 and 503: a request is sent once, and only ``forget`` starts over.
 import asyncio
 import base64
 import builtins
+import dataclasses
 import json
+import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -65,6 +67,8 @@ from ol_llm.memory.interface import (
 )
 
 _R = TypeVar("_R")
+
+log = logging.getLogger(__name__)
 
 LEARNER_BANK_PREFIX = "u-"
 GENERAL_BANK_PREFIX = "g-"
@@ -260,27 +264,53 @@ class _Api:
                     continue
                 if missing_ok and status == _NOT_FOUND:
                     return None
-                message = f"{operation}: {status} {exc.reason} {exc.body}"
+                # Not the body: a 422 echoes the request, note text included,
+                # and this message reaches logs and Sentry.
+                message = f"{operation}: {status} {exc.reason}"
                 raise from_status(status, message, operation=operation) from exc
             except httpx.TransportError as exc:
                 raise from_transport(exc, operation=operation) from exc
         raise AssertionError  # pragma: no cover - the loop returns or raises
 
 
-def _writer(unit_id: str, tags: Sequence[str] | None) -> str:
+class _DrainTimedOut(MemoryTimeout):
+    """The forget's drain outlasted ``DRAIN_TIMEOUT_SECONDS``; forget does not retry.
+
+    Still a ``MemoryTimeout``, so the caller repeats the forget later, as it must
+    after any failure.
+    """
+
+
+class _NotANote(Exception):  # noqa: N818 - private, never raised to callers
+    """A memory unit no app wrote through this library, e.g. a consolidated one."""
+
+
+def _writer(tags: Sequence[str] | None) -> str:
     apps = [tag.removeprefix("app:") for tag in tags or [] if tag.startswith("app:")]
     if len(apps) != 1:
-        msg = f"memory {unit_id} has app tags {apps}, not exactly one"
-        raise ValueError(msg)
+        msg = f"{len(apps)} app tags, not exactly one"
+        raise _NotANote(msg)
     return apps[0]
 
 
-def _key(unit_id: str, document_id: str | None, app: str) -> str:
-    document_id = document_id or ""
-    if not document_id.startswith(f"{app}."):
-        msg = f"memory {unit_id} has document id {document_id!r}, not {app}.*"
-        raise ValueError(msg)
-    return document_id.removeprefix(f"{app}.")
+def _key(document_id: str | None, app: str) -> str:
+    if not (document_id or "").startswith(f"{app}."):
+        msg = f"a document id outside {app}.*"
+        raise _NotANote(msg)
+    return (document_id or "").removeprefix(f"{app}.")
+
+
+def _chunk_index(chunk_id: str | None) -> int:
+    """Return a unit's place in its note, from the server's chunk id.
+
+    In the ``chunks`` extraction mode the deployed service runs, a note over the
+    chunk size (3000 characters by default) is stored as one unit per chunk, and
+    each unit's chunk id ends in ``_<chunk index>`` whatever the bank and document
+    ids hold (hindsight-api ``engine/chunk_ids.py``). A unit without one sorts
+    first.
+    """
+    index = (chunk_id or "").rpartition("_")[2]
+    return int(index) if index.isdigit() else 0
 
 
 def _metadata(metadata: Mapping[str, object] | None) -> dict[str, str]:
@@ -291,17 +321,35 @@ class _Unit:
     """What a note is built from, from a listed memory unit or a recall result."""
 
     def __init__(self, item: Any) -> None:  # noqa: ANN401 - two generated models
-        self.app = _writer(item.id, item.tags)
-        self.key = _key(item.id, item.document_id, self.app)
+        self.app = _writer(item.tags)
+        self.key = _key(item.document_id, self.app)
+        self.index = _chunk_index(item.chunk_id)
         self.text = str(item.text or "")
         self.metadata = _metadata(item.metadata)
+
+
+def _readable(items: Sequence[Any]) -> builtins.list[tuple[Any, _Unit]]:
+    """Pair each item with its unit, skipping (and logging) any that is not a note.
+
+    One such unit (consolidation, were it turned on, or a write that bypassed the
+    library) must not fail every read of the learner's memory. Only its id is
+    logged, never its text.
+    """
+    readable = []
+    for item in items:
+        try:
+            readable.append((item, _Unit(item)))
+        except _NotANote as exc:
+            log.warning("Skipping memory unit %s: %s", item.id, exc)
+    return readable
 
 
 def _notes(units: builtins.list[_Unit]) -> builtins.list[Note]:
     """Group memory units into notes, one per document, in the order listed.
 
-    A note long enough to be chunked is stored as several units; their texts are
-    joined with newlines in the order the service lists them.
+    A chunked note's units are joined with newlines in chunk order. The service
+    strips whitespace at chunk boundaries, so a reassembled note has its text in
+    order but not always the original whitespace where it was split.
     """
     grouped: dict[tuple[str, str], builtins.list[_Unit]] = {}
     for unit in units:
@@ -309,7 +357,9 @@ def _notes(units: builtins.list[_Unit]) -> builtins.list[Note]:
     return [
         Note(
             key=key,
-            text="\n".join(unit.text for unit in units),
+            text="\n".join(
+                unit.text for unit in sorted(units, key=lambda unit: unit.index)
+            ),
             app=app,
             metadata=units[0].metadata,
         )
@@ -372,17 +422,19 @@ class _Notes:
     ) -> builtins.list[_Unit] | None:
         """Return every memory unit the listing matches, or ``None`` with no bank."""
         units: builtins.list[_Unit] = []
+        listed = 0
         while True:
             page = await self._api.send(
-                partial(self._page, document_id=document_id, offset=len(units)),
+                partial(self._page, document_id=document_id, offset=listed),
                 operation=operation,
                 credential=self._credential,
                 missing_ok=True,
             )
             if page is None:
                 return None
-            units.extend(_Unit(item) for item in page.items)
-            if not page.items or len(units) >= page.total:
+            listed += len(page.items)
+            units.extend(unit for _, unit in _readable(page.items))
+            if not page.items or listed >= page.total:
                 return units
 
     async def get(self, key: str, *, app: str | None = None) -> Note:
@@ -408,19 +460,26 @@ class _Notes:
         )
         if response is None:
             return []
-        found = []
-        for result in response.results[:limit]:
-            unit = _Unit(result)
-            found.append(
-                Note(
-                    key=unit.key,
-                    text=unit.text,
-                    app=unit.app,
-                    metadata=unit.metadata,
-                    score=None if result.scores is None else float(result.scores.final),
+        # Recall answers with units, best first, and a chunked note's chunks are
+        # separate units, so keep each note's best score, then read the matched
+        # notes whole.
+        best: dict[tuple[str, str], float | None] = {}
+        for result, unit in _readable(response.results):
+            if (unit.app, unit.key) not in best:
+                best[unit.app, unit.key] = (
+                    None if result.scores is None else float(result.scores.final)
                 )
-            )
-        return found
+            if len(best) == limit:
+                break
+        notes = await asyncio.gather(
+            *(self._units("search", f"{app}.{key}") for app, key in best)
+        )
+        # A note deleted between the recall and the read is left out.
+        return [
+            dataclasses.replace(note, score=score)
+            for score, units in zip(best.values(), notes, strict=True)
+            for note in _notes(units or [])
+        ]
 
     async def delete(self, key: str) -> None:
         await self._api.send(
@@ -465,7 +524,10 @@ class _Admin:
             try:
                 return await self._forget(learner_id)
             except MemoryStoreError as exc:
-                if not exc.retryable or attempt == FORGET_ATTEMPTS - 1:
+                # A drain that timed out already waited DRAIN_TIMEOUT_SECONDS;
+                # starting over would wait that long again, up to five times.
+                last = attempt == FORGET_ATTEMPTS - 1
+                if not exc.retryable or isinstance(exc, _DrainTimedOut) or last:
                     raise
                 await _sleep(FORGET_BACKOFF_SECONDS * 2**attempt)
         raise AssertionError  # pragma: no cover - the loop returns or raises
@@ -519,7 +581,7 @@ class _Admin:
                 return
             if time.monotonic() > deadline:
                 msg = f"{bank} still had work in flight after {DRAIN_TIMEOUT_SECONDS}s"
-                raise MemoryTimeout(msg, operation="forget")
+                raise _DrainTimedOut(msg, operation="forget")
             await _sleep(DRAIN_POLL_SECONDS)
 
     async def _operations(
