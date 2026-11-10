@@ -139,9 +139,6 @@ _TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
 
 _OPENAI_PROVIDERS = frozenset({"openai", "openai-chat", "openai-responses"})
 _AZURE_PROVIDERS = frozenset({"azure", "azure-responses"})
-# TogetherProvider's own base URL; the provider cannot be given a client built
-# with retries off any other way.
-_TOGETHER_BASE_URL = "https://api.together.xyz/v1"
 
 SUPPORTED_PROVIDERS = frozenset(
     {
@@ -1015,20 +1012,18 @@ def _mistral_provider() -> Provider[Any]:
     return MistralProvider()
 
 
-def _together_provider() -> Provider[Any]:
+def _together_provider(settings: Settings) -> Provider[Any]:
     try:
-        from openai import AsyncOpenAI, DefaultAsyncHttpxClient  # noqa: PLC0415
         from pydantic_ai.providers.together import TogetherProvider  # noqa: PLC0415
     except ImportError as exc:
         _raise_missing_extra("openai", exc)
-    # AsyncOpenAI reads OPENAI_API_KEY by default; Together's key has its own name.
-    client = AsyncOpenAI(
-        max_retries=0,
-        http_client=DefaultAsyncHttpxClient(),
-        base_url=_TOGETHER_BASE_URL,
-        api_key=os.environ["TOGETHER_API_KEY"],
+    # The provider knows Together's base URL and makes its own client, which it
+    # closes on exit. The client reads max_retries on every request.
+    provider = TogetherProvider(
+        api_key=settings.together_api_key or os.environ["TOGETHER_API_KEY"]
     )
-    return TogetherProvider(openai_client=client)
+    provider.client.max_retries = 0
+    return provider
 
 
 def provider_factory(
@@ -1073,7 +1068,7 @@ def provider_factory(
         if provider == "mistral":
             return _mistral_provider()
         if provider == "together":
-            return _together_provider()
+            return _together_provider(settings)
         msg = (
             f"ol-llm does not build {provider!r} models; "
             f"supported providers are {sorted(SUPPORTED_PROVIDERS)}"

@@ -59,7 +59,8 @@ provider clients.
 
 Set `OL_LLM_ENVIRONMENT`, or call `ol_llm.configure(ol_llm.Settings(environment=...))` at
 startup. Provider credentials are each SDK's own (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, the AWS
-and Google default credential chains, and so on). Operators can change a use case's limits
+and Google default credential chains, and so on), except that a host configuring in code can
+pass Together's key as `Settings(together_api_key=...)`. Operators can change a use case's limits
 without a release, e.g. `OL_LLM_CONTENT_SUMMARY_TIMEOUT_SECONDS=120`.
 
 Call sites not built on PydanticAI (LangGraph, a plain SDK) apply the same numbers with
