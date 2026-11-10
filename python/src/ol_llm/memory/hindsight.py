@@ -26,7 +26,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from functools import partial
 from typing import Any, TypeVar
 
-import httpx
+import httpx2
 from hindsight_client_api.api.banks_api import BanksApi
 from hindsight_client_api.api.documents_api import DocumentsApi
 from hindsight_client_api.api.memory_api import MemoryApi
@@ -137,9 +137,9 @@ def token_subject(token: str) -> str:
 
 
 class _Answer:
-    """An ``httpx`` response in the shape the generated client reads."""
+    """An ``httpx2`` response in the shape the generated client reads."""
 
-    def __init__(self, response: httpx.Response) -> None:
+    def __init__(self, response: httpx2.Response) -> None:
         self.response = response
         self.status = response.status_code
         self.reason = response.reason_phrase
@@ -148,7 +148,7 @@ class _Answer:
     async def read(self) -> bytes:
         return self.data
 
-    def getheaders(self) -> httpx.Headers:
+    def getheaders(self) -> httpx2.Headers:
         return self.response.headers
 
     def getheader(self, name: str, default: str | None = None) -> str | None:
@@ -157,17 +157,17 @@ class _Answer:
 
 
 class _Transport:
-    """The generated client's transport, on ``httpx`` in place of its ``aiohttp``.
+    """The generated client's transport, on ``httpx2`` in place of its ``aiohttp``.
 
     ``ApiClient`` sends every request through ``rest_client.request`` and closes it
     with ``rest_client.close``. Its own ``aiohttp`` session logs "Unclosed client
     session" when it is dropped unclosed, which is what happens to a value built on
     a loop ol-llm does not close (``asyncio.run`` per call, a thread pool's threads
-    exiting). An ``httpx`` client is dropped quietly, as every other client in
+    exiting). An ``httpx2`` client is dropped quietly, as every other client in
     ol-llm is.
     """
 
-    def __init__(self, http: httpx.AsyncClient) -> None:
+    def __init__(self, http: httpx2.AsyncClient) -> None:
         self.http = http
 
     async def request(
@@ -185,8 +185,8 @@ class _Transport:
             raise ValueError(msg)
         # The generated methods name the content type themselves for a body
         # ("Content-Type"), and headers compare case-insensitively only once
-        # they are httpx.Headers, so set the default there, not in a dict.
-        sent = httpx.Headers(dict(headers or {}))
+        # they are httpx2.Headers, so set the default there, not in a dict.
+        sent = httpx2.Headers(dict(headers or {}))
         if body is not None:
             sent.setdefault("content-type", "application/json")
         response = await self.http.request(
@@ -203,7 +203,7 @@ class _Transport:
         await self.http.aclose()
 
 
-def _api_client(base_url: str, http: httpx.AsyncClient) -> ApiClient:
+def _api_client(base_url: str, http: httpx2.AsyncClient) -> ApiClient:
     client = ApiClient(Configuration(host=base_url.rstrip("/")))
     # ApiClient only calls request() and close() on it, which _Transport provides.
     client.rest_client = _Transport(http)  # type: ignore[assignment]
@@ -218,12 +218,12 @@ class _Api:
     """Sends with the running loop's ``ApiClient`` and turns failures into errors."""
 
     def __init__(
-        self, base_url: str, *, timeout_seconds: float, http: httpx.AsyncClient | None
+        self, base_url: str, *, timeout_seconds: float, http: httpx2.AsyncClient | None
     ) -> None:
         self._timeout = timeout_seconds
         self._given = None if http is None else _api_client(base_url, http)
         self._clients = LoopLocal(
-            lambda: _api_client(base_url, httpx.AsyncClient()), _close
+            lambda: _api_client(base_url, httpx2.AsyncClient()), _close
         )
 
     async def send(
@@ -268,7 +268,7 @@ class _Api:
                 # and this message reaches logs and Sentry.
                 message = f"{operation}: {status} {exc.reason}"
                 raise from_status(status, message, operation=operation) from exc
-            except httpx.TransportError as exc:
+            except httpx2.TransportError as exc:
                 raise from_transport(exc, operation=operation) from exc
         raise AssertionError  # pragma: no cover - the loop returns or raises
 
@@ -619,7 +619,7 @@ class HindsightBackend:
         app: str,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
         recall_max_tokens: int = DEFAULT_RECALL_MAX_TOKENS,
-        http: httpx.AsyncClient | None = None,
+        http: httpx2.AsyncClient | None = None,
     ) -> None:
         """Hold the configuration; nothing is connected until the first request."""
         self.app = app

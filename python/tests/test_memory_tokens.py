@@ -4,6 +4,7 @@ from typing import TypeVar
 from urllib.parse import parse_qs
 
 import httpx
+import httpx2
 import pytest
 from ol_llm.memory import (
     ClientCredentialsTokens,
@@ -17,6 +18,8 @@ from ol_llm.memory import (
 from ol_llm.tracing import KeycloakClient
 
 _T = TypeVar("_T")
+# The exchange sends with httpx2; client-credentials tokens with httpx.
+Response = httpx.Response | httpx2.Response
 
 TOKEN_URL = "https://sso.example/realms/olapps/protocol/openid-connect/token"  # noqa: S105
 EXCHANGE_CLIENT = KeycloakExchangeClient(
@@ -34,11 +37,11 @@ def run(coroutine: Awaitable[_T]) -> _T:
 class FakeKeycloak:
     """The realm's token endpoint: records each form and answers in turn."""
 
-    def __init__(self, *responses: httpx.Response) -> None:
+    def __init__(self, *responses: Response) -> None:
         self.responses = list(responses)
         self.forms: list[dict[str, str]] = []
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    def __call__(self, request: httpx.Request | httpx2.Request) -> Response:
         assert str(request.url) == TOKEN_URL
         form = parse_qs(request.content.decode())
         self.forms.append({key: value for key, [value] in form.items()})
@@ -47,7 +50,7 @@ class FakeKeycloak:
 
 def exchange(keycloak: FakeKeycloak, subject: str = "session-token") -> str:
     async def go() -> str:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(keycloak)) as http:
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(keycloak)) as http:
             return await KeycloakTokenExchange(EXCHANGE_CLIENT, http=http).exchange(
                 subject
             )
@@ -56,7 +59,7 @@ def exchange(keycloak: FakeKeycloak, subject: str = "session-token") -> str:
 
 
 def test_exchange_sends_the_standard_token_exchange_form() -> None:
-    keycloak = FakeKeycloak(httpx.Response(200, json={"access_token": "memory-token"}))
+    keycloak = FakeKeycloak(httpx2.Response(200, json={"access_token": "memory-token"}))
 
     assert exchange(keycloak) == "memory-token"
     assert keycloak.forms == [
@@ -77,11 +80,11 @@ def test_exchange_sends_the_standard_token_exchange_form() -> None:
     ("response", "error"),
     [
         (
-            httpx.Response(400, json={"error": "invalid_token"}),
+            httpx2.Response(400, json={"error": "invalid_token"}),
             MemoryUnauthenticated,
         ),
         (
-            httpx.Response(
+            httpx2.Response(
                 400,
                 json={
                     "error": "invalid_request",
@@ -90,13 +93,13 @@ def test_exchange_sends_the_standard_token_exchange_form() -> None:
             ),
             MemoryUnauthenticated,
         ),
-        (httpx.Response(401, json={"error": "invalid_client"}), MemoryRejected),
-        (httpx.Response(503, text="maintenance"), MemoryUnavailable),
-        (httpx.Response(418, text="teapot"), MemoryRejected),
+        (httpx2.Response(401, json={"error": "invalid_client"}), MemoryRejected),
+        (httpx2.Response(503, text="maintenance"), MemoryUnavailable),
+        (httpx2.Response(418, text="teapot"), MemoryRejected),
     ],
 )
 def test_a_refused_exchange_raises_by_class(
-    response: httpx.Response, error: type[Exception]
+    response: httpx2.Response, error: type[Exception]
 ) -> None:
     with pytest.raises(error) as raised:
         exchange(FakeKeycloak(response))
@@ -105,12 +108,12 @@ def test_a_refused_exchange_raises_by_class(
 
 
 def test_an_exchange_that_times_out_is_retryable() -> None:
-    def hang(request: httpx.Request) -> httpx.Response:
+    def hang(request: httpx2.Request) -> httpx2.Response:
         msg = "slow"
-        raise httpx.ReadTimeout(msg, request=request)
+        raise httpx2.ReadTimeout(msg, request=request)
 
     async def go() -> str:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(hang)) as http:
+        async with httpx2.AsyncClient(transport=httpx2.MockTransport(hang)) as http:
             return await KeycloakTokenExchange(EXCHANGE_CLIENT, http=http).exchange("x")
 
     with pytest.raises(MemoryTimeout) as raised:
@@ -169,3 +172,19 @@ def test_a_refused_client_credentials_grant_raises_by_class(
     )
     with pytest.raises(error):
         run(tokens.token())
+
+
+def test_an_unreachable_keycloak_for_client_credentials_is_unavailable() -> None:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        msg = "refused"
+        raise httpx.ConnectError(msg, request=request)
+
+    tokens = ClientCredentialsTokens(
+        KeycloakClient(
+            token_url=TOKEN_URL, client_id="ol-memory-admin-client", client_secret="s"
+        ),
+        http=httpx.Client(transport=httpx.MockTransport(refuse)),
+    )
+    with pytest.raises(MemoryUnavailable) as raised:
+        run(tokens.token())
+    assert raised.value.operation == "token"

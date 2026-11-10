@@ -9,13 +9,22 @@ is never shown to users.
 from typing import Any, ClassVar
 
 import httpx
+import httpx2
 
 from ol_llm.errors import _rebuild
 
 RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 """HTTP statuses that mean the service did not answer and a retry can help."""
 
-_UNAVAILABLE_TRANSPORT_ERRORS = (httpx.NetworkError, httpx.RemoteProtocolError)
+# The Hindsight client and the token exchange send with httpx2; client-credentials
+# tokens come from the cache shared with Opik, which sends with httpx.
+_TIMEOUT_ERRORS = (httpx.TimeoutException, httpx2.TimeoutException)
+_UNAVAILABLE_TRANSPORT_ERRORS = (
+    httpx.NetworkError,
+    httpx.RemoteProtocolError,
+    httpx2.NetworkError,
+    httpx2.RemoteProtocolError,
+)
 
 
 class MemoryStoreError(Exception):
@@ -111,16 +120,18 @@ def from_status(status_code: int, message: str, *, operation: str) -> MemoryStor
     return kind(message, operation=operation, status_code=status_code)
 
 
-def from_transport(exc: httpx.TransportError, *, operation: str) -> MemoryStoreError:
+def from_transport(
+    exc: httpx.TransportError | httpx2.TransportError, *, operation: str
+) -> MemoryStoreError:
     """Return the error for a request that got no answer.
 
-    :param exc: what ``httpx`` raised.
+    :param exc: what ``httpx`` or ``httpx2`` raised.
     :param operation: the operation that failed.
     :returns: the error.
     :rtype: MemoryStoreError
     """
     message = f"{type(exc).__name__}: {exc}"
-    if isinstance(exc, httpx.TimeoutException):
+    if isinstance(exc, _TIMEOUT_ERRORS):
         return MemoryTimeout(message, operation=operation)
     if isinstance(exc, _UNAVAILABLE_TRANSPORT_ERRORS):
         return MemoryUnavailable(message, operation=operation)

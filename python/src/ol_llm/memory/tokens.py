@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 import httpx
+import httpx2
 
 from ol_llm.loops import LoopLocal
 from ol_llm.memory.errors import (
@@ -77,7 +78,7 @@ class KeycloakTokenExchange:
     """Standard token exchange (RFC 8693) of learner session tokens."""
 
     def __init__(
-        self, client: KeycloakExchangeClient, *, http: httpx.AsyncClient | None = None
+        self, client: KeycloakExchangeClient, *, http: httpx2.AsyncClient | None = None
     ) -> None:
         """Exchange as ``client``.
 
@@ -88,7 +89,7 @@ class KeycloakTokenExchange:
         self._client = client
         self._given = http
         self._http = LoopLocal(
-            lambda: httpx.AsyncClient(timeout=TOKEN_REQUEST_TIMEOUT_SECONDS),
+            lambda: httpx2.AsyncClient(timeout=TOKEN_REQUEST_TIMEOUT_SECONDS),
             _close_http,
         )
 
@@ -118,7 +119,7 @@ class KeycloakTokenExchange:
                     "scope": self._client.scope,
                 },
             )
-        except httpx.TransportError as exc:
+        except httpx2.TransportError as exc:
             raise from_transport(exc, operation="exchange") from exc
         if response.is_success:
             token: str = response.json()["access_token"]
@@ -126,11 +127,11 @@ class KeycloakTokenExchange:
         raise _exchange_error(response)
 
 
-async def _close_http(http: httpx.AsyncClient) -> None:
+async def _close_http(http: httpx2.AsyncClient) -> None:
     await http.aclose()
 
 
-def _exchange_error(response: httpx.Response) -> MemoryStoreError:
+def _exchange_error(response: httpx2.Response) -> MemoryStoreError:
     try:
         code = str(response.json().get("error", ""))
     except ValueError:
@@ -153,6 +154,9 @@ class ClientCredentialsTokens:
     For the general writer, request ``ol-memory-audience ol-memory-general`` as the
     scope unless the client has both as default scopes; the admin client needs
     none.
+
+    It sends with ``httpx``, not ``httpx2`` as the rest of the memory package does,
+    because the token cache it wraps is the one the Opik SDK's ``httpx`` hooks use.
     """
 
     def __init__(

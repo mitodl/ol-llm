@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, TypeVar
 
-import httpx
+import httpx2
 import pytest
 from conftest import record_sleeps
 from ol_llm import run_coroutine
@@ -65,7 +65,7 @@ def jwt(claims: dict[str, object]) -> str:
 
 LEARNER_TOKEN = jwt({"sub": LEARNER, "azp": "ol-learn-ai-client"})
 
-Reply = httpx.Response | Callable[[httpx.Request], httpx.Response]
+Reply = httpx2.Response | Callable[[httpx2.Request], httpx2.Response]
 
 
 @dataclass
@@ -77,13 +77,13 @@ class Service:
     """
 
     script: dict[tuple[str, str], list[Reply]] = field(default_factory=dict)
-    requests: list[httpx.Request] = field(default_factory=list)
+    requests: list[httpx2.Request] = field(default_factory=list)
 
     def on(self, method: str, path: str, *replies: Reply) -> "Service":
         self.script.setdefault((method, path), []).extend(replies)
         return self
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    def __call__(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(request)
         replies = self.script.get((request.method, request.url.path))
         assert replies, f"unscripted {request.method} {request.url.path}"
@@ -95,7 +95,7 @@ class Service:
             BASE,
             app=app,
             recall_max_tokens=512,
-            http=httpx.AsyncClient(transport=httpx.MockTransport(self)),
+            http=httpx2.AsyncClient(transport=httpx2.MockTransport(self)),
         )
 
     def seen(self) -> list[tuple[str, str]]:
@@ -115,8 +115,8 @@ def unit(
     }
 
 
-def page(*items: dict[str, object], total: int | None = None) -> httpx.Response:
-    return httpx.Response(
+def page(*items: dict[str, object], total: int | None = None) -> httpx2.Response:
+    return httpx2.Response(
         200,
         json={
             "items": list(items),
@@ -127,7 +127,7 @@ def page(*items: dict[str, object], total: int | None = None) -> httpx.Response:
     )
 
 
-RETAINED = httpx.Response(
+RETAINED = httpx2.Response(
     200,
     json={"success": True, "bank_id": f"u-{LEARNER}", "items_count": 1, "async": False},
 )
@@ -200,7 +200,7 @@ def test_list_reads_every_page_and_groups_units_by_note() -> None:
 
 
 def test_an_empty_memory_lists_and_searches_as_empty() -> None:
-    missing = httpx.Response(404, json={"detail": "bank not found"})
+    missing = httpx2.Response(404, json={"detail": "bank not found"})
     service = (
         Service()
         .on("GET", f"{BANK}/memories/list", missing)
@@ -233,7 +233,7 @@ def test_get_of_a_missing_note_is_not_found() -> None:
 def by_document(**units: list[dict[str, object]]) -> Reply:
     """Answer a units listing with the units of the document it asks for, or all."""
 
-    def answer(request: httpx.Request) -> httpx.Response:
+    def answer(request: httpx2.Request) -> httpx2.Response:
         if (document_id := request.url.params.get("document_id")) is None:
             return page(*[u for listed in units.values() for u in listed])
         return page(*units.get(document_id, []))
@@ -259,7 +259,7 @@ def test_search_recalls_within_the_budget_and_keeps_the_limit() -> None:
         .on(
             "POST",
             f"{BANK}/memories/recall",
-            httpx.Response(200, json={"results": results}),
+            httpx2.Response(200, json={"results": results}),
         )
         .on(
             "GET",
@@ -311,7 +311,7 @@ def test_search_returns_each_note_once_whole_with_its_best_score() -> None:
         .on(
             "POST",
             f"{BANK}/memories/recall",
-            httpx.Response(200, json={"results": results}),
+            httpx2.Response(200, json={"results": results}),
         )
         .on(
             "GET",
@@ -336,7 +336,7 @@ def test_delete_removes_the_apps_document_and_tolerates_a_missing_one() -> None:
     service = Service().on(
         "DELETE",
         f"{BANK}/documents/learn-ai.pace",
-        httpx.Response(
+        httpx2.Response(
             200,
             json={
                 "success": True,
@@ -345,7 +345,7 @@ def test_delete_removes_the_apps_document_and_tolerates_a_missing_one() -> None:
                 "memory_units_deleted": 1,
             },
         ),
-        httpx.Response(404, json={"detail": "not found"}),
+        httpx2.Response(404, json={"detail": "not found"}),
     )
     notes = learner_notes(service)
     run(notes.delete("pace"))
@@ -367,7 +367,7 @@ def test_delete_removes_the_apps_document_and_tolerates_a_missing_one() -> None:
 )
 def test_a_refused_write_raises_by_status(status: int, error: type[Exception]) -> None:
     service = Service().on(
-        "POST", f"{BANK}/memories", httpx.Response(status, json={"detail": "no"})
+        "POST", f"{BANK}/memories", httpx2.Response(status, json={"detail": "no"})
     )
     with pytest.raises(error) as raised:
         run(learner_notes(service).put("pace", "Weekends."))
@@ -378,7 +378,9 @@ def test_a_refused_write_raises_by_status(status: int, error: type[Exception]) -
 
 def test_an_error_message_leaves_out_the_response_body() -> None:
     echoed = {"detail": [{"loc": ["body"], "input": {"content": "Weekends."}}]}
-    service = Service().on("POST", f"{BANK}/memories", httpx.Response(422, json=echoed))
+    service = Service().on(
+        "POST", f"{BANK}/memories", httpx2.Response(422, json=echoed)
+    )
     with pytest.raises(MemoryRejected) as raised:
         run(learner_notes(service).put("pace", "Weekends."))
     assert "Weekends" not in str(raised.value)
@@ -386,9 +388,9 @@ def test_an_error_message_leaves_out_the_response_body() -> None:
 
 
 def test_a_timeout_is_retryable() -> None:
-    def hang(request: httpx.Request) -> httpx.Response:
+    def hang(request: httpx2.Request) -> httpx2.Response:
         msg = "slow"
-        raise httpx.ReadTimeout(msg, request=request)
+        raise httpx2.ReadTimeout(msg, request=request)
 
     service = Service().on("POST", f"{BANK}/memories/recall", hang)
     with pytest.raises(MemoryTimeout) as raised:
@@ -399,15 +401,15 @@ def test_a_timeout_is_retryable() -> None:
 @pytest.mark.parametrize(
     ("raised", "error"),
     [
-        (httpx.ConnectError("refused"), MemoryUnavailable),
-        (httpx.RemoteProtocolError("dropped"), MemoryUnavailable),
-        (httpx.UnsupportedProtocol("nope://"), MemoryRejected),
+        (httpx2.ConnectError("refused"), MemoryUnavailable),
+        (httpx2.RemoteProtocolError("dropped"), MemoryUnavailable),
+        (httpx2.UnsupportedProtocol("nope://"), MemoryRejected),
     ],
 )
 def test_a_transport_failure_is_classified_by_type(
     raised: Exception, error: type[Exception]
 ) -> None:
-    def fail(_request: httpx.Request) -> httpx.Response:
+    def fail(_request: httpx2.Request) -> httpx2.Response:
         raise raised
 
     service = Service().on("POST", f"{BANK}/memories", fail)
@@ -430,7 +432,7 @@ def test_a_service_token_is_refreshed_once_after_a_401() -> None:
     service = Service().on(
         "POST",
         f"{general}/memories",
-        httpx.Response(401, json={"detail": "expired"}),
+        httpx2.Response(401, json={"detail": "expired"}),
         RETAINED,
     )
     tokens = Tokens("old", "new")
@@ -483,7 +485,7 @@ def test_a_unit_no_app_wrote_is_skipped_and_logged_without_its_text(
         .on(
             "POST",
             f"{BANK}/memories/recall",
-            httpx.Response(
+            httpx2.Response(
                 200,
                 json={
                     "results": [
@@ -505,7 +507,7 @@ def test_a_unit_no_app_wrote_is_skipped_and_logged_without_its_text(
 # -- forget -----------------------------------------------------------------------
 
 
-def operations(*ids: str) -> httpx.Response:
+def operations(*ids: str) -> httpx2.Response:
     listed = [
         {
             "id": i,
@@ -517,7 +519,7 @@ def operations(*ids: str) -> httpx.Response:
         }
         for i in ids
     ]
-    return httpx.Response(
+    return httpx2.Response(
         200,
         json={
             "bank_id": f"u-{LEARNER}",
@@ -529,18 +531,18 @@ def operations(*ids: str) -> httpx.Response:
     )
 
 
-def cancelled(operation_id: str) -> httpx.Response:
-    return httpx.Response(
+def cancelled(operation_id: str) -> httpx2.Response:
+    return httpx2.Response(
         200,
         json={"success": True, "message": "cancelled", "operation_id": operation_id},
     )
 
 
 def forget_service() -> Service:
-    def by_status(*replies: tuple[str, httpx.Response]) -> Reply:
+    def by_status(*replies: tuple[str, httpx2.Response]) -> Reply:
         queued = list(replies)
 
-        def answer(request: httpx.Request) -> httpx.Response:
+        def answer(request: httpx2.Request) -> httpx2.Response:
             status = request.url.params["status"]
             index = next(i for i, (s, _) in enumerate(queued) if s == status)
             return queued.pop(index)[1]
@@ -552,7 +554,7 @@ def forget_service() -> Service:
         .on(
             "DELETE",
             f"{BANK}/memories",
-            httpx.Response(200, json={"success": True, "deleted_count": 3}),
+            httpx2.Response(200, json={"success": True, "deleted_count": 3}),
         )
         .on(
             "GET",
@@ -569,12 +571,12 @@ def forget_service() -> Service:
         .on(
             "DELETE",
             f"{BANK}/operations/op-2",
-            httpx.Response(409, json={"detail": "already processing"}),
+            httpx2.Response(409, json={"detail": "already processing"}),
         )
         .on(
             "DELETE",
             BANK,
-            httpx.Response(200, json={"success": True, "deleted_count": 1}),
+            httpx2.Response(200, json={"success": True, "deleted_count": 1}),
         )
     )
 
@@ -603,7 +605,7 @@ def test_forget_clears_drains_then_deletes_the_bank(no_waits: list[float]) -> No
 
 
 def test_forget_of_an_absent_bank_skips_the_drain() -> None:
-    missing = httpx.Response(404, json={"detail": "bank not found"})
+    missing = httpx2.Response(404, json={"detail": "bank not found"})
     service = (
         Service().on("DELETE", f"{BANK}/memories", missing).on("DELETE", BANK, missing)
     )
@@ -620,11 +622,11 @@ def test_forget_starts_over_after_a_failure_that_can_clear(
         .on(
             "DELETE",
             f"{BANK}/memories",
-            httpx.Response(503, json={"detail": "deadlock"}),
-            httpx.Response(200, json={"success": True, "deleted_count": 2}),
+            httpx2.Response(503, json={"detail": "deadlock"}),
+            httpx2.Response(200, json={"success": True, "deleted_count": 2}),
         )
         .on("GET", f"{BANK}/operations", operations())
-        .on("DELETE", BANK, httpx.Response(200, json={"success": True}))
+        .on("DELETE", BANK, httpx2.Response(200, json={"success": True}))
     )
     admin = service.backend().admin(ServiceCredential(Tokens("admin-token")))
     assert run(admin.forget(LEARNER)) == 2
@@ -640,13 +642,13 @@ def test_forget_does_not_start_over_after_a_drain_times_out(
         .on(
             "DELETE",
             f"{BANK}/memories",
-            httpx.Response(200, json={"success": True, "deleted_count": 1}),
+            httpx2.Response(200, json={"success": True, "deleted_count": 1}),
         )
         .on("GET", f"{BANK}/operations", operations("op-1"))
         .on(
             "DELETE",
             f"{BANK}/operations/op-1",
-            httpx.Response(409, json={"detail": "already processing"}),
+            httpx2.Response(409, json={"detail": "already processing"}),
         )
     )
     admin = service.backend().admin(ServiceCredential(Tokens("admin-token")))
@@ -660,7 +662,7 @@ def test_forget_does_not_start_over_after_a_drain_times_out(
 
 def test_forget_gives_up_after_its_attempts(no_waits: list[float]) -> None:
     service = Service().on(
-        "DELETE", f"{BANK}/memories", httpx.Response(503, json={"detail": "down"})
+        "DELETE", f"{BANK}/memories", httpx2.Response(503, json={"detail": "down"})
     )
     admin = service.backend().admin(ServiceCredential(Tokens("admin-token")))
     with pytest.raises(MemoryUnavailable):
@@ -671,7 +673,7 @@ def test_forget_gives_up_after_its_attempts(no_waits: list[float]) -> None:
 
 def test_forget_does_not_retry_a_refusal() -> None:
     service = Service().on(
-        "DELETE", f"{BANK}/memories", httpx.Response(403, json={"detail": "no"})
+        "DELETE", f"{BANK}/memories", httpx2.Response(403, json={"detail": "no"})
     )
     admin = service.backend().admin(ServiceCredential(Tokens("admin-token")))
     with pytest.raises(MemoryForbidden):
@@ -788,7 +790,7 @@ class LiveHarness:
     async def new_learner(self) -> ConformanceLearner:
         config = self.config
         username = f"conformance-{uuid.uuid4().hex[:12]}"
-        async with httpx.AsyncClient(timeout=60) as http:
+        async with httpx2.AsyncClient(timeout=60) as http:
             admin = await http.post(
                 f"{config.keycloak_url}/realms/master/protocol/openid-connect/token",
                 data={

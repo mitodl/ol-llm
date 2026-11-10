@@ -29,7 +29,11 @@ dependencies = [
     # 2026.10.19 it trusts emSign intermediates whose keys are compromised
     # (GHSA-6q48-6c7w-9gw2), and a floor here reaches every consuming app.
     "certifi>=2026.10.19",
+    # opik requires httpx, and the provider SDKs (openai, anthropic, mistralai,
+    # pydantic-ai-slim) require its maintained continuation, httpx2. Code that
+    # does not share a client or hook with Opik sends with httpx2.
     "httpx>=0.28",
+    "httpx2>=2.13",
     "opentelemetry-exporter-otlp-proto-http>=1.38",
     "opentelemetry-sdk>=1.38",
     "opik==2.2.94",

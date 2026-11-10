@@ -10,3 +10,4 @@
 ### Changed
 
 - The `memory` extra now installs `hindsight-client` 1.2.x, matching the deployed Hindsight server (1.2.0), in place of 0.10.x.
+- ol-llm now requires `httpx2`, the maintained continuation of `httpx` that the openai, anthropic, mistralai and pydantic-ai-slim SDKs already require. The memory package sends with it: `HindsightBackend(http=...)` and `KeycloakTokenExchange(http=...)` take an `httpx2.AsyncClient`. `ClientCredentialsTokens(http=...)` still takes an `httpx.Client`, because it shares the token cache the Opik SDK's `httpx` hooks use.
