@@ -166,8 +166,8 @@ _answers: ContextVar[list[str] | None] = ContextVar("ol_llm_answers", default=No
 async def close_provider_model(model: Model | EmbeddingModel) -> None:
     """Close the HTTP client of a provider model built for one event loop.
 
-    A provider that made its own client (Google, Mistral) owns it; one given an SDK
-    client (OpenAI, Azure, Anthropic, Together) leaves it to its maker, which is
+    A provider that made its own client (Google, Mistral, Together) owns it; one
+    given an SDK client (OpenAI, Azure, Anthropic) leaves it to its maker, which is
     ol-llm here. Bedrock's boto3 client is synchronous and shared by every loop
     (see ``provider_factory``), so it stays open, as does a test's own model.
 
@@ -1033,7 +1033,7 @@ def provider_factory(
 
     :param use_case: the call site, for the gateway header.
     :param policy: the resolved policy, for the client timeouts.
-    :param settings: the gateway routes and Azure credentials.
+    :param settings: the gateway routes, Azure credentials, and Together key.
     :returns: a factory from a provider name to the provider.
     :rtype: Callable[[str], Provider[Any]]
 
