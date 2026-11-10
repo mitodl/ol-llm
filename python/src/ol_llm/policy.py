@@ -239,7 +239,9 @@ def worst_case_seconds(
     and 3,300 s on the batch profile at the defaults, per model. A Celery time
     limit, an arq ``job_timeout``, or a Dagster ``dagster/max_runtime`` has to sit
     above this times the model requests the job makes, or it kills a call the
-    policy is still retrying.
+    policy is still retrying. A run that counts tokens before each request
+    (``UsageLimits(count_tokens_before_request=True)``) makes the count under the
+    same policy with its own retries, so double the figure for such a run.
 
     :param use_case: the call site.
     :param environ: the environment to read; ``os.environ`` when omitted.

@@ -59,7 +59,8 @@ provider clients.
 
 Set `OL_LLM_ENVIRONMENT`, or call `ol_llm.configure(ol_llm.Settings(environment=...))` at
 startup. Provider credentials are each SDK's own (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, the AWS
-and Google default credential chains, and so on). Operators can change a use case's limits
+and Google default credential chains, and so on), except that a host configuring in code can
+pass Together's key as `Settings(together_api_key=...)`. Operators can change a use case's limits
 without a release, e.g. `OL_LLM_CONTENT_SUMMARY_TIMEOUT_SECONDS=120`.
 
 Call sites not built on PydanticAI (LangGraph, a plain SDK) apply the same numbers with
@@ -544,7 +545,7 @@ The breaker lives in one task, so each task of a group has its own. A task time 
 (Celery `soft_time_limit`, Dagster `dagster/max_runtime`) has to sit above
 `ol_llm.worst_case_seconds(use_case)`, the longest one model request can take under the
 policy (3,300 s per model on the batch profile's defaults), or it kills a call that is still
-retrying.
+retrying. Double it for a run that counts tokens before each request.
 
 With `max_workers` above 1, rows run on threads, as in the Dagster example. `complete_sync`
 and `run_sync` over an agent built once both work there, since each thread's event loop gets

@@ -28,6 +28,7 @@ from ol_llm.embeddings import PolicyEmbeddingModel, build_embedder
 from ol_llm.models import PolicyModel, build_agent, build_model
 from ol_llm.settings import GatewayRoute, Settings, configure
 from pydantic_ai.providers import mistral
+from pydantic_ai.providers.together import TogetherProvider
 
 HANG_SECONDS = 1.5
 TEST_TIMEOUT_SECONDS = "0.3"
@@ -167,6 +168,31 @@ def test_gateway_route_replaces_the_vendor_api(family: str, model_id: str) -> No
     assert str(client.base_url) == "https://gateway.example/llm/"
     assert client.api_key == "app-key"
     assert client.default_headers[USE_CASE_HEADER] == "summary"
+
+
+def test_together_takes_its_key_from_the_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TOGETHER_API_KEY", raising=False)
+    configure(Settings(environment="ci", together_api_key="configured-key"))
+    model = build_model(use_case("together:meta-llama/Llama-3.3-70B-Instruct-Turbo"))
+    assert isinstance(model, PolicyModel)
+    provider = model.wrapped.provider  # type: ignore[attr-defined]
+
+    assert provider.client.api_key == "configured-key"
+    assert provider.client.max_retries == 0
+
+
+@pytest.mark.usefixtures("provider_env")
+def test_together_requests_go_to_the_providers_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    moved = "https://together.example/v2"
+    monkeypatch.setattr(TogetherProvider, "base_url", property(lambda _self: moved))
+
+    client = provider_client("together:meta-llama/Llama-3.3-70B-Instruct-Turbo")
+
+    assert str(client.base_url) == f"{moved}/"
 
 
 @pytest.mark.usefixtures("provider_env")
