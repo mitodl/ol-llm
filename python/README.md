@@ -545,7 +545,7 @@ The breaker lives in one task, so each task of a group has its own. A task time 
 (Celery `soft_time_limit`, Dagster `dagster/max_runtime`) has to sit above
 `ol_llm.worst_case_seconds(use_case)`, the longest one model request can take under the
 policy (3,300 s per model on the batch profile's defaults), or it kills a call that is still
-retrying.
+retrying. Double it for a run that counts tokens before each request.
 
 With `max_workers` above 1, rows run on threads, as in the Dagster example. `complete_sync`
 and `run_sync` over an agent built once both work there, since each thread's event loop gets
