@@ -448,7 +448,9 @@ SUMMARY = ol_llm.UseCase(
     profile="batch",
     model="bedrock:global.anthropic.claude-haiku-4-5-20251001-v1:0",
 )
-SUMMARY_PROMPT = ol_llm.TextTemplate(template=EXPORTED_TEXT, version="v3")
+SUMMARY_PROMPT = ol_llm.load_default(
+    "feedback-summary", directory=PROMPTS_DIR, template=ol_llm.TextTemplate
+)
 
 
 @dg.asset(pool=ol_llm.dagster_pool(SUMMARY))
@@ -512,7 +514,9 @@ import ol_llm
 SUMMARY = ol_llm.UseCase(
     app="mit-learn", name="content-summary", profile="batch", model="openai:gpt-4o-mini"
 )
-SUMMARY_PROMPT = ol_llm.TextTemplate(template=EXPORTED_TEXT, version="v2")
+SUMMARY_PROMPT = ol_llm.load_default(
+    "content-summary", directory=PROMPTS_DIR, template=ol_llm.TextTemplate
+)
 FILES_PER_TASK = 20
 
 
