@@ -38,7 +38,7 @@ jobs:
   newest-dependencies:
     # Consumers resolve their own versions, which run ahead of uv.lock. The
     # harness extra pins slim exactly and would hold it at the lock's version,
-    # and the tests use neither it nor the memory extra.
+    # and the tests don't use it.
     name: test (newest dependencies, Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
@@ -58,7 +58,7 @@ jobs:
         run: |
           uv venv "$RUNNER_TEMP/newest"
           uv pip install --python "$RUNNER_TEMP/newest" \
-            "./python[anthropic,bedrock,google,mistral,openai,pydantic-ai,langchain]" "pytest>=8.4" "asgiref>=3.8"
+            "./python[anthropic,bedrock,google,mistral,openai,pydantic-ai,langchain,memory]" "pytest>=8.4" "asgiref>=3.8"
           uv pip list --python "$RUNNER_TEMP/newest"
       - name: Test
         run: '"$RUNNER_TEMP/newest/bin/python" -m pytest python/tests'

@@ -767,6 +767,7 @@ source = { editable = "../" }
 dependencies = [
     { name = "certifi" },
     { name = "httpx" },
+    { name = "httpx2" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-sdk" },
     { name = "opik" },
@@ -782,8 +783,9 @@ pydantic-ai = [
 [package.metadata]
 requires-dist = [
     { name = "certifi", specifier = ">=2026.10.19" },
-    { name = "hindsight-client", marker = "extra == 'memory'", specifier = ">=0.10,<0.11" },
+    { name = "hindsight-client", marker = "extra == 'memory'", specifier = ">=1.2,<1.3" },
     { name = "httpx", specifier = ">=0.28" },
+    { name = "httpx2", specifier = ">=2.13" },
     { name = "langchain-core", marker = "extra == 'langchain'", specifier = ">=1.1,<2" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.38" },
     { name = "opentelemetry-sdk", specifier = ">=1.38" },

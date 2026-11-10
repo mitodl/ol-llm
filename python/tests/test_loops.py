@@ -8,6 +8,7 @@ used it. A new loop-local client (a memory backend's, say) adds itself to
 """
 
 import asyncio
+import base64
 import gc
 import gzip
 import inspect
@@ -49,6 +50,12 @@ from ol_llm import (
 )
 from ol_llm import settings as settings_module
 from ol_llm.catalog import UseCaseCache, check_chat_model
+from ol_llm.memory import (
+    HindsightBackend,
+    KeycloakExchangeClient,
+    KeycloakTokenExchange,
+    LearnerCredential,
+)
 from ol_llm.models import shared_model
 from ol_llm.policy import resolve_policy
 from ol_llm.settings import GatewayRoute, Settings, configure
@@ -165,10 +172,36 @@ def _token_resource(url: str) -> Resource:
     return Resource(call, "token")
 
 
+def _memory_resource(url: str) -> Resource:
+    claims = base64.urlsafe_b64encode(json.dumps({"sub": "learner"}).encode())
+    token = f"e30.{claims.decode().rstrip('=')}.signature"
+    notes = HindsightBackend(url, app="learn-ai").learner(LearnerCredential(token))
+
+    async def call() -> object:
+        return await notes.search("anything")
+
+    return Resource(call, [])
+
+
+def _memory_exchange_resource(url: str) -> Resource:
+    exchange = KeycloakTokenExchange(
+        KeycloakExchangeClient(
+            token_url=f"{url}/token", client_id="app", client_secret="s"
+        )
+    )
+
+    async def call() -> object:
+        return await exchange.exchange("session-token")
+
+    return Resource(call, "token")
+
+
 RESOURCES: dict[str, Callable[[str], Resource]] = {
     "model": lambda _url: Resource(_chat, "ok"),
     "embedding": lambda _url: Resource(_embedding, 3),
     "token": _token_resource,
+    "memory": _memory_resource,
+    "memory-exchange": _memory_exchange_resource,
 }
 
 

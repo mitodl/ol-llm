@@ -126,7 +126,6 @@ _LAZY_EXPORTS = {
 # What each extra installs that the lazily imported modules import directly.
 _EXTRA_MODULES = {
     "pydantic_ai": "pydantic-ai",
-    "httpx2": "pydantic-ai",
     "langchain_core": "langchain",
 }
 
