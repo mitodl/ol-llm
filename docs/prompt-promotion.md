@@ -17,7 +17,11 @@ project = "dagster-ml"                   # the app's Opik project
 [prompts]                                # the version production runs, per prompt
 feedback-summary = "v4"
 feedback-category-proposal = "v2"
+"tutor.system" = "v7"                    # quote a name with a dot
 ```
+
+A `<use_case>.<part>` name must be quoted: TOML reads an unquoted dotted key as a nested
+table, and the file is then refused.
 
 Every managed prompt the app fetches has a pointer, whether or not a gate evaluates it. A
 prompt's [evaluation gate](evaluation-gate.md) names this file and reads its version from it,
@@ -43,8 +47,9 @@ It exits 2 when the label is not a registered environment in the workspace; Opik
 `development`, `staging`, and `production`.
 
 `export` writes `<name>.json` for each prompt: the pointed version's template (or messages, for
-a chat prompt), its type, version, and template hash. The app passes it to `get_prompt` as the
-embedded default:
+a chat prompt), its type, version, and template hash. It leaves other files in the directory,
+so
+export into a fresh one. The app passes it to `get_prompt` as the embedded default:
 
 ```python
 PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -72,6 +77,8 @@ on:
   push:
     branches: [main]
     paths: ["dg_projects/ml/prompts.toml"]
+  schedule:
+    - cron: "17 13 * * 1-5"
   workflow_dispatch:
 
 permissions: {}
@@ -87,17 +94,37 @@ jobs:
       opik-url: ${{ vars.OPIK_URL }}
       keycloak-token-url: ${{ vars.OPIK_KEYCLOAK_TOKEN_URL }}
     secrets:
-      OPIK_KEYCLOAK_CLIENT_ID: ${{ secrets.OPIK_PROMOTION_CLIENT_ID }}
-      OPIK_KEYCLOAK_CLIENT_SECRET: ${{ secrets.OPIK_PROMOTION_CLIENT_SECRET }}
+      OPIK_KEYCLOAK_CLIENT_ID: ${{ secrets.OPIK_EVALUATION_CLIENT_ID }}
+      OPIK_KEYCLOAK_CLIENT_SECRET: ${{ secrets.OPIK_EVALUATION_CLIENT_SECRET }}
+      OPIK_PROMOTION_CLIENT_ID: ${{ secrets.OPIK_PROMOTION_CLIENT_ID }}
+      OPIK_PROMOTION_CLIENT_SECRET: ${{ secrets.OPIK_PROMOTION_CLIENT_SECRET }}
 ```
 
-On a pull request the job runs `check`. On a push or a manual run it runs `promote` with the
-pointer file from the default branch's head as it is when the job starts, not from the commit
-that triggered it, and runs one promotion per repository and pointer file at a time. Two merges
-close together therefore cannot finish out of order and move the label back. A manual run is
-how to restore the label after someone moved it in the UI.
+Each event does one thing:
 
-The job authenticates with a Keycloak client of its own, the only one meant to move
-`production`. Opik cannot enforce that, which is what `check --environment production` is for.
-The evaluation gate runs separately, on the same pull request, when its `paths` include the
-pointer file.
+- `pull_request` runs `check`.
+- `schedule` runs `check --environment production`, the drift report, which fails when a label
+  is not where the pointer file puts it.
+- `push` and `workflow_dispatch` run `promote`. It reads the pointer file from the default
+  branch's head as it is when the job starts, not from the commit that triggered it, and runs
+  one promotion per repository and pointer file at a time, so two merges close together cannot
+  finish out of order and move the label back. A manual run restores a label someone moved in
+  the UI.
+- Any other event (e.g. `merge_group`) fails the job rather than promoting or passing
+  unchecked.
+
+The check and the drift report read Opik with `OPIK_KEYCLOAK_CLIENT_*`, the client the
+evaluation gate already uses on pull requests. Promotion runs in the GitHub environment
+`prompt-promotion` (the `promotion-environment` input) and takes `OPIK_PROMOTION_CLIENT_*` from
+that environment's secrets, so code from a pull request, which `check` installs and runs, never
+holds the client meant to move `production`. Create the environment with its deployment
+branches limited to the default branch, and set the two secrets on it rather than on the
+repository. The caller still passes them by name; GitHub substitutes the environment's values
+in the job that names the environment.
+
+Opik admits any authenticated client as a workspace admin, so the gate's client could move a
+label too. The drift report is what catches that.
+
+Every prompt the app fetches should have a gate whose `paths` include the pointer file, so a
+pull request that moves a pointer also evaluates the new version. Nothing here enforces that,
+and promotion does not wait on the gate's result.

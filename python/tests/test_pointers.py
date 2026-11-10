@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import ol_llm.pointers as pointers_module
 import pytest
 from conftest import PromptLibrary
 from ol_llm import ChatTemplate, TextTemplate, get_prompt, load_default
@@ -75,7 +76,7 @@ def test_promote_moves_the_label_to_each_pointed_version(
     prompt_library.add("summary", "two", environments=("qa",))
     prompt_library.add("tutor", CHAT, environments=("production",))
 
-    states = promote(pointers(summary="v2", tutor="v1"))
+    states = list(promote(pointers(summary="v2", tutor="v1")))
 
     assert [(s.name, s.labeled, s.drifted) for s in states] == [
         ("summary", "v1", True),
@@ -104,7 +105,7 @@ def test_a_pointer_to_a_missing_version_moves_no_label(
     prompt_library.add("tutor", CHAT, environments=("production",))
 
     with pytest.raises(PointerError, match="no tutor v4, glossary v1"):
-        promote(pointers(summary="v2", tutor="v4", glossary="v1"))
+        list(promote(pointers(summary="v2", tutor="v4", glossary="v1")))
 
     assert prompt_library.labels("summary") == {"v1": ["production"], "v2": []}
 
@@ -115,7 +116,7 @@ def test_promoting_to_an_unregistered_environment_says_what_to_do(
     prompt_library.add("summary", "one")
 
     with pytest.raises(PointerError, match="'qa' is not a registered environment"):
-        promote(pointers(summary="v1"), environment="qa")
+        list(promote(pointers(summary="v1"), environment="qa"))
 
 
 # Export
@@ -216,6 +217,32 @@ def test_the_promote_command_says_what_moved(
         "summary: production moved to v2 (was v1)",
         "summary: production already on v2",
     ]
+
+
+def test_the_promote_command_reports_moves_made_before_a_failure(
+    prompt_library: PromptLibrary,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prompt_library.add("summary", "one")
+    prompt_library.add("tutor", CHAT)
+    moved = pointers_module.promote_prompt
+
+    def opik_goes_away(name: str, **kwargs: str) -> None:
+        if name == "tutor":
+            raise ConnectionError
+        moved(name, **kwargs)
+
+    monkeypatch.setattr(pointers_module, "promote_prompt", opik_goes_away)
+
+    with pytest.raises(ConnectionError):
+        main(["promote", str(write(tmp_path, summary="v1", tutor="v1"))])
+
+    assert capsys.readouterr().out.splitlines() == [
+        "summary: production moved to v1 (was on no version)"
+    ]
+    assert prompt_library.labels("summary") == {"v1": ["production"]}
 
 
 def test_the_command_refuses_an_unreadable_pointer_file(

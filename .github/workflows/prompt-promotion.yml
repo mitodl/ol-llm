@@ -1,9 +1,18 @@
-# Reusable: acts on an app's prompt pointer file (`ol-llm-prompts`). On a pull request
-# it checks that every pointed version exists in Opik. On any other event it moves the
-# production label to the pointed versions, reading the pointer file from the default
-# branch's head and running one promotion per repository and pointer file at a time,
-# so two merges close together cannot finish out of order and move a label back
-# (lifecycle spec §2.3). docs/prompt-promotion.md has the file format and a caller.
+# Reusable: acts on an app's prompt pointer file (`ol-llm-prompts`).
+#
+# - pull_request: checks that every pointed version exists in Opik.
+# - schedule: reports a production label that is not where the pointer file puts it.
+# - push, workflow_dispatch: moves the production label to the pointed versions,
+#   reading the pointer file from the default branch's head and running one
+#   promotion per pointer file at a time, so two merges close together cannot
+#   finish out of order and move a label back (lifecycle spec §2.3).
+# - anything else fails, rather than promoting or passing unchecked.
+#
+# The check and the drift report authenticate with the caller's read client
+# (OPIK_KEYCLOAK_CLIENT_*), the one the evaluation gate uses. Promotion runs in the
+# GitHub environment named by `promotion-environment` and authenticates with that
+# environment's OPIK_PROMOTION_CLIENT_* secrets, so pull request code never holds
+# the client meant to move production. docs/prompt-promotion.md has a caller.
 name: prompt promotion
 
 on:
@@ -29,35 +38,41 @@ on:
         description: The token endpoint of the realm that issues Opik tokens.
         required: true
         type: string
+      promotion-environment:
+        description: The GitHub environment holding OPIK_PROMOTION_CLIENT_*, restricted to the default branch.
+        type: string
+        default: prompt-promotion
     secrets:
       OPIK_KEYCLOAK_CLIENT_ID:
-        description: The promotion job's own Keycloak client, the only one meant to move production.
+        description: The client the check and the drift report read Opik as.
         required: true
       OPIK_KEYCLOAK_CLIENT_SECRET:
         description: That client's secret.
         required: true
+      OPIK_PROMOTION_CLIENT_ID:
+        description: The promotion job's own client; set it as a secret of promotion-environment.
+        required: false
+      OPIK_PROMOTION_CLIENT_SECRET:
+        description: That client's secret.
+        required: false
 
 permissions: {}
 
 jobs:
-  pointers:
-    name: prompt promotion
+  check:
+    name: prompt pointers
+    if: contains(fromJSON('["pull_request", "schedule"]'), github.event_name)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
     concurrency:
-      # A pull request's check is superseded by its next push. A promotion is
-      # never cancelled; a newer one queues behind it and reads the newer head.
-      group: ${{ github.event_name == 'pull_request' && format('prompt-check-{0}-{1}', inputs.pointers, github.event.pull_request.number) || format('prompt-promotion-{0}-{1}', github.repository, inputs.pointers) }}
-      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+      group: prompt-check-${{ inputs.working-directory }}-${{ inputs.pointers }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # A promotion reads the default branch's head when it starts, not the
-          # commit that triggered it.
-          ref: ${{ github.event_name != 'pull_request' && github.event.repository.default_branch || '' }}
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.13.7"
@@ -66,17 +81,18 @@ jobs:
           OPIK_KEYCLOAK_CLIENT_ID: ${{ secrets.OPIK_KEYCLOAK_CLIENT_ID }}
         run: |
           if [ -z "$OPIK_KEYCLOAK_CLIENT_ID" ]; then
-            echo "::error::No Opik credentials. Pull requests from forks get no secrets, so the pointers cannot be checked for them."
+            echo "::error::No Opik credentials. Pull requests from forks get no secrets, so their pointers cannot be checked."
             exit 1
           fi
       - name: Install
         working-directory: ${{ inputs.working-directory }}
         run: uv sync --frozen
-      - name: Check or promote the pointers
+      - name: Check the pointers
         working-directory: ${{ inputs.working-directory }}
         env:
           POINTERS: ${{ inputs.pointers }}
-          COMMAND: ${{ github.event_name == 'pull_request' && 'check' || 'promote' }}
+          # A schedule also reports a production label someone moved by hand.
+          DRIFT: ${{ github.event_name == 'schedule' }}
           OPIK_URL_OVERRIDE: ${{ inputs.opik-url }}
           OPIK_WORKSPACE: ${{ inputs.opik-workspace }}
           OPIK_KEYCLOAK_TOKEN_URL: ${{ inputs.keycloak-token-url }}
@@ -84,4 +100,66 @@ jobs:
           OPIK_KEYCLOAK_CLIENT_SECRET: ${{ secrets.OPIK_KEYCLOAK_CLIENT_SECRET }}
         # An explicit bash runs with -o pipefail, so the command's status is the step's.
         shell: bash
-        run: uv run --frozen ol-llm-prompts "$COMMAND" "$POINTERS" | tee -a "$GITHUB_STEP_SUMMARY"
+        run: |
+          flags=()
+          if [ "$DRIFT" = true ]; then flags+=(--environment production); fi
+          uv run --frozen ol-llm-prompts check "$POINTERS" "${flags[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    name: prompt promotion
+    if: contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ inputs.promotion-environment }}
+    permissions:
+      contents: read
+    concurrency:
+      # Never cancels a running promotion. A newer one waits behind it and replaces
+      # an older waiting one, which is safe because each reads the default branch's
+      # head when it starts.
+      group: prompt-promotion-${{ github.repository }}-${{ inputs.working-directory }}-${{ inputs.pointers }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.13.7"
+      - name: Credentials are available
+        env:
+          OPIK_PROMOTION_CLIENT_ID: ${{ secrets.OPIK_PROMOTION_CLIENT_ID }}
+          ENVIRONMENT: ${{ inputs.promotion-environment }}
+        run: |
+          if [ -z "$OPIK_PROMOTION_CLIENT_ID" ]; then
+            echo "::error::No OPIK_PROMOTION_CLIENT_ID. Set it as a secret of the $ENVIRONMENT environment and pass it from the caller."
+            exit 1
+          fi
+      - name: Install
+        working-directory: ${{ inputs.working-directory }}
+        run: uv sync --frozen
+      - name: Promote the pointers
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          POINTERS: ${{ inputs.pointers }}
+          OPIK_URL_OVERRIDE: ${{ inputs.opik-url }}
+          OPIK_WORKSPACE: ${{ inputs.opik-workspace }}
+          OPIK_KEYCLOAK_TOKEN_URL: ${{ inputs.keycloak-token-url }}
+          OPIK_KEYCLOAK_CLIENT_ID: ${{ secrets.OPIK_PROMOTION_CLIENT_ID }}
+          OPIK_KEYCLOAK_CLIENT_SECRET: ${{ secrets.OPIK_PROMOTION_CLIENT_SECRET }}
+        shell: bash
+        run: uv run --frozen ol-llm-prompts promote "$POINTERS" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  unsupported:
+    name: prompt pointers (unsupported event)
+    if: ${{ !contains(fromJSON('["pull_request", "schedule", "push", "workflow_dispatch"]'), github.event_name) }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Refuse
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          echo "::error::prompt-promotion runs on pull_request, schedule, push and workflow_dispatch, not $EVENT."
+          exit 1

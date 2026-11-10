@@ -246,7 +246,11 @@ class GateDeclaration(pydantic.BaseModel):
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
         declared = raw.pop("pointers", None)
         names = raw.get("prompts")
-        if not isinstance(declared, str) or not isinstance(names, list):
+        if not (
+            isinstance(declared, str)
+            and isinstance(names, list)
+            and all(isinstance(name, str) for name in names)
+        ):
             msg = (
                 "A gate reads its prompts' versions from the app's pointer file: "
                 'declare pointers = "<path from this file>" and '

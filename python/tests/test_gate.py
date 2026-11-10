@@ -394,6 +394,13 @@ def test_a_declaration_loads_from_toml(tmp_path: Path) -> None:
         (GATE_TOML, f'project = "other"\n[prompts]\n{USE_CASE} = "v2"\n', "other"),
         (GATE_TOML, f'project = "{APP}"\n[prompts]\nanother = "v2"\n', "no pointer"),
         (GATE_TOML.replace('"prompts.toml"', '"missing.toml"'), None, "missing.toml"),
+        (
+            GATE_TOML.replace(
+                f'prompts = ["{USE_CASE}"]', f'prompts = [["{USE_CASE}"]]'
+            ),
+            None,
+            "reads its prompts' versions from the app's pointer file",
+        ),
     ],
 )
 def test_a_declaration_takes_its_versions_from_the_pointer_file(

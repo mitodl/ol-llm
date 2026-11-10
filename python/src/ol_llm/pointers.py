@@ -31,7 +31,7 @@ import argparse
 import json
 import sys
 import tomllib
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, cast
@@ -171,45 +171,45 @@ def label_states(
 
 def promote(
     pointers: PromptPointers, *, environment: str = PRODUCTION
-) -> list[LabelState]:
+) -> Iterator[LabelState]:
     """Move a label to every pointed version that does not carry it yet.
 
-    Every pointer is resolved first, so a pointer to a missing version moves no
-    label. A failure partway (e.g. Opik going away) can leave some labels moved;
-    running it again finishes the rest, since a label already in place is left.
+    Every pointer is resolved before the first state is yielded, so a pointer to
+    a missing version moves no label. Each state is yielded once its move is done,
+    so a caller can report what moved before a failure partway (e.g. Opik going
+    away). Running it again finishes the rest, since a label in place is left.
 
     :param pointers: the pointer file, read from the default branch's head.
     :param environment: the label to move.
-    :returns: the state of each prompt before the move; ``drifted`` ones moved.
-    :rtype: list[LabelState]
+    :returns: the state of each prompt before its move; ``drifted`` ones moved.
+    :rtype: Iterator[LabelState]
     :raises PointerError: if a pointed version does not exist, or the label is
         not a registered environment in the workspace.
     """
     resolve(pointers)
-    states = label_states(pointers, environment=environment)
-    for state in states:
-        if not state.drifted:
-            continue
-        try:
-            promote_prompt(
-                state.name,
-                version=state.pointed,
-                environment=environment,
-                project_name=pointers.project,
-            )
-        except EnvironmentNotFoundError as exc:
-            msg = (
-                f"{environment!r} is not a registered environment in this Opik "
-                "workspace; create it once with Opik's create_environment"
-            )
-            raise PointerError(msg) from exc
-    return states
+    for state in label_states(pointers, environment=environment):
+        if state.drifted:
+            try:
+                promote_prompt(
+                    state.name,
+                    version=state.pointed,
+                    environment=environment,
+                    project_name=pointers.project,
+                )
+            except EnvironmentNotFoundError as exc:
+                msg = (
+                    f"{environment!r} is not a registered environment in this Opik "
+                    "workspace; create it once with Opik's create_environment"
+                )
+                raise PointerError(msg) from exc
+        yield state
 
 
 def export(pointers: PromptPointers, directory: Path) -> list[Path]:
     """Write each pointed version's template to ``<directory>/<name>.json``.
 
-    Run at image build, so the embedded default is the reviewed version.
+    Run at image build, so the embedded default is the reviewed version. Files
+    already in the directory are left, so export into a fresh one.
 
     :param pointers: the pointer file.
     :param directory: where to write; created if missing.
@@ -325,6 +325,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{'moved to' if state.drifted else 'already on'} {state.pointed}"
                     f"{moved if state.drifted else ''}\n"
                 )
+                sys.stdout.flush()
             return 0
         resolve(pointers)
     except PointerError as exc:
