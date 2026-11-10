@@ -6,6 +6,30 @@ All notable changes to ol-llm are recorded here. The format follows
 
 <!-- scriv-insert-here -->
 
+<a id='changelog-0.0.10'></a>
+## [0.0.10] - 2026-11-10
+
+### Added
+
+- The README documents how uv consumers override the version caps (`name<=X`) that opik 2.2.139 and later put on each of its dependencies, which an application inherits through ol-llm's exact opik pin. Without the overrides, uv fails to resolve an application that needs a newer version than a cap (e.g. `openai==3.46.0` next to opik 2.2.143's `openai<=3.42.1`), or installs the capped version. The opik release ol-llm pins now (2.2.94) has no caps, so nothing needs to change yet. pip has no equivalent. ol-llm now bumps opik once a month to keep the caps close to current.
+
+### Changed
+
+- The reusable evaluation gate workflow (`.github/workflows/evaluation-gate.yml`) installs and runs the calling project with uv 0.13.7 instead of 0.12.20. uv 0.13 makes Python 3.15 the default it downloads: a calling project that pins no Python version (no `.python-version`) and whose `requires-python` allows 3.15 now gets 3.15 when the runner has no matching interpreter, where it got 3.14 before. Pin the version with `uv python pin 3.14` or cap `requires-python` below 3.15 to keep 3.14. uv 0.13 also extracts source distributions with a stricter tar reader that rejects archives containing hard links or unsupported tar extensions; a locked dependency installed from such an sdist fails the gate's install step. The lockfile format is unchanged, so a lock written by uv 0.12 still passes `uv sync --frozen`.
+
+### Fixed
+
+- `ol_llm.evaluation.evaluate` puts `Settings.environment` on each item's trace and on the task's and judges' calls under it. `opik.evaluate` opens those traces with no environment and Opik gives nested spans their parent's, so experiment task and judge spend sat in Opik's default environment instead of the app's, and Opik logged a "nested span under the environment" warning for every call.
+
+- With tracing off (`OPIK_TRACK_DISABLE=true` or `TracingConfig(enabled=False)`), Opik SDK calls made after tracing is configured (`fetch_prompt`, `create_prompt`, `promote_prompt`, datasets, experiments) now send the Keycloak token when the `OPIK_KEYCLOAK_*` client is configured. Before, ol-llm registered the SDK's auth hook only with tracing on, so these calls reached Opik without credentials and got a 401. Tracing off still opens no root trace and exports no spans, and `get_prompt` still returns the embedded default without asking Opik.
+
+### Security
+
+- `check_chat_model`, the embedding catalog check, and the models and embedders `complete` and `embed` (and their `_sync` forms) run on are no longer kept for every use case for the life of the process. An application that builds a use case from a request's model id kept one of each, provider clients included, for every distinct id a caller sent. A use case whose models the catalog all lists stays cached, up to 1,024 of them (`CHECKED_USE_CASES_MAX`). A use case naming any model the catalog does not list, and an embedder asked for a `dimensions` other than the catalog's, is kept only among the 64 most recently used (`UNCATALOGED_USE_CASES_MAX`), so a caller cycling ids can't evict the application's cataloged use cases. Such a use case builds new clients, and its unlisted-model warning is logged again, once it falls out of those 64. An application's own use case on an unlisted model shares those 64; list its model in the catalog to keep it protected. Only a use case's `model` may come from a request: `fallback_models` and `embed`'s `dimensions` must be defined by the application.
+- `UseCase` raises `ValueError` when `model` or any of `fallback_models` is longer than 512 characters (`ol_llm.policy.MODEL_ID_MAX_CHARS`), so an application that builds a use case from a request's model id refuses an oversized id before it reaches a cache, a log line or a provider. The error gives the id's length, not the id.
+- `UseCase` raises `ValueError` when `fallback_models` names more than 8 models (`ol_llm.policy.MAX_FALLBACK_MODELS`), so a use case built from a request can't make a call build and try an arbitrarily long chain. The error gives the count, not the ids.
+- The catalog's unlisted-model and deprecation warnings write the model id with `repr`, so an id carrying a newline can't start a forged log line.
+
 <a id='changelog-0.0.9'></a>
 ## [0.0.9] - 2026-11-09
 
