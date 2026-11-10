@@ -19,6 +19,12 @@ dev = [
 [tool.uv]
 required-version = ">=0.12.22,<0.14"
 package = false
+# Floors for transitive dependencies with advisories against earlier releases, so a
+# relock can't resolve back into them. They shape this lockfile only, not the wheel.
+constraint-dependencies = [
+    "litellm>=1.95.0",  # GHSA-g5ff-637f-6q2m and earlier; opik requires litellm
+    "pyasn1>=0.6.5",    # GHSA-fm9c-5rcf-2q5p and three others; via google-auth
+]
 
 [tool.uv.workspace]
 members = ["python"]
