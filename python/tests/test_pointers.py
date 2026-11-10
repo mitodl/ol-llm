@@ -242,6 +242,27 @@ def test_every_export_that_does_not_match_is_reported(
     ]
 
 
+def test_an_exports_symlink_out_of_the_tree_is_refused(tmp_path: Path) -> None:
+    (tmp_path / "outside").mkdir()
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "prompts").symlink_to(tmp_path / "outside")
+    path = tmp_path / "app" / "prompts.toml"
+    path.write_text('project = "x"\nexports = "prompts"\n[prompts]\ns = "v1"\n')
+
+    with pytest.raises(PointerError, match="exports must be a directory beneath"):
+        PromptPointers.load(path)
+
+
+def test_exporting_into_a_file_is_refused(
+    prompt_library: PromptLibrary, tmp_path: Path
+) -> None:
+    prompt_library.add("summary", "one")
+    (tmp_path / "prompts").write_text("not a directory")
+
+    with pytest.raises(PointerError, match="is a file"):
+        export(pointers(tmp_path / "prompts", summary="v1"))
+
+
 def test_an_exports_path_that_is_a_file_is_reported(
     prompt_library: PromptLibrary, tmp_path: Path
 ) -> None:

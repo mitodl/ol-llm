@@ -108,14 +108,16 @@ class PromptPointers(pydantic.BaseModel):
         except (OSError, tomllib.TOMLDecodeError, pydantic.ValidationError) as exc:
             msg = f"{path} is not a prompt pointer file: {exc}"
             raise PointerError(msg) from exc
-        exports = pointers.exports
-        if exports.is_absolute() or not exports.parts or ".." in exports.parts:
+        exports = path.parent / pointers.exports
+        # resolve() follows a symlink, so a link out of the tree is refused too.
+        base = path.parent.resolve()
+        if exports.resolve() == base or not exports.resolve().is_relative_to(base):
             msg = (
                 f"{path}: exports must be a directory beneath the pointer file's, "
-                f"not {str(exports)!r}"
+                f"not {str(pointers.exports)!r}"
             )
             raise PointerError(msg)
-        return pointers.model_copy(update={"exports": path.parent / exports})
+        return pointers.model_copy(update={"exports": exports})
 
 
 def resolve(pointers: PromptPointers) -> dict[str, ManagedPrompt[Any]]:
@@ -234,10 +236,15 @@ def export(pointers: PromptPointers) -> list[Path]:
     :param pointers: the pointer file.
     :returns: the files written.
     :rtype: list[Path]
-    :raises PointerError: if a pointed version does not exist.
+    :raises PointerError: if a pointed version does not exist, or ``exports`` is
+        a file.
     """
     prompts = resolve(pointers)
-    pointers.exports.mkdir(parents=True, exist_ok=True)
+    try:
+        pointers.exports.mkdir(parents=True, exist_ok=True)
+    except FileExistsError as exc:
+        msg = f"exports {pointers.exports} is a file, not a directory"
+        raise PointerError(msg) from exc
     for stale in _unpointed_exports(pointers):
         stale.unlink()
     written = []
