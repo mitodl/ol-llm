@@ -8,11 +8,9 @@ code with ``register_backend``.
 
 import math
 import os
-import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from importlib import import_module
-from importlib.metadata import entry_points
 from typing import TYPE_CHECKING
 
 from ol_llm.memory.in_memory import InMemoryBackend
@@ -26,6 +24,7 @@ from ol_llm.memory.tokens import (
     KeycloakExchangeClient,
     KeycloakTokenExchange,
 )
+from ol_llm.plugins import NamedFactories
 from ol_llm.tracing import KeycloakClient
 
 if TYPE_CHECKING:
@@ -193,11 +192,11 @@ def _in_memory(config: MemoryConfig) -> MemoryBackend:
     return InMemoryBackend(config.app)
 
 
-_lock = threading.Lock()
-_factories: dict[str, BackendFactory] = {
-    "hindsight": _hindsight,
-    "in-memory": _in_memory,
-}
+_backends: NamedFactories[BackendFactory] = NamedFactories(
+    group=ENTRY_POINT_GROUP,
+    kind="memory backend",
+    builtins={"hindsight": _hindsight, "in-memory": _in_memory},
+)
 
 
 def register_backend(name: str, factory: BackendFactory) -> None:
@@ -206,8 +205,7 @@ def register_backend(name: str, factory: BackendFactory) -> None:
     :param name: what ``MemoryConfig.backend`` names it as.
     :param factory: builds the backend from the configuration.
     """
-    with _lock:
-        _factories[name] = factory
+    _backends.register(name, factory)
 
 
 def backend_factory(name: str) -> BackendFactory:
@@ -218,19 +216,7 @@ def backend_factory(name: str) -> BackendFactory:
     :rtype: BackendFactory
     :raises ValueError: if no backend has that name.
     """
-    with _lock:
-        if (factory := _factories.get(name)) is not None:
-            return factory
-    found = entry_points(group=ENTRY_POINT_GROUP, name=name)
-    if not found:
-        with _lock:
-            known = sorted(_factories)
-        msg = f"No memory backend named {name!r}; registered: {known}"
-        raise ValueError(msg)
-    [entry_point] = found
-    loaded: BackendFactory = entry_point.load()
-    register_backend(name, loaded)
-    return loaded
+    return _backends.get(name)
 
 
 def build_memory(config: MemoryConfig | None = None) -> Memory:

@@ -14,10 +14,10 @@ builds its registry in code passes it to ``configure_prompt_registry``.
 import os
 import threading
 from collections.abc import Callable, Mapping
-from importlib.metadata import entry_points
 from pathlib import Path
 
 from ol_llm.loops import register_at_fork
+from ol_llm.plugins import NamedFactories
 from ol_llm.prompt_registry.files import PRODUCTION, FilePromptRegistry
 from ol_llm.prompt_registry.interface import (
     PromptRegistry,
@@ -59,11 +59,12 @@ def _file(env: Mapping[str, str]) -> PromptRegistry:
     )
 
 
+_registries: NamedFactories[RegistryFactory] = NamedFactories(
+    group=ENTRY_POINT_GROUP,
+    kind="prompt registry",
+    builtins={"opik": lambda _env: OpikPromptRegistry(), "file": _file},
+)
 _lock = threading.Lock()
-_factories: dict[str, RegistryFactory] = {
-    "opik": lambda _env: OpikPromptRegistry(),
-    "file": _file,
-}
 _registry: PromptRegistry | None = None
 
 
@@ -82,8 +83,7 @@ def register_prompt_registry(name: str, factory: RegistryFactory) -> None:
     :param name: what ``OL_LLM_PROMPT_REGISTRY`` names it as.
     :param factory: builds the registry from the environment.
     """
-    with _lock:
-        _factories[name] = factory
+    _registries.register(name, factory)
 
 
 def configure_prompt_registry(registry: PromptRegistry | None) -> None:
@@ -110,24 +110,8 @@ def prompt_registry() -> PromptRegistry:
         if _registry is not None:
             return _registry
     env = dict(os.environ)
-    built = _factory(env.get(_ENV_NAME) or DEFAULT_REGISTRY)(env)
+    built = _registries.get(env.get(_ENV_NAME) or DEFAULT_REGISTRY)(env)
     with _lock:
         if _registry is None:
             _registry = built
         return _registry
-
-
-def _factory(name: str) -> RegistryFactory:
-    with _lock:
-        if (factory := _factories.get(name)) is not None:
-            return factory
-    found = entry_points(group=ENTRY_POINT_GROUP, name=name)
-    if not found:
-        with _lock:
-            known = sorted(_factories)
-        msg = f"No prompt registry named {name!r}; registered: {known}"
-        raise ValueError(msg)
-    [entry_point] = found
-    loaded: RegistryFactory = entry_point.load()
-    register_prompt_registry(name, loaded)
-    return loaded

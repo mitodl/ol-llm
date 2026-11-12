@@ -13,7 +13,7 @@ import ol_llm.memory
 import opik
 import pytest
 from conftest import runner_loop
-from ol_llm import Attribution, close_thread_loop, run_coroutine, tracing
+from ol_llm import Attribution, close_thread_loop, plugins, run_coroutine, tracing
 from ol_llm.attribution import NO_ATTRIBUTION
 from ol_llm.memory import (
     ALL_CAPABILITIES,
@@ -438,7 +438,7 @@ def test_hindsight_needs_a_url() -> None:
 def test_an_unknown_backend_names_the_known_ones(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(memory_config, "entry_points", lambda **_: EntryPoints(()))
+    monkeypatch.setattr(plugins, "entry_points", lambda **_: EntryPoints(()))
     with pytest.raises(ValueError, match=r"'hindsight', 'in-memory'"):
         build_memory(MemoryConfig(backend="cognee", app="learn-ai"))
 
@@ -458,8 +458,12 @@ def test_backends_register_by_entry_point(monkeypatch: pytest.MonkeyPatch) -> No
             )
         )
 
-    monkeypatch.setattr(memory_config, "entry_points", entry_points)
-    monkeypatch.setattr(memory_config, "_factories", dict(memory_config._factories))  # noqa: SLF001
+    monkeypatch.setattr(plugins, "entry_points", entry_points)
+    monkeypatch.setattr(
+        memory_config._backends,  # noqa: SLF001
+        "_factories",
+        dict(memory_config._backends._factories),  # noqa: SLF001
+    )
     memory = build_memory(MemoryConfig(backend="other", app="learn-ai"))
     assert isinstance(memory.backend, InMemoryBackend)
     assert backend_factory("other") is memory_config._in_memory  # noqa: SLF001
@@ -467,7 +471,11 @@ def test_backends_register_by_entry_point(monkeypatch: pytest.MonkeyPatch) -> No
 
 
 def test_backends_register_in_code(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(memory_config, "_factories", dict(memory_config._factories))  # noqa: SLF001
+    monkeypatch.setattr(
+        memory_config._backends,  # noqa: SLF001
+        "_factories",
+        dict(memory_config._backends._factories),  # noqa: SLF001
+    )
     store = InMemoryStore()
     register_backend("shared", lambda config: InMemoryBackend(config.app, store=store))
     memory = build_memory(MemoryConfig(backend="shared", app="learn-ai"))
