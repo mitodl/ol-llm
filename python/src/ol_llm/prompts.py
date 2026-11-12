@@ -327,12 +327,18 @@ def _structure(template: TextTemplate | ChatTemplate) -> str:
 
 @dataclass(frozen=True, kw_only=True)
 class _Lookup:
-    registry: PromptRegistry
+    # Keyed on the registry's identity, not its value: a registry need not be
+    # hashable. The key holds the registry, so its id is not reused while cached.
+    registry: PromptRegistry = field(compare=False)
+    registry_id: int = field(init=False)
     name: str
     app: str
     label: str | None
     version: str | None
     context: Hashable
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "registry_id", id(self.registry))
 
 
 @dataclass

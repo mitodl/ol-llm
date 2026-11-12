@@ -1,5 +1,6 @@
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -24,6 +25,7 @@ from ol_llm.prompt_registry import (
     OpikPromptRegistry,
     PromptRegistry,
     RegistryUnavailableError,
+    RegistryVersion,
     configure_prompt_registry,
     prompt_registry,
     register_prompt_registry,
@@ -748,6 +750,44 @@ def test_promote_to_a_missing_version_raises(prompt_library: PromptLibrary) -> N
 
 
 # The file registry and choosing a registry by name.
+
+
+@dataclass
+class DataclassRegistry(PromptRegistry):
+    """A registry an app might write: a plain dataclass, so not hashable."""
+
+    inner: FilePromptRegistry
+
+    def fetch(self, name: str, **kwargs: Any) -> RegistryVersion | None:  # noqa: ANN401
+        return self.inner.fetch(name, **kwargs)
+
+    def move_label(self, name: str, *, app: str, version: str, label: str) -> None:
+        raise NotImplementedError
+
+    def create_version(
+        self,
+        name: str,
+        template: TextTemplate | ChatTemplate,
+        *,
+        app: str,
+        change_description: str | None = None,
+    ) -> RegistryVersion:
+        raise NotImplementedError
+
+
+def test_a_registry_need_not_be_hashable(tmp_path: Path) -> None:
+    (tmp_path / "summary.prompt.yaml").write_text(
+        render_export("summary", PROJECT, DEFAULT), encoding="utf-8"
+    )
+    registry = DataclassRegistry(FilePromptRegistry(tmp_path))
+    with pytest.raises(TypeError, match="unhashable"):
+        hash(registry)
+    configure_prompt_registry(registry)
+
+    first = fetch(environment="production")
+    again = fetch(environment="production")
+
+    assert (first.version, again.version) == ("v1", "v1")
 
 
 def test_the_file_registry_is_read_only(tmp_path: Path) -> None:
