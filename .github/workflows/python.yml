@@ -158,8 +158,10 @@ jobs:
           curl -fsSL -o "$RUNNER_TEMP/edx-base.txt" \
             https://raw.githubusercontent.com/openedx/edx-platform/master/requirements/edx/base.txt
       - name: Resolve ol-llm[openai] under edx-platform pins
+        # --no-config: edxapp never sees the root pyproject.toml's [tool.uv]
+        # settings (e.g. constraint-dependencies), which shape this repo's lock only.
         run: |
-          echo "./python[openai]" | uv pip compile - \
+          echo "./python[openai]" | uv pip compile --no-config - \
             -c "$RUNNER_TEMP/edx-base.txt" \
             --python-version 3.12 \
             -o "$RUNNER_TEMP/resolved.txt"
