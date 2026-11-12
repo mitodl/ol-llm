@@ -309,10 +309,20 @@ def render_export(name: str, app: str, template: TextTemplate | ChatTemplate) ->
 
 
 def _clean(text: str, value: object) -> bool:
-    """Whether ``text`` reads back as ``value`` and no line ends in whitespace."""
-    return yaml.safe_load(text) == value and all(
-        line == line.rstrip() for line in text.split("\n")
+    """Whether ``text`` reads back as ``value`` in any YAML reader, unchanged by hooks.
+
+    No line may end in whitespace, and no raw U+0085, U+2028 or U+2029 may appear:
+    YAML 1.1 (PyYAML) reads them as line breaks and YAML 1.2 does not, so another
+    reader would see different text. Double quotes escape all three.
+    """
+    return (
+        not _AMBIGUOUS_BREAKS.intersection(text)
+        and yaml.safe_load(text) == value
+        and all(line == line.rstrip() for line in text.split("\n"))
     )
+
+
+_AMBIGUOUS_BREAKS = frozenset("\x85\u2028\u2029")
 
 
 def check_exports(
