@@ -13,7 +13,7 @@ The versions under test come from the app's [pointer file](prompt-promotion.md),
 that says which version production runs:
 
 ```toml
-project = "dagster-ml"
+app = "dagster-ml"
 exports = "prompts"
 
 [prompts]
@@ -21,8 +21,7 @@ feedback-summary = "v4"
 ```
 
 The gate is a TOML file next to the prompt, owned by the app team. It names the pointer file
-(relative to itself) and the prompts it tests, and `app` must be the pointer file's
-`project`:
+(relative to itself) and the prompts it tests, and its `app` must be the pointer file's `app`:
 
 ```toml
 app = "dagster-ml"                       # the app's Opik project

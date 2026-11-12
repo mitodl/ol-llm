@@ -3,7 +3,7 @@
 Prompts are authored in Opik. Each app repository holds one pointer file naming,
 for every managed prompt, the version production runs::
 
-    project = "dagster-ml"              # the app's Opik project
+    app = "dagster-ml"                  # the app's namespace in the registry
     exports = "prompts"                 # the committed embedded defaults
 
     [prompts]
@@ -31,7 +31,6 @@ merging promotes.
 """
 
 import argparse
-import json
 import sys
 import tomllib
 from collections.abc import Iterator, Mapping, Sequence
@@ -40,6 +39,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import pydantic
+import yaml
 from opik.exceptions import EnvironmentNotFoundError
 
 from ol_llm.prompts import (
@@ -60,6 +60,12 @@ POINTER_ERROR_STATUS = 2
 DRIFT_STATUS = 1
 """What ``ol-llm-prompts check --environment`` exits with when a label drifted."""
 
+EXPORT_SUFFIX = ".prompt.yaml"
+"""What ``export`` names a prompt's file: ``<name>.prompt.yaml``."""
+
+_NO_WRAP = 1_000_000_000
+"""A line width no export reaches, so YAML never folds a long line."""
+
 VersionName = Annotated[str, pydantic.StringConstraints(pattern=r"^v[1-9][0-9]*$")]
 """An Opik prompt or dataset version, e.g. ``v3``."""
 
@@ -77,7 +83,8 @@ class PointerError(Exception):
 class PromptPointers(pydantic.BaseModel):
     """An app's pointer file: the version production runs, per prompt.
 
-    :param project: the app's Opik project, which holds the prompts.
+    :param app: the app, whose namespace in the registry (its Opik project) holds
+        the prompts.
     :param exports: the directory of committed embedded defaults; ``load``
         resolves it against the pointer file's directory, which it must stay
         beneath.
@@ -86,7 +93,7 @@ class PromptPointers(pydantic.BaseModel):
 
     model_config = pydantic.ConfigDict(extra="forbid", frozen=True)
 
-    project: str
+    app: str
     exports: Path
     prompts: Annotated[dict[PromptName, VersionName], pydantic.Field(min_length=1)]
 
@@ -132,15 +139,15 @@ def resolve(pointers: PromptPointers) -> dict[str, ManagedPrompt[Any]]:
     found: dict[str, ManagedPrompt[Any]] = {}
     missing: list[str] = []
     for name, version in pointers.prompts.items():
-        prompt = fetch_prompt(name, project_name=pointers.project, version=version)
+        prompt = fetch_prompt(name, app=pointers.app, version=version)
         if prompt is None:
             missing.append(f"{name} {version}")
         else:
             found[name] = prompt
     if missing:
         msg = (
-            f"Opik project {pointers.project!r} has no {', '.join(missing)}. Point at "
-            "a version that exists in Opik."
+            f"The registry has no {', '.join(missing)} for app {pointers.app!r}. "
+            "Point at a version that exists there."
         )
         raise PointerError(msg)
     return found
@@ -177,9 +184,7 @@ def label_states(
     """
     states = []
     for name, version in pointers.prompts.items():
-        labeled = fetch_prompt(
-            name, project_name=pointers.project, environment=environment
-        )
+        labeled = fetch_prompt(name, app=pointers.app, environment=environment)
         states.append(
             LabelState(
                 name=name,
@@ -215,7 +220,7 @@ def promote(
                     state.name,
                     version=state.pointed,
                     environment=environment,
-                    project_name=pointers.project,
+                    app=pointers.app,
                 )
             except EnvironmentNotFoundError as exc:
                 msg = (
@@ -227,7 +232,7 @@ def promote(
 
 
 def export(pointers: PromptPointers) -> list[Path]:
-    """Write each pointed version's template to ``<exports>/<name>.json``.
+    """Write each pointed version to ``<exports>/<name>.prompt.yaml``.
 
     The person moving a pointer runs it and commits the result with the pointer
     change, so the embedded default is reviewed text. An earlier export for a prompt
@@ -236,10 +241,14 @@ def export(pointers: PromptPointers) -> list[Path]:
     :param pointers: the pointer file.
     :returns: the files written.
     :rtype: list[Path]
-    :raises PointerError: if a pointed version does not exist, or ``exports`` is
-        a file.
+    :raises PointerError: if a pointed version does not exist, ``exports`` is a
+        file, or a version's text does not read back exactly.
     """
     prompts = resolve(pointers)
+    texts = {
+        name: render_export(name, pointers.app, prompt.template)
+        for name, prompt in prompts.items()
+    }
     try:
         pointers.exports.mkdir(parents=True, exist_ok=True)
     except FileExistsError as exc:
@@ -248,32 +257,52 @@ def export(pointers: PromptPointers) -> list[Path]:
     for stale in _unpointed_exports(pointers):
         stale.unlink()
     written = []
-    for name, prompt in prompts.items():
-        template = prompt.template
-        content: dict[str, Any] = (
-            {"messages": [dict(m) for m in template.messages]}
-            if isinstance(template, ChatTemplate)
-            else {"template": template.template}
-        )
-        path = pointers.exports / f"{name}.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "name": name,
-                    "project": pointers.project,
-                    "version": prompt.version,
-                    "type": template.type,
-                    "template_hash": template.template_hash,
-                    **content,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+    for name, text in texts.items():
+        path = pointers.exports / f"{name}{EXPORT_SUFFIX}"
+        path.write_text(text, encoding="utf-8", newline="")
         written.append(path)
     return written
+
+
+def render_export(name: str, app: str, template: TextTemplate | ChatTemplate) -> str:
+    """Return the YAML ``export`` writes for one prompt version.
+
+    A multi-line string is written as a literal block, which reads as the prompt
+    does, when that reads back exactly; otherwise (e.g. trailing spaces, U+0085) it
+    is written double-quoted and escaped, so no line of the file ends in whitespace
+    for a hook to strip.
+
+    :param name: the prompt.
+    :param app: the app, whose namespace in the registry holds the prompt.
+    :param template: the version's template.
+    :returns: the export's text.
+    :rtype: str
+    :raises PointerError: if the text would not read back exactly.
+    """
+    content: dict[str, Any] = (
+        {"messages": [dict(message) for message in template.messages]}
+        if isinstance(template, ChatTemplate)
+        else {"template": template.template}
+    )
+    record = {
+        "name": name,
+        "app": app,
+        "version": template.version,
+        "type": template.type,
+        "template_hash": template.template_hash,
+        **content,
+    }
+    text = yaml.dump(
+        record,
+        Dumper=_ExportDumper,
+        sort_keys=False,
+        allow_unicode=True,
+        width=_NO_WRAP,
+    )
+    if yaml.safe_load(text) != record:
+        msg = f"{name}: the export would not read back as the version's text"
+        raise PointerError(msg)
+    return text
 
 
 def check_exports(
@@ -291,13 +320,13 @@ def check_exports(
         for path in _unpointed_exports(pointers)
     ]
     for name, prompt in prompts.items():
-        path = pointers.exports / f"{name}.json"
+        path = pointers.exports / f"{name}{EXPORT_SUFFIX}"
         try:
             exported = _read_export(path)
         except FileNotFoundError:
             problems.append(f"{name}: no export at {path}")
             continue
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError):
             problems.append(f"{name}: {path} is not an export ol-llm-prompts wrote")
             continue
         if exported.version != prompt.version:
@@ -321,7 +350,7 @@ def load_default(name: str, *, directory: Path, template: type[TemplateT]) -> Te
     :raises FileNotFoundError: if nothing was exported for the prompt.
     :raises TypeError: if the export is of the other structure.
     """
-    loaded = _read_export(directory / f"{name}.json")
+    loaded = _read_export(directory / f"{name}{EXPORT_SUFFIX}")
     if not isinstance(loaded, template):
         structure = "chat" if isinstance(loaded, ChatTemplate) else "text"
         msg = f"{name!r} was exported as a {structure} prompt, not {template.__name__}"
@@ -330,7 +359,7 @@ def load_default(name: str, *, directory: Path, template: type[TemplateT]) -> Te
 
 
 def _read_export(path: Path) -> TextTemplate | ChatTemplate:
-    exported: Mapping[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    exported: Mapping[str, Any] = yaml.safe_load(path.read_text(encoding="utf-8"))
     if "messages" in exported:
         return ChatTemplate(
             messages=exported["messages"],
@@ -345,31 +374,59 @@ def _read_export(path: Path) -> TextTemplate | ChatTemplate:
 
 
 def _unpointed_exports(pointers: PromptPointers) -> list[Path]:
-    """List this project's exports for prompts the file no longer names.
+    """List this app's exports for prompts the file no longer names.
 
-    Only a file ``export`` wrote for this project counts, so ``package.json`` or
-    another project's export beside it is never reported or removed.
+    Only a file ``export`` wrote for this app counts, so another app's export, or
+    any other YAML beside it, is never reported or removed.
     """
     if not pointers.exports.is_dir():
         return []
     return sorted(
         path
-        for path in pointers.exports.glob("*.json")
-        if path.stem not in pointers.prompts and _is_export(path, pointers.project)
+        for path in pointers.exports.glob(f"*{EXPORT_SUFFIX}")
+        if _export_name(path) not in pointers.prompts and _is_export(path, pointers.app)
     )
 
 
-def _is_export(path: Path, project: str) -> bool:
+def _export_name(path: Path) -> str:
+    return path.name.removesuffix(EXPORT_SUFFIX)
+
+
+def _is_export(path: Path, app: str) -> bool:
     try:
-        exported = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        exported = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, yaml.YAMLError):
         return False
     return (
         isinstance(exported, dict)
-        and exported.get("project") == project
-        and exported.get("name") == path.stem
+        and exported.get("app") == app
+        and exported.get("name") == _export_name(path)
         and ("template" in exported or "messages" in exported)
     )
+
+
+class _ExportDumper(yaml.SafeDumper):
+    """Writes multi-line strings as literal blocks when they read back exactly."""
+
+
+class _LiteralDumper(yaml.SafeDumper):
+    """Writes every string as a literal block, to test whether one reads back."""
+
+
+def _literal(dumper: yaml.SafeDumper, value: str) -> yaml.ScalarNode:
+    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style="|")
+
+
+def _export_str(dumper: yaml.SafeDumper, value: str) -> yaml.ScalarNode:
+    if "\n" not in value:
+        return dumper.represent_str(value)
+    probe = yaml.dump(value, Dumper=_LiteralDumper, allow_unicode=True, width=_NO_WRAP)
+    style = "|" if yaml.safe_load(probe) == value else '"'
+    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=style)
+
+
+_LiteralDumper.add_representer(str, _literal)
+_ExportDumper.add_representer(str, _export_str)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

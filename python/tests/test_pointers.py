@@ -1,8 +1,8 @@
-import json
 from pathlib import Path
 
 import ol_llm.pointers as pointers_module
 import pytest
+import yaml
 from conftest import PromptLibrary
 from ol_llm import ChatTemplate, TextTemplate, get_prompt, load_default
 from ol_llm.pointers import (
@@ -17,7 +17,7 @@ from ol_llm.pointers import (
     resolve,
 )
 
-PROJECT = "mit-learn"
+APP = "mit-learn"
 CHAT = [
     {"role": "system", "content": "You summarize {{subject}}."},
     {"role": "user", "content": "{{text}}"},
@@ -25,12 +25,12 @@ CHAT = [
 
 
 def pointers(exports: Path = Path("unused"), **prompts: str) -> PromptPointers:
-    return PromptPointers(project=PROJECT, exports=exports, prompts=prompts)
+    return PromptPointers(app=APP, exports=exports, prompts=prompts)
 
 
 def write(tmp_path: Path, **prompts: str) -> Path:
     path = tmp_path / "prompts.toml"
-    lines = [f'project = "{PROJECT}"', 'exports = "prompts"', "", "[prompts]"]
+    lines = [f'app = "{APP}"', 'exports = "prompts"', "", "[prompts]"]
     lines += [f'{name} = "{version}"' for name, version in prompts.items()]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return path
@@ -53,11 +53,11 @@ def test_the_documented_pointer_file_is_valid(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("text", "message"),
     [
-        ('project = "x"\nexports = "p"\n[prompts]\nsummary = "7"\n', "should match"),
-        ('project = "x"\nexports = "p"\n[prompts]\n', "at least 1 item"),
-        ('project = "x"\nexports = "p"\n[prompts]\n"../up" = "v1"\n', "should match"),
-        ('project = "x"\n[prompts]\nsummary = "v1"\n', "exports"),
-        ('project = "x"\nexports = "p"\nextra = 1\n[prompts]\ns = "v1"\n', "extra"),
+        ('app = "x"\nexports = "p"\n[prompts]\nsummary = "7"\n', "should match"),
+        ('app = "x"\nexports = "p"\n[prompts]\n', "at least 1 item"),
+        ('app = "x"\nexports = "p"\n[prompts]\n"../up" = "v1"\n', "should match"),
+        ('app = "x"\n[prompts]\nsummary = "v1"\n', "exports"),
+        ('app = "x"\nexports = "p"\nextra = 1\n[prompts]\ns = "v1"\n', "extra"),
         ("not toml", "Expected"),
     ],
 )
@@ -76,7 +76,7 @@ def test_exports_outside_the_pointer_files_directory_are_refused(
     tmp_path: Path, exports: str
 ) -> None:
     path = tmp_path / "prompts.toml"
-    path.write_text(f'project = "x"\nexports = "{exports}"\n[prompts]\ns = "v1"\n')
+    path.write_text(f'app = "x"\nexports = "{exports}"\n[prompts]\ns = "v1"\n')
 
     with pytest.raises(PointerError, match="exports must be a directory beneath"):
         PromptPointers.load(path)
@@ -148,7 +148,7 @@ def test_an_export_reads_back_as_the_embedded_default(
 
     written = export(pointers(tmp_path / "prompts", summary="v2", tutor="v1"))
 
-    assert [p.name for p in written] == ["summary.json", "tutor.json"]
+    assert [p.name for p in written] == ["summary.prompt.yaml", "tutor.prompt.yaml"]
     text = load_default(
         "summary", directory=tmp_path / "prompts", template=TextTemplate
     )
@@ -156,9 +156,45 @@ def test_an_export_reads_back_as_the_embedded_default(
     chat = load_default("tutor", directory=tmp_path / "prompts", template=ChatTemplate)
     assert chat.messages == CHAT
     assert chat.version == "v1"
-    exported = json.loads(written[0].read_text())
+    exported = yaml.safe_load(written[0].read_text())
     assert exported["template_hash"] == text.template_hash
-    assert exported["project"] == PROJECT
+    assert exported["app"] == APP
+
+
+def test_a_multi_line_template_is_exported_as_a_literal_block(
+    prompt_library: PromptLibrary, tmp_path: Path
+) -> None:
+    prompt_library.add("summary", "Summarize this.\n\n{{text}}\n")
+
+    [path] = export(pointers(tmp_path, summary="v1"))
+
+    assert "template: |\n  Summarize this.\n\n  {{text}}\n" in path.read_text()
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "line one   \nline two",
+        "body" + " " * 1900,
+        "body\n\n\n",
+        "  indented\nsecond",
+        "tab\there \N{LATIN SMALL LETTER E WITH ACUTE} \N{EM DASH} dash\n",
+        "next\x85line\nend",
+        "separator\u2028here\nend",
+        "\ufeffmark\nend",
+        "no final newline\nend",
+    ],
+)
+def test_any_template_reads_back_exactly_with_no_trailing_whitespace(
+    prompt_library: PromptLibrary, tmp_path: Path, template: str
+) -> None:
+    prompt_library.add("summary", template)
+
+    [path] = export(pointers(tmp_path, summary="v1"))
+
+    loaded = load_default("summary", directory=tmp_path, template=TextTemplate)
+    assert loaded.template == template
+    assert all(line == line.rstrip() for line in path.read_text().splitlines())
 
 
 def test_the_embedded_default_hashes_like_the_version_it_came_from(
@@ -168,11 +204,9 @@ def test_the_embedded_default_hashes_like_the_version_it_came_from(
     export(pointers(tmp_path, summary="v1"))
     default = load_default("summary", directory=tmp_path, template=TextTemplate)
 
-    fetched = get_prompt(
-        "summary", project_name=PROJECT, default=default, environment="production"
-    )
+    fetched = get_prompt("summary", app=APP, default=default, environment="production")
 
-    assert fetched.source == "opik"
+    assert fetched.source == "registry"
     assert fetched.template_hash == default.template_hash
 
 
@@ -193,17 +227,19 @@ def test_an_export_removes_a_prompt_the_pointers_no_longer_name(
     prompt_library.add("tutor", CHAT)
     export(pointers(tmp_path, summary="v1", tutor="v1"))
     (tmp_path / "notes.txt").write_text("kept")
-    (tmp_path / "package.json").write_text('{"name": "package"}')
-    other = json.loads((tmp_path / "tutor.json").read_text()) | {"project": "other"}
-    (tmp_path / "glossary.json").write_text(json.dumps(other | {"name": "glossary"}))
+    (tmp_path / "config.prompt.yaml").write_text("name: config\n")
+    other = yaml.safe_load((tmp_path / "tutor.prompt.yaml").read_text())
+    (tmp_path / "glossary.prompt.yaml").write_text(
+        yaml.safe_dump(other | {"app": "other", "name": "glossary"})
+    )
 
     export(pointers(tmp_path, summary="v1"))
 
     assert sorted(p.name for p in tmp_path.iterdir()) == [
-        "glossary.json",
+        "config.prompt.yaml",
+        "glossary.prompt.yaml",
         "notes.txt",
-        "package.json",
-        "summary.json",
+        "summary.prompt.yaml",
     ]
 
 
@@ -226,19 +262,24 @@ def test_every_export_that_does_not_match_is_reported(
         prompt_library.add(name, "two")
     export(pointers(tmp_path, summary="v1", glossary="v1", tutor="v1", retired="v1"))
     # The person moving the pointers forgot to export, or edited the text by hand.
-    edited = json.loads((tmp_path / "glossary.json").read_text())
-    (tmp_path / "glossary.json").write_text(json.dumps(edited | {"template": "x"}))
-    (tmp_path / "tutor.json").write_text("{not json")
+    edited = yaml.safe_load((tmp_path / "glossary.prompt.yaml").read_text())
+    (tmp_path / "glossary.prompt.yaml").write_text(
+        yaml.safe_dump(edited | {"template": "x"})
+    )
+    (tmp_path / "tutor.prompt.yaml").write_text("template: [not closed\n")
     moved = pointers(tmp_path, summary="v2", glossary="v1", tutor="v1", intro="v1")
 
-    (tmp_path / "package.json").write_text('{"name": "package"}')
+    (tmp_path / "config.prompt.yaml").write_text("name: config\n")
 
     assert check_exports(moved, resolve(moved)) == [
-        "retired.json is for a prompt the pointer file does not name",
+        "retired.prompt.yaml is for a prompt the pointer file does not name",
         "summary: the export is v1, the pointer says v2",
         "glossary: the export's text is not v1's",
-        f"tutor: {tmp_path / 'tutor.json'} is not an export ol-llm-prompts wrote",
-        f"intro: no export at {tmp_path / 'intro.json'}",
+        (
+            f"tutor: {tmp_path / 'tutor.prompt.yaml'} is not an export "
+            "ol-llm-prompts wrote"
+        ),
+        f"intro: no export at {tmp_path / 'intro.prompt.yaml'}",
     ]
 
 
@@ -247,7 +288,7 @@ def test_an_exports_symlink_out_of_the_tree_is_refused(tmp_path: Path) -> None:
     (tmp_path / "app").mkdir()
     (tmp_path / "app" / "prompts").symlink_to(tmp_path / "outside")
     path = tmp_path / "app" / "prompts.toml"
-    path.write_text('project = "x"\nexports = "prompts"\n[prompts]\ns = "v1"\n')
+    path.write_text('app = "x"\nexports = "prompts"\n[prompts]\ns = "v1"\n')
 
     with pytest.raises(PointerError, match="exports must be a directory beneath"):
         PromptPointers.load(path)

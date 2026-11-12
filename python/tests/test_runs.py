@@ -635,7 +635,7 @@ def test_a_managed_prompt_is_linked_to_the_run(
     prompt_library.add("summary", "Summarize.", environments=("production",))
     prompt = get_prompt(
         "summary",
-        project_name="mit-learn",
+        app="mit-learn",
         default=TextTemplate(template="Summarize."),
         environment="production",
     )
@@ -680,7 +680,7 @@ def test_an_embedded_prompt_marks_the_result_and_the_trace() -> None:
     assert "opik_prompts" not in trace.metadata
 
 
-@pytest.mark.parametrize("source", ["opik", "embedded"])
+@pytest.mark.parametrize("source", ["registry", "embedded"])
 def test_a_nested_run_names_its_prompt_on_the_callers_trace(
     prompt_library: PromptLibrary, source: str
 ) -> None:
@@ -688,11 +688,11 @@ def test_a_nested_run_names_its_prompt_on_the_callers_trace(
     prompt = (
         get_prompt(
             "summary",
-            project_name="mit-learn",
+            app="mit-learn",
             default=TextTemplate(template="Summarize."),
             environment="production",
         )
-        if source == "opik"
+        if source == "registry"
         else ManagedPrompt(
             name="summary",
             template=TextTemplate(template="Summarize.", version="v1"),
@@ -725,7 +725,7 @@ def test_every_prompt_is_linked_and_an_embedded_one_marks_the_run(
     system, user = (
         get_prompt(
             name,
-            project_name="mit-learn",
+            app="mit-learn",
             default=TextTemplate(template="Summarize."),
             environment="production",
         )

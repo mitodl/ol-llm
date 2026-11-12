@@ -242,7 +242,7 @@ def production_prompt(
     )
     return get_prompt(
         "summary",
-        project_name=APP,
+        app=APP,
         default=TextTemplate(template="Summarize {{text}}."),
         environment="production",
     )
@@ -280,9 +280,9 @@ def test_evaluate_links_the_prompt_versions_to_the_experiment(
 
     assert result is expected
     [call] = calls
-    assert production_prompt.opik_prompt is not None
+    assert production_prompt.registry_ref is not None
     assert production_prompt.version == "v2"
-    assert call["prompts"] == [production_prompt.opik_prompt]
+    assert call["prompts"] == [production_prompt.registry_ref]
     assert call["dataset"] == ("summary-golden", "v1")
     assert call["task"].__wrapped__ is task
     assert call["scoring_metrics"] == [metric]

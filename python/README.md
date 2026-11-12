@@ -220,7 +220,7 @@ SUMMARY_PROMPT = ol_llm.load_default(
 
 def summarize(text: str, audience: str) -> Summary:
     prompt = ol_llm.get_prompt(
-        "content-summary", project_name="mit-learn", default=SUMMARY_PROMPT
+        "content-summary", app="mit-learn", default=SUMMARY_PROMPT
     )
     result = ol_llm.complete_sync(
         SUMMARY,
@@ -273,14 +273,17 @@ per prompt, and `ol-llm-prompts` exports the embedded defaults for the pull requ
 checks both on the pull request, and moves the `production` label on merge. [Prompt promotion](../docs/prompt-promotion.md)
 has the file format and the workflow to call.
 
-Underneath, `ol_llm.create_prompt(name, template, project_name=...)` adds a version only when
-the text or template type changed, and `ol_llm.promote_prompt(name, version="v7",
-environment="production", project_name=...)` moves one label and leaves the version's other
-labels in place. Opik seeds only `development`, `staging`, and `production`; create `ci` and
-`qa` once per instance before promoting to them. `ol_llm.fetch_prompt(name, project_name=...,
-version="v7")` (or `environment="production"`) reads one version back, text or chat, with no
-embedded default, cache, or fallback, and returns `None` when Opik has no such version or
-label.
+Underneath, `ol_llm.create_prompt(name, template, app=...)` adds a version only when the text
+or template type changed, and `ol_llm.promote_prompt(name, version="v7",
+environment="production", app=...)` moves one label and leaves the version's other labels in
+place. Opik seeds only `development`, `staging`, and `production`; create `ci` and `qa` once per
+instance before promoting to them. `ol_llm.fetch_prompt(name, app=..., version="v7")` (or
+`environment="production"`) reads one version back, text or chat, with no embedded default,
+cache, or fallback, and returns `None` when Opik has no such version or label.
+
+A fetched prompt's `source` is `"registry"`; the embedded default's is `"embedded"`, marked
+degraded when the registry could not be reached. `app` is the app's namespace in the registry,
+its Opik project.
 
 ### Embeddings
 
@@ -455,9 +458,7 @@ SUMMARY_PROMPT = ol_llm.load_default(
 
 @dg.asset(pool=ol_llm.dagster_pool(SUMMARY))
 def feedback_summaries(context: dg.AssetExecutionContext) -> None:
-    prompt = ol_llm.get_prompt(
-        SUMMARY.name, project_name=SUMMARY.app, default=SUMMARY_PROMPT
-    )
+    prompt = ol_llm.get_prompt(SUMMARY.name, app=SUMMARY.app, default=SUMMARY_PROMPT)
     keys = ol_llm.BatchKeys(model=SUMMARY.model, prompt=prompt)
     stored = load_stored_keys()  # {conversation_pk: idempotency_key}
     rows = [
@@ -526,9 +527,7 @@ FILES_PER_TASK = 20
     rate_limit=ol_llm.celery_rate_limit(100, rows_per_task=FILES_PER_TASK, workers=2),
 )
 def summarize_content_files_task(self, content_file_ids: list[int]) -> int:
-    prompt = ol_llm.get_prompt(
-        SUMMARY.name, project_name=SUMMARY.app, default=SUMMARY_PROMPT
-    )
+    prompt = ol_llm.get_prompt(SUMMARY.name, app=SUMMARY.app, default=SUMMARY_PROMPT)
     summarizer = ol_llm.build_agent(SUMMARY, instructions=prompt.format())
     keys = ol_llm.BatchKeys(model=SUMMARY.model, prompt=prompt)
     attribution = ol_llm.Attribution(run_id=self.request.id)
@@ -602,7 +601,7 @@ from ol_llm.evaluation import (
 )
 
 prompt = ol_llm.get_prompt(
-    "syllabus", project_name="learn-ai", default=SYLLABUS_PROMPT, environment="ci"
+    "syllabus", app="learn-ai", default=SYLLABUS_PROMPT, environment="ci"
 )
 judge = judge_model("learn-ai", "openai:gpt-4o-mini")
 

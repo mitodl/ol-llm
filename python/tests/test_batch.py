@@ -168,7 +168,7 @@ def test_provenance_names_the_model_that_answered(
     )
     prompt = get_prompt(
         "feedback-summary",
-        project_name="ol-data-platform",
+        app="ol-data-platform",
         default=TEMPLATE,
         environment="production",
     )

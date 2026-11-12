@@ -12,7 +12,7 @@ Rollback is a revert of the pull request.
 One per app repository:
 
 ```toml
-project = "dagster-ml"                   # the app's Opik project
+app = "dagster-ml"                       # the app's namespace (its Opik project)
 exports = "prompts"                      # the embedded defaults, from this file
 
 [prompts]                                # the version production runs, per prompt
@@ -51,11 +51,33 @@ ol-llm-prompts check prompts.toml --environment production   # and the label is 
 ol-llm-prompts promote prompts.toml                          # move production to the pointers
 ```
 
-`export` writes `<exports>/<name>.json` for each prompt: the pointed version's template (or
-messages, for a chat prompt), its type, version, and template hash. It also removes its own
-earlier export of a prompt the file no longer names and leaves every other file. `exports` must
-be a directory beneath the pointer file's. The app reads an export with `load_default` and
-passes it to `get_prompt`:
+`export` writes `<exports>/<name>.prompt.yaml` for each prompt: its name, the app, the pointed
+version, the template's type (`mustache` or `jinja2`), its template hash, and the template (or
+the messages, for a chat prompt). A multi-line template is written as a YAML literal block, so
+the pull request shows the prompt as it reads:
+
+```yaml
+name: feedback-summary
+app: dagster-ml
+version: v4
+type: mustache
+template_hash: 8e31a7bc6baa57c09d90bd7ee44ca9801432b95dae933ebfbcb23130ce14c223
+template: |-
+  You are analyzing feedback about MIT Learn, ...
+
+  <learner_text>
+  {{conversation_text}}
+  </learner_text>
+```
+
+Text a literal block cannot hold exactly (a line ending in spaces, U+0085) is written
+double-quoted and escaped instead, so no line of an export ends in whitespace and hooks such as
+`trailing-whitespace` leave it alone. Every export reads back as exactly the version's text, or
+`export` refuses to write it.
+
+`export` also removes its own earlier export of a prompt the file no longer names and leaves
+every other file. `exports` must be a directory beneath the pointer file's. The app reads an
+export with `load_default`, which works offline, and passes it to `get_prompt`:
 
 ```python
 PROMPTS_DIR = Path(__file__).parent / "prompts"
