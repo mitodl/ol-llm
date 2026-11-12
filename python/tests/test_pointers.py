@@ -173,6 +173,22 @@ def test_a_multi_line_template_is_exported_as_a_literal_block(
 
 @pytest.mark.parametrize(
     "template",
+    ["0o7", "1e3", "0x1F", "12", "-1.5", ".inf", ".NaN", "True", "FALSE", "~", "null"],
+)
+def test_text_a_yaml_1_2_reader_would_not_read_as_a_string_is_double_quoted(
+    prompt_library: PromptLibrary, tmp_path: Path, template: str
+) -> None:
+    prompt_library.add("summary", template)
+
+    [path] = export(pointers(tmp_path, summary="v1"))
+
+    assert f'template: "{template}"\n' in path.read_text()
+    loaded = load_default("summary", directory=tmp_path, template=TextTemplate)
+    assert loaded.template == template
+
+
+@pytest.mark.parametrize(
+    "template",
     [
         "line one   \nline two",
         "body" + " " * 1900,

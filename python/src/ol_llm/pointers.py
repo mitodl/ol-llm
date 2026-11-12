@@ -31,6 +31,7 @@ merging promotes.
 """
 
 import argparse
+import re
 import sys
 import tomllib
 from collections.abc import Iterator, Mapping, Sequence
@@ -432,7 +433,21 @@ class _ExportDumper(yaml.SafeDumper):
 _STR_TAG = "tag:yaml.org,2002:str"
 
 
+_YAML12_NON_STRING = re.compile(
+    r"null|Null|NULL|~|true|True|TRUE|false|False|FALSE"
+    r"|[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+"
+    r"|[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?"
+    r"|[-+]?\.(inf|Inf|INF)|\.(nan|NaN|NAN)"
+)
+"""What a YAML 1.2 core-schema reader resolves to something other than a string.
+
+PyYAML resolves YAML 1.1, which writes most of these quoted already but leaves
+e.g. ``0o7`` and ``1e3`` plain, so another reader would load them as numbers."""
+
+
 def _export_str(dumper: yaml.SafeDumper, value: str) -> yaml.ScalarNode:
+    if _YAML12_NON_STRING.fullmatch(value):
+        return dumper.represent_scalar(_STR_TAG, value, style='"')
     style = "|" if "\n" in value else None
     probe = yaml.serialize(
         yaml.ScalarNode(_STR_TAG, value, style=style),
