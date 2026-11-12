@@ -65,10 +65,10 @@ openai = ["pydantic-ai-slim[openai]>=2.66,<3"]
 # PydanticAI's first-party capabilities: in-session memory, compaction, and
 # conversation search. Each harness release pins pydantic-ai-slim exactly, so
 # this extra also fixes the PydanticAI version. 0.x: pinned to a minor series.
-# 0.66 fixes the secret-redaction ReDoS (GHSA-mfx5-pc32-32m8), and slim 2.66
-# fixes eight that affect 2.65 and earlier (GHSA-m5vj-8mcw-82qx and others),
-# hence the 2.66 floor on every extra above.
-harness = ["pydantic-ai-harness>=0.66,<0.67"]
+# Releases before 0.66 have the secret-redaction ReDoS (GHSA-mfx5-pc32-32m8), and
+# slim 2.66 fixes eight advisories that affect 2.65 and earlier
+# (GHSA-m5vj-8mcw-82qx and others), hence the 2.66 floor on every extra above.
+harness = ["pydantic-ai-harness>=0.68,<0.69"]
 # The Hindsight backend of ol_llm.memory. The client is generated from the
 # server's API, so it follows the deployed server's minor version
 # (ol-infrastructure src/bridge/lib/versions.py HINDSIGHT_VERSION).
