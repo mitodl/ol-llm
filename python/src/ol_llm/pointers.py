@@ -43,6 +43,7 @@ from typing import Annotated, Any
 import pydantic
 import yaml
 
+from ol_llm.prompt_registry import prompt_registry
 from ol_llm.prompt_registry.files import EXPORT_SUFFIX, PRODUCTION, read_export
 from ol_llm.prompts import (
     ChatTemplate,
@@ -209,18 +210,19 @@ def promote(
     :raises PointerError: if a pointed version does not exist, or the registry
         is read-only.
     """
+    if prompt_registry().read_only:
+        # A read-only registry would report every export as labeled already.
+        msg = "The configured prompt registry is read-only; promote against Opik"
+        raise PointerError(msg)
     resolve(pointers)
     for state in label_states(pointers, environment=environment):
         if state.drifted:
-            try:
-                promote_prompt(
-                    state.name,
-                    version=state.pointed,
-                    environment=environment,
-                    app=pointers.app,
-                )
-            except NotImplementedError as exc:
-                raise PointerError(str(exc)) from exc
+            promote_prompt(
+                state.name,
+                version=state.pointed,
+                environment=environment,
+                app=pointers.app,
+            )
         yield state
 
 

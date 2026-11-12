@@ -49,6 +49,15 @@ class PromptRegistry(ABC):
         """
         return True
 
+    @property
+    def read_only(self) -> bool:
+        """Whether ``move_label`` and ``create_version`` refuse.
+
+        ``ol-llm-prompts promote`` checks it first, since a read-only registry can
+        report a label as in place without any registry having moved it.
+        """
+        return False
+
     def context_key(self) -> Hashable:
         """Return what, in the calling context, changes what ``fetch`` returns.
 

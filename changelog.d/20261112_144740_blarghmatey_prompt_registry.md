@@ -1,6 +1,6 @@
 ### Added
 
-- `ol_llm.prompt_registry`: the prompt registry behind `get_prompt`, `fetch_prompt`, `create_prompt`, `promote_prompt` and `ol-llm-prompts`, chosen by name like memory backends. `OL_LLM_PROMPT_REGISTRY` is `opik` by default, or `file` with `OL_LLM_PROMPT_REGISTRY_PATH` set to an exports directory, which serves the committed exports at their versions for tests and local work without Opik. The file registry serves them under `production`, or under the labels in `OL_LLM_PROMPT_REGISTRY_LABELS` (e.g. `production,ci`). `configure_prompt_registry` sets one in code, and the `ol_llm.prompt_registries` entry-point group adds others.
+- `ol_llm.prompt_registry`: the prompt registry behind `get_prompt`, `fetch_prompt`, `create_prompt`, `promote_prompt` and `ol-llm-prompts`, chosen by name like memory backends. `OL_LLM_PROMPT_REGISTRY` is `opik` by default, or `file` with `OL_LLM_PROMPT_REGISTRY_PATH` set to an exports directory, which serves the committed exports at their versions for tests and local work without Opik. The file registry serves them under `production`, or under the labels in `OL_LLM_PROMPT_REGISTRY_LABELS` (e.g. `production,ci`). It is read-only, and `ol-llm-prompts promote` refuses to run against it. `configure_prompt_registry` sets one in code, and the `ol_llm.prompt_registries` entry-point group adds others.
 
 ### Changed
 

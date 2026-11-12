@@ -145,8 +145,10 @@ def test_promoting_through_a_read_only_registry_says_so(
     export(pointers(tmp_path, summary="v1"))
     configure_prompt_registry(FilePromptRegistry(tmp_path))
 
+    # Every export carries production in the file registry, so without the check
+    # promote would report nothing to move and succeed.
     with pytest.raises(PointerError, match="read-only"):
-        list(promote(pointers(tmp_path, summary="v1"), environment="qa"))
+        list(promote(pointers(tmp_path, summary="v1")))
 
 
 # Exports

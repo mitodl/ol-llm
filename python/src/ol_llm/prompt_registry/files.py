@@ -79,6 +79,11 @@ class FilePromptRegistry(PromptRegistry):
         self.directory = directory
         self.labels = frozenset(labels)
 
+    @property
+    def read_only(self) -> bool:
+        """Always: exports change only by committing new ones."""
+        return True
+
     def fetch(
         self,
         name: str,
