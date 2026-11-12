@@ -32,13 +32,20 @@ uv run prek run --all-files                     # the same hooks CI runs
   requirement of the new release with an upper bound and review them by hand (caps are mostly
   `<=`, but opik also bounds litellm with `<1.106`):
   `curl -s https://pypi.org/pypi/opik/<version>/json | jq -r '.info.requires_dist[] | select(test("<"))'`.
+  opik states a capped package's floor or extra on a separate line (e.g.
+  `boto3-stubs[bedrock-runtime]>=1.34.110` beside `boto3-stubs<=1.43.123`), so read all of
+  its requirements on each capped package, not only the `<` lines.
   Replace the block in the README's "Overriding opik's version caps" section with one entry per
-  capped package. Write each entry as all the non-cap bounds of every package that requires it,
-  combined (list them with `uv tree --invert --package <name> --depth 1`, then read each
-  one's requirement on it), with opik's environment markers kept, e.g. `"pydantic>=2.14,<3"`,
-  `"tenacity>=8.1.0,!=8.4.0"` (langchain-core excludes 8.4.0). `python/smoke/pyproject.toml`
-  takes the cap entries for the packages its slimming list does not drop. Keep the smoke test
-  passing with them. Drop them once comet-ml/opik#9491 moves the caps into an extra.
+  capped package. Write each entry as all the non-cap bounds and extras of every package that
+  requires it, opik included, combined (list them with
+  `uv tree --invert --package <name> --depth 1 --no-dev`, then read each one's requirement on
+  it), with opik's environment markers kept, e.g. `"pydantic>=2.14,<3"`,
+  `"tenacity>=8.2.3,!=8.4.0,<9.2.0"` (langchain-core excludes 8.4.0, google-genai caps 9.2).
+  The litellm entry is the exception: it replaces opik's `<1.106` bound with `>=1.108.3`, the
+  first litellm that accepts the `openai` extra's openai 3 and filelock 4, and the root
+  `pyproject.toml` overrides litellm the same way. `python/smoke/pyproject.toml` takes the cap entries for the
+  packages its slimming list does not drop. Keep the smoke test passing with them. Drop them
+  once comet-ml/opik#9491 moves the caps into an extra.
 - Do not add litellm as a dependency.
 - No async client is created outside a `LoopLocal` (`ol_llm/loops.py`) with a close function,
   so the runner can close it and a forked child drops it. New loop-local resources join the

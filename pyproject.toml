@@ -22,10 +22,15 @@ package = false
 # Floors for transitive dependencies with advisories against earlier releases, so a
 # relock can't resolve back into them. They shape this lockfile only, not the wheel.
 constraint-dependencies = [
-    "filelock>=4.2.1",  # GHSA-v4x8-3wr5-3wq8; litellm up to 1.108.0 requires filelock<4
-    "litellm>=1.95.0",  # GHSA-g5ff-637f-6q2m and earlier; opik requires litellm
+    "filelock>=4.2.1",  # GHSA-v4x8-3wr5-3wq8; litellm up to 1.108.2 requires filelock<4
     "pyasn1>=0.6.5",    # GHSA-fm9c-5rcf-2q5p and three others; via google-auth
 ]
+# opik requires litellm<1.106, and every litellm from 1.95.0 (GHSA-g5ff-637f-6q2m
+# and earlier) to that bound requires openai<3, which the openai extra's openai 3
+# excludes. This is the README's litellm override, which replaces opik's bound. It
+# applies to this lockfile and to the CI jobs that run `uv pip` from this directory,
+# so they test the litellm the README tells uv consumers to install.
+override-dependencies = ["litellm>=1.108.3,<2"]
 
 [tool.uv.workspace]
 members = ["python"]
