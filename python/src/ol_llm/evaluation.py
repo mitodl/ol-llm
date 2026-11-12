@@ -57,7 +57,6 @@ import pydantic
 from opik import context_storage
 from opik.api_objects.experiment.experiment import Experiment
 from opik.api_objects.experiment.experiment_item import ExperimentItemContent
-from opik.api_objects.prompt import BasePrompt
 from opik.evaluation.evaluation_result import EvaluationResult
 from opik.evaluation.metrics import BaseMetric, arguments_helpers, score_result
 from opik.evaluation.metrics.arguments_validator import validate_score_arguments
@@ -76,6 +75,7 @@ from ol_llm import tracing
 from ol_llm.catalog import load_catalog
 from ol_llm.errors import LLMError
 from ol_llm.policy import UseCase
+from ol_llm.prompt_registry.opik_registry import opik_prompt
 from ol_llm.prompts import ManagedPrompt
 from ol_llm.runs import LLMResult, complete, complete_sync
 from ol_llm.settings import get_settings
@@ -628,11 +628,8 @@ def evaluate(  # noqa: PLR0913
     if not prompts:
         msg = "Pass every managed prompt the task uses, so the experiment links them"
         raise ValueError(msg)
-    linked = [p.registry_ref for p in prompts if isinstance(p.registry_ref, BasePrompt)]
-    if len(linked) != len(prompts):
-        unlinked = [
-            p.name for p in prompts if not isinstance(p.registry_ref, BasePrompt)
-        ]
+    linked = {p.name: opik_prompt(p.registry_ref) for p in prompts}
+    if unlinked := [name for name, prompt in linked.items() if prompt is None]:
         msg = (
             f"Prompts {unlinked} are not Opik versions (embedded defaults, or from "
             "another prompt registry); an evaluation links the Opik versions it ran"
@@ -648,7 +645,7 @@ def evaluate(  # noqa: PLR0913
         scoring_metrics=[_guard_metric(metric) for metric in metrics],
         experiment_name=experiment_name,
         experiment_config={"environment": environment, **(experiment_config or {})},
-        prompts=linked,
+        prompts=[prompt for prompt in linked.values() if prompt is not None],
         scoring_key_mapping=dict(scoring_key_mapping or {}),
         experiment_tags=[
             f"app:{project_name}",

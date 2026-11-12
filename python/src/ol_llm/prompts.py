@@ -3,10 +3,11 @@
 Deployed code fetches a prompt by its label with ``get_prompt``. The registry is
 whichever ``ol_llm.prompt_registry`` is configured (Opik by default); the runtime
 policy here applies to every one. Each fetched version is kept in a process-wide
-cache for ``PROMPT_CACHE_TTL_SECONDS``. After that the cached version is still
-served while a background thread fetches it again, and it stays when that fetch
-fails. So a label move reaches every process within about one TTL, and only a
-fetch with nothing cached can fail.
+cache for ``PROMPT_CACHE_TTL_SECONDS``. The first call after that fetches it again,
+waiting up to ``COLD_FETCH_DEADLINE_SECONDS``, and gets the cached version if the
+fetch fails, finds nothing, or is slow; a failed refresh is tried again after
+another TTL. So a label move reaches every process within one TTL, and only a fetch
+with nothing cached can fail.
 
 A cold fetch waits ``COLD_FETCH_DEADLINE_SECONDS`` and then, if the registry has
 not answered or could not be reached, returns the embedded default the caller
@@ -28,6 +29,7 @@ import contextvars
 import logging
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Hashable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -52,6 +54,7 @@ from ol_llm.templates import (
 
 __all__ = [
     "COLD_FETCH_DEADLINE_SECONDS",
+    "PROMPT_CACHE_MAX_ENTRIES",
     "PROMPT_CACHE_TTL_SECONDS",
     "ChatTemplate",
     "ManagedPrompt",
@@ -75,6 +78,10 @@ default. The Opik SDK took 11 s to give up on an unreachable Opik (spec §3 item
 
 PROMPT_CACHE_TTL_SECONDS = 300.0
 """How long a fetched version is served before it is fetched again (spec §3)."""
+
+PROMPT_CACHE_MAX_ENTRIES = 128
+"""How many fetched versions the cache keeps, least recently used out first, as the
+Opik SDK's cache did."""
 
 PromptSource = Literal["registry", "embedded"]
 """Where a prompt came from: the prompt registry, or the embedded default."""
@@ -272,6 +279,9 @@ def promote_prompt(name: str, *, version: str, environment: str, app: str) -> No
     with _inflight_lock:
         for lookup in [k for k in _cache if (k.name, k.app) == (name, app)]:
             del _cache[lookup]
+        # A fetch in flight may have read the label before the move.
+        for lookup in [k for k in _inflight if (k.name, k.app) == (name, app)]:
+            del _inflight[lookup]
 
 
 def fetch_prompt(
@@ -325,15 +335,15 @@ class _Lookup:
     context: Hashable
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Entry:
     found: RegistryVersion
-    fetched_at: float
+    checked_at: float
 
 
 _inflight_lock = threading.Lock()
 _inflight: dict[_Lookup, Future[RegistryVersion | None]] = {}
-_cache: dict[_Lookup, _Entry] = {}
+_cache: OrderedDict[_Lookup, _Entry] = OrderedDict()
 
 
 def _after_fork_in_child() -> None:
@@ -349,21 +359,29 @@ register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def _cached_fetch(lookup: _Lookup) -> RegistryVersion | None:
-    """Return the cached version, refreshing it in the background once stale.
+    """Return the version for ``lookup``, from the cache while it is fresh.
 
-    With nothing cached, fetch in a worker thread and wait at most the deadline.
-    Concurrent fetches of one lookup share a worker, which keeps going after the
-    deadline so its result reaches the cache.
+    Otherwise fetch in a worker thread and wait at most the deadline. Concurrent
+    fetches of one lookup share a worker, which keeps going after the deadline so
+    its result reaches the cache. A stale entry is served when its refresh fails,
+    finds nothing, or misses the deadline, as the Opik SDK's cache did.
 
     :raises TimeoutError: if a cold fetch missed the deadline.
     """
     with _inflight_lock:
-        if (entry := _cache.get(lookup)) is not None:
-            if time.monotonic() - entry.fetched_at >= PROMPT_CACHE_TTL_SECONDS:
-                _start(lookup)
-            return entry.found
+        entry = _cache.get(lookup)
+        if entry is not None:
+            _cache.move_to_end(lookup)
+            if time.monotonic() - entry.checked_at < PROMPT_CACHE_TTL_SECONDS:
+                return entry.found
         future = _start(lookup)
-    return future.result(timeout=COLD_FETCH_DEADLINE_SECONDS)
+    try:
+        found = future.result(timeout=COLD_FETCH_DEADLINE_SECONDS)
+    except Exception:
+        if entry is None:
+            raise
+        return entry.found
+    return found if found is not None or entry is None else entry.found
 
 
 def _start(lookup: _Lookup) -> Future[RegistryVersion | None]:
@@ -388,28 +406,48 @@ def _start(lookup: _Lookup) -> Future[RegistryVersion | None]:
 
 def _resolve(lookup: _Lookup, future: Future[RegistryVersion | None]) -> None:
     # Retired before it resolves, so a caller arriving later starts a fresh fetch
-    # instead of getting this one's error.
+    # instead of getting this one's error. A worker that promote_prompt evicted
+    # writes nothing, so a version fetched before the move is not cached after it.
     try:
         found = lookup.registry.fetch(
             lookup.name, app=lookup.app, version=lookup.version, label=lookup.label
         )
-    except Exception as exc:
-        with _inflight_lock:
-            del _inflight[lookup]
-            stale = lookup in _cache
-        if stale:
-            logger.warning(
-                "Could not refresh prompt %r (%s); serving the cached version",
-                lookup.name,
-                type(exc).__name__,
-                exc_info=exc,
-            )
+    except Exception as exc:  # noqa: BLE001 - handed to the waiting caller
+        _settle(lookup, future, None, exc)
         future.set_exception(exc)
         return
-    with _inflight_lock:
-        del _inflight[lookup]
-        if found is None:
-            _cache.pop(lookup, None)
-        else:
-            _cache[lookup] = _Entry(found, time.monotonic())
+    _settle(lookup, future, found, None)
     future.set_result(found)
+
+
+def _settle(
+    lookup: _Lookup,
+    future: Future[RegistryVersion | None],
+    found: RegistryVersion | None,
+    exc: Exception | None,
+) -> None:
+    """Record a fetch's outcome in the cache, unless promote_prompt evicted it.
+
+    A failed or empty refresh keeps the cached version and is tried again after
+    another TTL, not on every call.
+    """
+    with _inflight_lock:
+        if _inflight.get(lookup) is not future:
+            return
+        del _inflight[lookup]
+        now = time.monotonic()
+        if found is not None:
+            _cache[lookup] = _Entry(found, now)
+            _cache.move_to_end(lookup)
+            while len(_cache) > PROMPT_CACHE_MAX_ENTRIES:
+                _cache.popitem(last=False)
+            return
+        if (entry := _cache.get(lookup)) is None:
+            return
+        entry.checked_at = now
+    logger.warning(
+        "Could not refresh prompt %r (%s); serving the cached version",
+        lookup.name,
+        "not found" if exc is None else type(exc).__name__,
+        exc_info=exc,
+    )

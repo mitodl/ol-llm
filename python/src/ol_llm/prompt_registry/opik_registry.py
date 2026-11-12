@@ -204,7 +204,35 @@ class OpikPromptRegistry(PromptRegistry):
             return detail
         if (mask_id := mask_context.get_mask_for_prompt(detail.prompt_id)) is None:
             return detail
-        return client.rest_client.prompts.get_prompt_version_by_id(version_id=mask_id)
+        masked = client.rest_client.prompts.get_prompt_version_by_id(version_id=mask_id)
+        # Text or chat is the prompt's, which a version read by id may not carry.
+        return masked.model_copy(
+            update={"template_structure": detail.template_structure}
+        )
+
+
+def opik_prompt(ref: object) -> BasePrompt | None:
+    """Return the Opik prompt a ``ManagedPrompt.registry_ref`` is, for evaluation.
+
+    :param ref: the reference.
+    :returns: the Opik prompt, or ``None`` for an embedded default or another
+        registry's version.
+    :rtype: BasePrompt | None
+    """
+    return ref if isinstance(ref, BasePrompt) else None
+
+
+def opik_version_id(ref: object) -> str | None:
+    """Return the Opik id of the version a ``ManagedPrompt.registry_ref`` is.
+
+    Opik's experiments link prompt versions by this id.
+
+    :param ref: the reference.
+    :returns: the id, or ``None`` when ``ref`` is not an Opik version.
+    :rtype: str | None
+    """
+    prompt = opik_prompt(ref)
+    return None if prompt is None else prompt.__internal_api__version_id__
 
 
 def _unreachable(exc: Exception) -> bool:

@@ -256,6 +256,17 @@ def test_a_chat_template_keeps_its_media_and_other_keys() -> None:
     }
 
 
+def test_a_media_part_whose_url_renders_empty_is_left_out() -> None:
+    image = {"type": "image_url", "image_url": {"url": "{{image}}"}}
+    template = ChatTemplate(
+        messages=[{"role": "user", "content": [{"type": "text", "text": "Hi"}, image]}]
+    )
+
+    [message] = template.format(image="")
+
+    assert message["content"] == [{"type": "text", "text": "Hi"}]
+
+
 @pytest.mark.parametrize(
     "template",
     [TextTemplate(template="Hi {{name}}."), ChatTemplate(messages=CHAT)],
@@ -407,6 +418,24 @@ def test_a_fetch_inside_a_mask_context_returns_the_masked_version(
     assert outside.template.template == "Summarize {{text}}."
 
 
+def test_a_masked_chat_prompt_stays_chat(prompt_library: PromptLibrary) -> None:
+    prompt_library.add("tutor", CHAT, environments=("production",))
+    masked = prompt_library.add("tutor", [{"role": "system", "content": "Masked"}])
+    [unmasked] = [
+        v for v in prompt_library.prompts[PROJECT, "tutor"] if v["id"] != masked["id"]
+    ]
+
+    with mask_context.prompt_mask_context({unmasked["prompt_id"]: masked["id"]}):
+        prompt = get_prompt(
+            "tutor",
+            app=PROJECT,
+            default=ChatTemplate(messages=[]),
+            environment="production",
+        )
+
+    assert prompt.template.messages == [{"role": "system", "content": "Masked"}]
+
+
 def test_a_slow_cold_fetch_falls_back_and_then_fills_the_cache(
     monkeypatch: pytest.MonkeyPatch, prompt_library: PromptLibrary
 ) -> None:
@@ -436,42 +465,96 @@ def test_a_cached_prompt_is_served_without_a_fetch(
     assert prompt_library.retrievals == 0
 
 
+def make_stale() -> None:
+    for entry in prompts._cache.values():  # noqa: SLF001
+        entry.checked_at -= prompts.PROMPT_CACHE_TTL_SECONDS + 1
+
+
 def test_a_stale_prompt_is_served_while_opik_is_down(
     monkeypatch: pytest.MonkeyPatch, prompt_library: PromptLibrary
 ) -> None:
     prompt_library.add("summary", "Summarize {{text}}.", environments=("production",))
     fetch(environment="production")
-    monkeypatch.setattr(prompts, "PROMPT_CACHE_TTL_SECONDS", 0)
-    monkeypatch.setattr(
-        OpikPromptRegistry, "_retrieve", failing(httpx.ConnectError("refused"))
-    )
+    make_stale()
+    attempts: list[object] = []
 
-    first = fetch(environment="production")
-    wait_for_fetches()
-    second = fetch(environment="production")
+    def refused(*_args: object, **_kwargs: object) -> None:
+        attempts.append(None)
+        msg = "refused"
+        raise httpx.ConnectError(msg)
 
-    for prompt in (first, second):
+    monkeypatch.setattr(OpikPromptRegistry, "_retrieve", refused)
+
+    served = [fetch(environment="production") for _ in range(3)]
+
+    for prompt in served:
         assert (prompt.source, prompt.version, prompt.degraded_reasons) == (
             "registry",
             "v1",
             (),
         )
+    # Tried again after another TTL, not on every call.
+    assert len(attempts) == 1
 
 
-def test_a_stale_prompt_is_refreshed_in_the_background(
-    monkeypatch: pytest.MonkeyPatch, prompt_library: PromptLibrary
+def test_a_stale_prompt_is_kept_when_its_label_is_gone(
+    prompt_library: PromptLibrary,
+) -> None:
+    prompt_library.add("summary", "Summarize {{text}}.", environments=("production",))
+    fetch(environment="production")
+    for version in prompt_library.prompts[PROJECT, "summary"]:
+        version["environments"] = []
+    make_stale()
+
+    assert fetch(environment="production").version == "v1"
+
+
+def test_a_stale_prompt_is_fetched_again_on_the_next_call(
+    prompt_library: PromptLibrary,
 ) -> None:
     prompt_library.add("summary", "one {{text}}", environments=("production",))
     fetch(environment="production")
     # Someone moves the label in the Opik UI.
     prompt_library.add("summary", "two {{text}}", environments=("production",))
-    monkeypatch.setattr(prompts, "PROMPT_CACHE_TTL_SECONDS", 0)
+    make_stale()
+
+    assert fetch(environment="production").version == "v2"
+
+
+def test_a_slow_refresh_serves_the_stale_prompt(
+    monkeypatch: pytest.MonkeyPatch, prompt_library: PromptLibrary
+) -> None:
+    prompt_library.add("summary", "one {{text}}", environments=("production",))
+    fetch(environment="production")
+    prompt_library.add("summary", "two {{text}}", environments=("production",))
+    make_stale()
+    prompt_library.delay_seconds = 0.3
+    monkeypatch.setattr(prompts, "COLD_FETCH_DEADLINE_SECONDS", 0.05)
 
     stale = fetch(environment="production")
     wait_for_fetches()
     fresh = fetch(environment="production")
 
     assert (stale.version, fresh.version) == ("v1", "v2")
+
+
+def test_the_cache_keeps_the_most_recently_used(
+    monkeypatch: pytest.MonkeyPatch, prompt_library: PromptLibrary
+) -> None:
+    monkeypatch.setattr(prompts, "PROMPT_CACHE_MAX_ENTRIES", 2)
+    for text in ("one", "two", "three"):
+        prompt_library.add("summary", f"{text} {{{{text}}}}")
+    fetch(version="v1")
+    fetch(version="v2")
+    fetch(version="v1")
+    fetch(version="v3")
+    prompt_library.retrievals = 0
+
+    fetch(version="v1")
+    fetch(version="v3")
+    fetch(version="v2")
+
+    assert prompt_library.retrievals == 1
 
 
 def test_with_tracing_off_the_embedded_default_is_used_unmarked(
@@ -672,6 +755,22 @@ def test_the_registry_is_chosen_by_name(
 
     assert isinstance(registry, FilePromptRegistry)
     assert registry.directory == tmp_path
+
+
+def test_the_file_registry_serves_the_configured_labels(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "summary.prompt.yaml").write_text(
+        render_export("summary", PROJECT, DEFAULT), encoding="utf-8"
+    )
+    monkeypatch.setenv("OL_LLM_PROMPT_REGISTRY", "file")
+    monkeypatch.setenv("OL_LLM_PROMPT_REGISTRY_PATH", str(tmp_path))
+    monkeypatch.setenv("OL_LLM_PROMPT_REGISTRY_LABELS", "production, ci")
+
+    # The label defaults to Settings.environment, ci in these tests.
+    prompt = fetch()
+
+    assert (prompt.source, prompt.version) == ("registry", "v1")
 
 
 def test_the_default_registry_is_opik() -> None:

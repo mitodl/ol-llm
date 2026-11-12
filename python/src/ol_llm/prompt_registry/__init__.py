@@ -1,7 +1,10 @@
 """The prompt registry, chosen by name like memory backends (library spec §8.3).
 
 ``OL_LLM_PROMPT_REGISTRY`` names it: ``opik`` (the default), or ``file`` with
-``OL_LLM_PROMPT_REGISTRY_PATH`` set to an app's exports directory. Another package
+``OL_LLM_PROMPT_REGISTRY_PATH`` set to an app's exports directory. The file registry
+serves each export under ``production``, or under the comma-separated labels in
+``OL_LLM_PROMPT_REGISTRY_LABELS``; a test or a local run that fetches by the
+deployment environment adds that environment there. Another package
 adds a registry with an entry point in the ``ol_llm.prompt_registries`` group,
 naming a factory that takes the environment mapping and returns a
 ``PromptRegistry``, or in code with ``register_prompt_registry``. A host that
@@ -15,7 +18,7 @@ from importlib.metadata import entry_points
 from pathlib import Path
 
 from ol_llm.loops import register_at_fork
-from ol_llm.prompt_registry.files import FilePromptRegistry
+from ol_llm.prompt_registry.files import PRODUCTION, FilePromptRegistry
 from ol_llm.prompt_registry.interface import (
     PromptRegistry,
     RegistryUnavailableError,
@@ -39,6 +42,7 @@ __all__ = [
 ENTRY_POINT_GROUP = "ol_llm.prompt_registries"
 _ENV_NAME = "OL_LLM_PROMPT_REGISTRY"
 _ENV_PATH = "OL_LLM_PROMPT_REGISTRY_PATH"
+_ENV_LABELS = "OL_LLM_PROMPT_REGISTRY_LABELS"
 DEFAULT_REGISTRY = "opik"
 
 RegistryFactory = Callable[[Mapping[str, str]], PromptRegistry]
@@ -49,7 +53,10 @@ def _file(env: Mapping[str, str]) -> PromptRegistry:
     if not (path := env.get(_ENV_PATH)):
         msg = f"the file prompt registry needs {_ENV_PATH}, the exports directory"
         raise ValueError(msg)
-    return FilePromptRegistry(Path(path))
+    labels = env.get(_ENV_LABELS) or PRODUCTION
+    return FilePromptRegistry(
+        Path(path), labels=[label.strip() for label in labels.split(",")]
+    )
 
 
 _lock = threading.Lock()

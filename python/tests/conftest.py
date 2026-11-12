@@ -183,10 +183,14 @@ class PromptLibrary:
         return 404, {"errors": [f"no fake for {method} {path}"]}
 
     def _by_id(self, version_id: str) -> tuple[int, Any]:
+        # Without template_structure: the SDK treats it as the prompt's field,
+        # which a version read by id may not carry.
         for versions in self.prompts.values():
             for version in versions:
                 if version["id"] == version_id:
-                    return 200, version
+                    return 200, {
+                        k: v for k, v in version.items() if k != "template_structure"
+                    }
         return 404, {"errors": ["version not found"]}
 
     def _retrieve(self, request: dict[str, Any]) -> tuple[int, Any]:
