@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          version: "0.12.20"
+          version: "0.13.7"
           python-version: ${{ matrix.python-version }}
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -38,7 +38,7 @@ jobs:
   newest-dependencies:
     # Consumers resolve their own versions, which run ahead of uv.lock. The
     # harness extra pins slim exactly and would hold it at the lock's version,
-    # and the tests use neither it nor the memory extra.
+    # and the tests don't use it.
     name: test (newest dependencies, Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
@@ -52,13 +52,13 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          version: "0.12.20"
+          version: "0.13.7"
           python-version: ${{ matrix.python-version }}
       - name: Install the newest releases the extras allow
         run: |
           uv venv "$RUNNER_TEMP/newest"
           uv pip install --python "$RUNNER_TEMP/newest" \
-            "./python[anthropic,bedrock,google,mistral,openai,pydantic-ai,langchain]" "pytest>=8.4"
+            "./python[anthropic,bedrock,google,mistral,openai,pydantic-ai,langchain,memory]" "pytest>=8.4" "asgiref>=3.8"
           uv pip list --python "$RUNNER_TEMP/newest"
       - name: Test
         run: '"$RUNNER_TEMP/newest/bin/python" -m pytest python/tests'
@@ -74,7 +74,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          version: "0.12.20"
+          version: "0.13.7"
           python-version: "3.14"
       - name: Install ol-llm alone
         run: |
@@ -133,7 +133,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          version: "0.12.20"
+          version: "0.13.7"
           python-version: "3.14"
       - name: Install
         run: uv sync --frozen
@@ -152,14 +152,16 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          version: "0.12.20"
+          version: "0.13.7"
       - name: Fetch edx-platform master requirements
         run: |
           curl -fsSL -o "$RUNNER_TEMP/edx-base.txt" \
             https://raw.githubusercontent.com/openedx/edx-platform/master/requirements/edx/base.txt
       - name: Resolve ol-llm[openai] under edx-platform pins
+        # --no-config: edxapp never sees the root pyproject.toml's [tool.uv]
+        # settings (e.g. constraint-dependencies), which shape this repo's lock only.
         run: |
-          echo "./python[openai]" | uv pip compile - \
+          echo "./python[openai]" | uv pip compile --no-config - \
             -c "$RUNNER_TEMP/edx-base.txt" \
             --python-version 3.12 \
             -o "$RUNNER_TEMP/resolved.txt"

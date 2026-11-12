@@ -55,6 +55,8 @@ from ol_llm.errors import (
     LLMRejected,
     LLMUnavailable,
 )
+from ol_llm.loops import close_thread_loop, run_coroutine
+from ol_llm.pointers import load_default
 from ol_llm.policy import (
     CallPolicy,
     Profile,
@@ -125,7 +127,6 @@ _LAZY_EXPORTS = {
 # What each extra installs that the lazily imported modules import directly.
 _EXTRA_MODULES = {
     "pydantic_ai": "pydantic-ai",
-    "httpx2": "pydantic-ai",
     "langchain_core": "langchain",
 }
 
@@ -171,6 +172,7 @@ __all__ = [
     "celery_rate_limit",
     "check_chat_model",
     "check_model_ids",
+    "close_thread_loop",
     "complete",
     "complete_sync",
     "configure",
@@ -184,10 +186,12 @@ __all__ = [
     "get_prompt",
     "get_settings",
     "load_catalog",
+    "load_default",
     "process_batch",
     "promote_prompt",
     "resolve_policy",
     "run",
+    "run_coroutine",
     "run_stream",
     "run_sync",
     "trace_fields",

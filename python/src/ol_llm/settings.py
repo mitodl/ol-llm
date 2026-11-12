@@ -8,6 +8,8 @@ Provider credentials are not read here. Each provider SDK reads its own variable
 (``OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``, ``AZURE_OPENAI_ENDPOINT``,
 ``GOOGLE_API_KEY``, ``MISTRAL_API_KEY``, ``TOGETHER_API_KEY``), and Bedrock and
 Vertex use the default credential chain, which covers IRSA and workload identity.
+A host that configures in code can pass Together's key and an Azure token provider
+on ``Settings`` instead.
 """
 
 import inspect
@@ -15,6 +17,8 @@ import os
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+
+from ol_llm.loops import register_at_fork
 
 _ENV_PREFIX = "OL_LLM"
 
@@ -52,11 +56,14 @@ class Settings:
         It must be synchronous: every event loop's Azure client shares it, and an
         ``azure.identity.aio`` credential binds its session and locks to the first
         loop that awaits it.
+    :param together_api_key: the Together AI API key; ``None`` reads
+        ``TOGETHER_API_KEY``.
     """
 
     environment: str
     gateway_routes: Mapping[str, GatewayRoute] = field(default_factory=dict)
     azure_ad_token_provider: Callable[[], str] | None = field(default=None, repr=False)
+    together_api_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Reject an empty environment and routes for unknown families.
@@ -114,6 +121,15 @@ class Settings:
 
 _lock = threading.Lock()
 _settings: Settings | None = None
+
+
+def _after_fork_in_child() -> None:
+    # A parent thread may have held it at the fork, and won't release it here.
+    global _lock  # noqa: PLW0603
+    _lock = threading.Lock()
+
+
+register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def configure(settings: Settings) -> None:

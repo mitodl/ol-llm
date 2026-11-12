@@ -18,7 +18,6 @@ import traceback
 from collections.abc import Awaitable, Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import cache
 from typing import Any, TypeVar
 
 import opik
@@ -31,7 +30,7 @@ from opik.decorator.tracker import OpikTrackDecorator
 from opik.types import ErrorInfoDict
 
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution, TraceFields, trace_fields
-from ol_llm.catalog import embedding_entry, status_tags
+from ol_llm.catalog import CachedCheck, embedding_entry, status_tags
 from ol_llm.policy import UseCase, resolve_policy
 from ol_llm.prompts import ManagedPrompt, attach_prompt
 from ol_llm.settings import get_settings
@@ -96,23 +95,13 @@ class TracedCall:
             prompt_version=prompt.version if prompt else None,
         )
 
-    def track(self, func: Callable[..., _T]) -> Callable[..., _T]:
-        """Wrap ``func`` in the call's root trace, as ``trace_scope`` opens it.
-
-        The trace's input is ``func``'s arguments and its output what it returns.
-        """
-
-        def traced(*args: object) -> _T:
-            with self.trace_scope(func, *args) as outcome:
-                result = outcome.value = func(*args)
-            return result
-
-        return traced
-
     def track_async(
         self, func: Callable[..., Awaitable[_T]]
     ) -> Callable[..., Awaitable[_T]]:
-        """Wrap the coroutine function ``func`` in the call's root trace."""
+        """Wrap the coroutine function ``func`` in the call's root trace.
+
+        The trace's input is ``func``'s arguments and its output what it returns.
+        """
 
         async def traced(*args: object) -> _T:
             with self.trace_scope(func, *args) as outcome:
@@ -212,11 +201,12 @@ class TracedCall:
         )
 
 
-@cache
+@CachedCheck
 def _model_tags(use_case: UseCase) -> tuple[str, ...]:
     """Check a use case's embedding model once, as ``embed`` does per embedder.
 
-    A rejected use case raises every time; an unlisted or deprecated one warns once.
+    A rejected use case raises every time; an unlisted or deprecated one warns once,
+    until its use case falls out of ``UseCaseCache``.
     """
     return status_tags([embedding_entry(use_case)])
 

@@ -6,7 +6,9 @@ exception and the trace and is never shown to users.
 """
 
 import copy
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar, Self, TypeVar
+
+_E = TypeVar("_E", bound=Exception)
 
 
 class LLMError(Exception):
@@ -42,9 +44,7 @@ class LLMError(Exception):
         return copy.copy(self)
 
 
-def _rebuild(
-    cls: type[LLMError], args: tuple[object, ...], state: dict[str, object]
-) -> LLMError:
+def _rebuild(cls: type[_E], args: tuple[object, ...], state: dict[str, object]) -> _E:
     error = cls.__new__(cls)
     error.args = args
     error.__dict__.update(state)

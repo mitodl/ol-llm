@@ -1,3 +1,5 @@
+import asyncio
+import gc
 import gzip
 import json
 import os
@@ -5,17 +7,19 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Generator, Sequence
+import weakref
+from collections.abc import Generator, Mapping, Sequence
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import ModuleType
 from typing import Any
 
 import ol_llm.catalog as catalog_module
 import pytest
-from ol_llm import GatewayRoute, UseCase, models, tracing
+from ol_llm import GatewayRoute, UseCase, loops, models, tracing
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.settings import Settings, configure
-from ol_llm.tracing import TracingConfig, configure_tracing
+from ol_llm.tracing import KeycloakClient, TracingConfig, configure_tracing
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -53,6 +57,7 @@ class PromptLibrary:
             self.environments = {"development", "staging", "production"}
             self.retrievals = 0
             self.delay_seconds = 0.0
+            self.authorizations: list[str | None] = []
 
     def add(  # noqa: PLR0913
         self,
@@ -90,10 +95,14 @@ class PromptLibrary:
                 for v in self.prompts[project_name, name]
             }
 
-    def handle(self, method: str, path: str, body: bytes) -> tuple[int, Any] | None:
+    def handle(
+        self, method: str, path: str, body: bytes, authorization: str | None
+    ) -> tuple[int, Any] | None:
         """Answer a prompt request, or return ``None`` for any other path."""
         if not path.startswith(_PROMPTS):
             return None
+        with self._lock:
+            self.authorizations.append(authorization)
         request = json.loads(gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body)
         if method == "POST" and path == f"{_PROMPTS}/retrieve":
             time.sleep(self.delay_seconds)
@@ -178,11 +187,21 @@ PROMPTS = PromptLibrary()
 
 
 class AcceptingOpik(BaseHTTPRequestHandler):
-    """Accepts every SDK request, so the SDK has nothing to queue and replay."""
+    """Accepts every SDK request, so the SDK has nothing to queue and replay.
+
+    Also answers Keycloak token requests at ``KEYCLOAK_PATH``.
+    """
 
     def _accept(self) -> None:
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        if (answer := PROMPTS.handle(self.command, self.path, body)) is not None:
+        answer = (
+            (200, TOKEN_REPLY)
+            if self.path == KEYCLOAK_PATH
+            else PROMPTS.handle(
+                self.command, self.path, body, self.headers.get("Authorization")
+            )
+        )
+        if answer is not None:
             status, payload = answer
             data = json.dumps(payload).encode() if payload is not None else b""
             self.send_response(status)
@@ -214,6 +233,12 @@ class AcceptingOpik(BaseHTTPRequestHandler):
 _opik = ThreadingHTTPServer(("127.0.0.1", 0), AcceptingOpik)
 threading.Thread(target=_opik.serve_forever, daemon=True).start()
 OPIK_URL = f"http://127.0.0.1:{_opik.server_address[1]}/api"
+KEYCLOAK_PATH = "/keycloak/token"
+OPIK_KEYCLOAK = KeycloakClient(
+    token_url=f"http://127.0.0.1:{_opik.server_address[1]}{KEYCLOAK_PATH}",
+    client_id="ol-opik-client",
+    client_secret="secret",
+)
 
 # The SDK reads these when it first builds its client, which no import does.
 # Tests read root traces with opik.record_traces_locally and model spans from the
@@ -226,6 +251,32 @@ TRACING = TracingConfig()
 
 # A frame of a traceback that names where each frame is and quotes nothing.
 _FRAME = re.compile(r'  File ".+", line \d+, in \S+')
+
+
+RELEASE_TIMEOUT_SECONDS = 5
+
+
+def released(ref: weakref.ref[Any]) -> bool:
+    """Return whether ``ref``'s object is collected within a few seconds.
+
+    An anyio worker thread (Bedrock's requests run on one) keeps its loop until
+    the thread has finished unwinding, a moment after the run returns.
+    """
+    deadline = time.monotonic() + RELEASE_TIMEOUT_SECONDS
+    while True:
+        gc.collect()
+        if ref() is None:
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.01)
+
+
+def runner_loop() -> asyncio.AbstractEventLoop:
+    """Return the calling thread's ol-llm loop, the one its sync calls ran on."""
+    loop = loops._thread.loop  # noqa: SLF001
+    assert loop is not None
+    return loop
 
 
 def opik_context_is_empty() -> bool:
@@ -271,16 +322,21 @@ def clear_policy_env(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(name)
 
 
-@pytest.fixture(autouse=True)
-def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
-    """Record backoff waits instead of sleeping."""
+def record_sleeps(monkeypatch: pytest.MonkeyPatch, module: ModuleType) -> list[float]:
+    """Replace ``module._sleep`` so backoff waits are recorded instead of slept."""
     recorded: list[float] = []
 
     async def record(delay: float) -> None:
         recorded.append(delay)
 
-    monkeypatch.setattr(models, "_sleep", record)
+    monkeypatch.setattr(module, "_sleep", record)
     return recorded
+
+
+@pytest.fixture(autouse=True)
+def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record backoff waits instead of sleeping."""
+    return record_sleeps(monkeypatch, models)
 
 
 @pytest.fixture
@@ -355,16 +411,27 @@ GEMINI_REPLY = {
         "totalTokenCount": 2,
     },
 }
+EMBEDDINGS_REPLY = {
+    "object": "list",
+    "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]}],
+    "model": "text-embedding-3-small",
+    "usage": {"prompt_tokens": 1, "total_tokens": 1},
+}
+TOKEN_REPLY = {"access_token": "token", "expires_in": 300}
+# Hindsight's answer to a recall that finds nothing.
+RECALL_REPLY: dict[str, object] = {"results": []}
 PRIMARY = "openai:gpt-4o-mini"
 # Not in the released catalog; the fixture adds it.
 GEMINI = "google:gemini-3.1-pro-preview"
 
 
 class KeepAliveProvider(BaseHTTPRequestHandler):
-    """Answers OpenAI Responses and Gemini requests over persistent connections.
+    """Answers OpenAI Responses and embeddings, Gemini, Keycloak token requests, and
+    Hindsight recalls.
 
-    Paths under ``/unavailable`` answer 503, so a chain falls back. Gemini's
-    streaming endpoint answers with one server-sent event.
+    Over persistent connections. Paths under ``/unavailable`` answer 503, so a
+    chain falls back. Gemini's streaming endpoint answers with one server-sent
+    event.
     """
 
     protocol_version = "HTTP/1.1"
@@ -378,7 +445,17 @@ class KeepAliveProvider(BaseHTTPRequestHandler):
             content_type = "text/event-stream"
             body = f"data: {json.dumps(GEMINI_REPLY)}\r\n\r\n".encode()
         else:
-            reply = GEMINI_REPLY if "generateContent" in self.path else RESPONSES_REPLY
+            reply: Mapping[str, object]
+            if self.path.endswith("/embeddings"):
+                reply = EMBEDDINGS_REPLY
+            elif self.path.endswith("/memories/recall"):
+                reply = RECALL_REPLY
+            elif self.path.endswith("/token"):
+                reply = TOKEN_REPLY
+            elif "generateContent" in self.path:
+                reply = GEMINI_REPLY
+            else:
+                reply = RESPONSES_REPLY
             body = json.dumps(reply).encode()
         self.send_response(status)
         self.send_header("content-type", content_type)
@@ -390,19 +467,27 @@ class KeepAliveProvider(BaseHTTPRequestHandler):
         pass
 
 
+@pytest.fixture
+def keepalive_url(provider_env: None) -> Generator[str]:  # noqa: ARG001
+    """Serve ``KeepAliveProvider`` and return its base URL."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), KeepAliveProvider)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{server.server_address[1]}"
+    server.shutdown()
+    server.server_close()
+
+
 @pytest.fixture(
     params=[(PRIMARY,), (GEMINI,), (PRIMARY, GEMINI)],
     ids=["openai", "google", "openai-then-google"],
 )
 def real_client(
-    provider_env: None,  # noqa: ARG001
+    keepalive_url: str,
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
-) -> Generator[UseCase]:
-    server = ThreadingHTTPServer(("127.0.0.1", 0), KeepAliveProvider)
-    server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    url = f"http://127.0.0.1:{server.server_address[1]}"
+) -> UseCase:
+    url = keepalive_url
     monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", url)
     gemini = CatalogEntry(
         id=GEMINI,
@@ -417,15 +502,13 @@ def real_client(
     prefix = "/unavailable" if fallbacks else ""
     route = GatewayRoute(base_url=f"{url}{prefix}/v1", api_key="app-key")
     configure(Settings(environment="ci", gateway_routes={"openai": route}))
-    yield UseCase(
+    return UseCase(
         app="mit-learn",
         name="summary",
         profile="request",
         model=model,
         fallback_models=tuple(fallbacks),
     )
-    server.shutdown()
-    server.server_close()
 
 
 @pytest.fixture

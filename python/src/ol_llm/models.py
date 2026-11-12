@@ -7,6 +7,7 @@ the extra for each provider a use case names.
 """
 
 import asyncio
+import inspect
 import os
 import random
 import sys
@@ -16,6 +17,7 @@ from collections.abc import (
     Awaitable,
     Callable,
     Generator,
+    Hashable,
     Iterator,
     Mapping,
     Sequence,
@@ -30,7 +32,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial
 from types import TracebackType
-from typing import Any, Generic, NoReturn, Self, TypeVar, cast, overload
+from typing import Any, NoReturn, Self, TypeVar, cast, overload
 
 import anyio
 import httpx
@@ -41,6 +43,7 @@ from pydantic_ai.capabilities import (
     Instrumentation,
     RaiseContentFilterError,
 )
+from pydantic_ai.embeddings import EmbeddingModel
 from pydantic_ai.exceptions import (
     ContentFilterError,
     FallbackExceptionGroup,
@@ -76,7 +79,13 @@ from pydantic_ai.settings import ModelSettings, merge_model_settings
 from pydantic_ai.usage import RequestUsage, UsageLimits
 
 from ol_llm.attribution import USE_CASE_HEADER, Attribution
-from ol_llm.catalog import CatalogEntry, catalog_entries, status_tags
+from ol_llm.catalog import (
+    CatalogEntry,
+    UseCaseCache,
+    catalog_entries,
+    is_cataloged,
+    status_tags,
+)
 from ol_llm.errors import (
     LLMBudgetExceeded,
     LLMContentFiltered,
@@ -86,13 +95,14 @@ from ol_llm.errors import (
     LLMRejected,
     LLMUnavailable,
 )
+from ol_llm.loops import LoopLocal, register_at_fork
 from ol_llm.policy import CallPolicy, Profile, UseCase, resolve_policy
 from ol_llm.settings import GatewayRoute, Settings, get_settings
 from ol_llm.tracing import include_content, tracer_provider
 
 OutputT = TypeVar("OutputT")
 _T = TypeVar("_T")
-_V = TypeVar("_V")
+_K = TypeVar("_K", bound=Hashable)
 _NO_DEPS: type[None] = type(None)
 DepsT = TypeVar("DepsT")
 
@@ -129,9 +139,6 @@ _TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
 
 _OPENAI_PROVIDERS = frozenset({"openai", "openai-chat", "openai-responses"})
 _AZURE_PROVIDERS = frozenset({"azure", "azure-responses"})
-# TogetherProvider's own base URL; the provider cannot be given a client built
-# with retries off any other way.
-_TOGETHER_BASE_URL = "https://api.together.xyz/v1"
 
 SUPPORTED_PROVIDERS = frozenset(
     {
@@ -156,46 +163,73 @@ _model_override: ContextVar[Model | Mapping[str, Model] | None] = ContextVar(
 _answers: ContextVar[list[str] | None] = ContextVar("ol_llm_answers", default=None)
 
 
-class LoopLocal(threading.local, Generic[_V]):
-    """A value built once for each event loop that uses it, kept by the loop's thread.
+async def close_provider_model(model: Model | EmbeddingModel) -> None:
+    """Close the HTTP client of a provider model built for one event loop.
 
-    For what holds provider clients, which bind to the loop they first run on: a
-    pooled ``httpx`` connection belongs to that loop's transport, and SDK clients
-    keep asyncio locks and events (a provider's own enter lock among them). Shared
-    across loops, they fail with "bound to a different event loop", or "Event loop
-    is closed" once the first loop is gone, which is what ``run_sync`` from a
-    thread pool and ``asyncio.run`` per task do. A loop runs on one thread, so
-    keeping the values per thread loses nothing, and a worker thread's loop, which
-    ``run_sync`` never closes, is released with the thread.
+    A provider that made its own client (Google, Mistral, Together) owns it; one
+    given an SDK client (OpenAI, Azure, Anthropic) leaves it to its maker, which is
+    ol-llm here. Bedrock's boto3 client is synchronous and shared by every loop
+    (see ``provider_factory``), so it stays open, as does a test's own model.
 
-    :param build: builds the value; called again for each new loop.
+    :param model: the provider model.
     """
-
-    def __init__(self, build: Callable[[], _V]) -> None:
-        """Start empty; ``threading.local`` runs this again in each new thread."""
-        self._build = build
-        self._values: dict[asyncio.AbstractEventLoop, _V] = {}
-
-    def get(self) -> _V:
-        """Return the running loop's value, dropping the values of closed loops.
-
-        :returns: the value.
-        :rtype: _V
-        :raises RuntimeError: if no event loop is running.
-        """
-        loop = asyncio.get_running_loop()
-        for closed in [other for other in self._values if other.is_closed()]:
-            del self._values[closed]
-        if (value := self._values.get(loop)) is None:
-            value = self._values[loop] = self._build()
-        return value
+    # Chat and embedding models both keep their provider here; only chat models
+    # expose it as a property.
+    provider: Provider[Any] | None = getattr(model, "_provider", None)
+    if provider is None:
+        return
+    if (own := provider._own_http_client) is not None:  # noqa: SLF001
+        await own.aclose()
+        return
+    close = getattr(provider.client, "close", None)
+    if close is not None and inspect.iscoroutinefunction(close):
+        await close()
 
 
 # The models complete runs on, by use case, with the settings each was built with.
 # The lock keeps two threads' first calls from building a use case twice, which for
 # Bedrock would also create boto3 clients concurrently from the default session.
-_shared_models: dict[UseCase, tuple[Settings, Model]] = {}
+_shared_models: UseCaseCache[UseCase, tuple[Settings, Model]] = UseCaseCache(
+    is_cataloged
+)
 _shared_models_lock = threading.Lock()
+
+
+def _after_fork_in_child() -> None:
+    # A parent thread may have held it at the fork, and won't release it here.
+    global _shared_models_lock  # noqa: PLW0603
+    _shared_models_lock = threading.Lock()
+
+
+register_at_fork(after_in_child=_after_fork_in_child)
+
+
+def reuse_or_build(
+    shared: UseCaseCache[_K, tuple[Settings, _T]],
+    key: _K,
+    settings: Settings,
+    build: Callable[[], _T],
+) -> _T:
+    """Return the value kept for a key, built anew if missing or under old settings.
+
+    A value ``shared`` drops (see ``UseCaseCache``) is dropped as one replaced after
+    ``configure`` is: a call still using it keeps it until that call ends, and its
+    loop-local clients are not closed.
+
+    :param shared: the values, by key, with the settings each was built with. The
+        caller holds the lock that keeps two threads from building one twice.
+    :param key: what the value is built for.
+    :param settings: the settings in force.
+    :param build: builds the value under ``settings``.
+    :returns: the value.
+    :rtype: _T
+    """
+    kept = shared.get(key)
+    if kept is None or kept[0] is not settings:
+        kept = (settings, build())
+        shared.put(key, kept)
+    return kept[1]
+
 
 # Patched in tests so retries do not wait.
 _sleep: Callable[[float], Any] = asyncio.sleep
@@ -527,7 +561,9 @@ class PolicyModel(WrapperModel):
         self.catalog_entry = catalog_entry
         self.profile_name = use_case.profile
         self.policy = policy
-        self._loop_models = None if build is None else LoopLocal(build)
+        self._loop_models = (
+            None if build is None else LoopLocal(build, close_provider_model)
+        )
 
     def _loop_model(self) -> Model:
         """Return the provider model for the running event loop."""
@@ -555,7 +591,7 @@ class PolicyModel(WrapperModel):
         An agent calls this at the start of every run. ``WrapperModel`` would refresh
         ``wrapped``, whose provider then records the run's loop as the one its client
         is used on and keeps it alive as long as the model, which ``shared_model``
-        keeps for the life of the process.
+        can keep for the life of the process.
         """
         self._loop_model()._refresh_http_client()  # noqa: SLF001
 
@@ -565,9 +601,15 @@ class PolicyModel(WrapperModel):
         model_settings: ModelSettings | None,
         model_request_parameters: ModelRequestParameters,
     ) -> RequestUsage:
-        """Count tokens with the running loop's provider model."""
-        return await self._loop_model().count_tokens(
-            messages, model_settings, model_request_parameters
+        """Count tokens under the policy, as a request is made.
+
+        A run counts before every request when its usage limits set
+        ``count_tokens_before_request``, and the count is a provider request too.
+        """
+        settings = self._with_timeout(model_settings)
+        provider = self._loop_model()
+        return await self._retrying(
+            lambda: provider.count_tokens(messages, settings, model_request_parameters)
         )
 
     async def cancel_suspended_response(self, response: ModelResponse) -> None:
@@ -601,6 +643,15 @@ class PolicyModel(WrapperModel):
     def _retry_delay(self, exc: Exception, budget: _RetryBudget) -> float:
         return _retry_delay(exc, budget, use_case=self.use_case, model=self.catalog_id)
 
+    async def _retrying(self, attempt: Callable[[], Awaitable[_T]]) -> _T:
+        return await retrying(
+            attempt,
+            policy=self.policy,
+            profile=self.profile_name,
+            use_case=self.use_case,
+            model=self.catalog_id,
+        )
+
     async def request(
         self,
         messages: list[ModelMessage],
@@ -610,12 +661,8 @@ class PolicyModel(WrapperModel):
         """Make the request, retrying transient failures under the policy."""
         settings = self._with_timeout(model_settings)
         provider = self._loop_model()
-        response = await retrying(
-            lambda: provider.request(messages, settings, model_request_parameters),
-            policy=self.policy,
-            profile=self.profile_name,
-            use_case=self.use_case,
-            model=self.catalog_id,
+        response = await self._retrying(
+            lambda: provider.request(messages, settings, model_request_parameters)
         )
         _stamp_answered_by(response, self.catalog_id)
         return response
@@ -686,8 +733,8 @@ class PolicyFallbackModel(FallbackModel):
 
     Each model in the chain spends its own retries before the next is tried, and
     only rate limits and outages fall back (spec §6.4). When every model fails the
-    caller gets the error of the first model tried, with the whole group as
-    ``__cause__``.
+    caller gets the primary's error (on a retry, that of the model the retry starts
+    at), with the whole group as ``__cause__``.
 
     A request that asks the model to retry its last response (invalid output, or a
     tool's ``ModelRetry``) starts at the model that gave that response, so the retry
@@ -734,8 +781,7 @@ class PolicyFallbackModel(FallbackModel):
         ids = [cast("PolicyModel", model).catalog_id for model in self.models]
         if answered_by not in ids[1:]:
             return self
-        start = ids.index(answered_by)
-        return FallbackModel(*self.models[start:], fallback_on=FALLBACK_ON)
+        return _ChainTail(self, ids.index(answered_by))
 
     async def request(
         self,
@@ -744,15 +790,13 @@ class PolicyFallbackModel(FallbackModel):
         model_request_parameters: ModelRequestParameters,
     ) -> ModelResponse:
         """Try each model in turn."""
+        chain = self._starting_at(messages)
         try:
             return await FallbackModel.request(
-                self._starting_at(messages),
-                messages,
-                model_settings,
-                model_request_parameters,
+                chain, messages, model_settings, model_request_parameters
             )
         except FallbackExceptionGroup as group:
-            if (primary := _primary_error(group)) is None:
+            if (primary := _primary_error(group, chain)) is None:
                 raise
             raise primary from group
 
@@ -765,8 +809,9 @@ class PolicyFallbackModel(FallbackModel):
         run_context: RunContext[Any] | None = None,
     ) -> AsyncGenerator[StreamedResponse]:
         """Open a stream on each model in turn; fall back only while opening."""
+        chain = self._starting_at(messages)
         stream_cm = FallbackModel.request_stream(
-            self._starting_at(messages),
+            chain,
             messages,
             model_settings,
             model_request_parameters,
@@ -775,11 +820,37 @@ class PolicyFallbackModel(FallbackModel):
         try:
             stream = await stream_cm.__aenter__()
         except FallbackExceptionGroup as group:
-            if (primary := _primary_error(group)) is None:
+            if (primary := _primary_error(group, chain)) is None:
                 raise
             raise primary from group
         async with _exit_with(stream_cm):
             yield stream
+
+
+@dataclass(init=False)
+class _ChainTail(FallbackModel):
+    """The members of a chain from one of them on, named as the whole chain.
+
+    Instrumentation opens a request's span under the name of the model the agent
+    holds, the whole chain, and ``FallbackModel`` names the member that answered
+    only on a span opened under its own name.
+    """
+
+    chain_name: str
+
+    def __init__(self, chain: FallbackModel, start: int) -> None:
+        """Take ``chain``'s members from ``start`` on.
+
+        :param chain: the whole chain.
+        :param start: the index of the member the request starts at.
+        """
+        super().__init__(*chain.models[start:], fallback_on=FALLBACK_ON)
+        self.chain_name = chain.model_name
+
+    @property
+    def model_name(self) -> str:
+        """The whole chain's name."""
+        return self.chain_name
 
 
 @asynccontextmanager
@@ -796,10 +867,23 @@ async def _exit_with(
         await stream_cm.__aexit__(None, None, None)
 
 
-def _primary_error(group: FallbackExceptionGroup) -> LLMError | None:
-    """Return a copy of the primary model's error to raise in place of the group."""
-    primary = group.exceptions[0]
-    return primary.copy() if isinstance(primary, LLMError) else None
+def _primary_error(
+    group: FallbackExceptionGroup, chain: FallbackModel
+) -> LLMError | None:
+    """Return a copy of the chain's first member's error, to raise for the group.
+
+    The first member is the primary, or on a retry the member that gave the response
+    being retried. A request continuing a suspended response (OpenAI background
+    mode) first tries the member that holds it, then the whole chain, so the group
+    can open with that member's error; the first member's own comes later.
+    """
+    first = cast("PolicyModel", chain.models[0]).catalog_id
+    errors = [
+        exc
+        for exc in group.exceptions
+        if isinstance(exc, LLMError) and exc.model == first
+    ]
+    return errors[-1].copy() if errors else None
 
 
 def _gateway_headers(route: GatewayRoute | None, use_case: UseCase) -> dict[str, str]:
@@ -881,7 +965,9 @@ def _bedrock_client(policy: CallPolicy) -> Any:  # noqa: ANN401
         connect_timeout=policy.timeout_seconds,
         retries={"total_max_attempts": 1},
     )
-    return boto3.client("bedrock-runtime", config=config)
+    # A session of its own: boto3's default session isn't thread-safe, and other
+    # models' factories build their clients on other threads at the same time.
+    return boto3.session.Session().client("bedrock-runtime", config=config)
 
 
 def _bedrock_provider(client: Any) -> Provider[Any]:  # noqa: ANN401
@@ -926,20 +1012,18 @@ def _mistral_provider() -> Provider[Any]:
     return MistralProvider()
 
 
-def _together_provider() -> Provider[Any]:
+def _together_provider(settings: Settings) -> Provider[Any]:
     try:
-        from openai import AsyncOpenAI, DefaultAsyncHttpxClient  # noqa: PLC0415
         from pydantic_ai.providers.together import TogetherProvider  # noqa: PLC0415
     except ImportError as exc:
         _raise_missing_extra("openai", exc)
-    # AsyncOpenAI reads OPENAI_API_KEY by default; Together's key has its own name.
-    client = AsyncOpenAI(
-        max_retries=0,
-        http_client=DefaultAsyncHttpxClient(),
-        base_url=_TOGETHER_BASE_URL,
-        api_key=os.environ["TOGETHER_API_KEY"],
+    # The provider knows Together's base URL and makes its own client, which it
+    # closes on exit. The client reads max_retries on every request.
+    provider = TogetherProvider(
+        api_key=settings.together_api_key or os.environ["TOGETHER_API_KEY"]
     )
-    return TogetherProvider(openai_client=client)
+    provider.client.max_retries = 0
+    return provider
 
 
 def provider_factory(
@@ -949,16 +1033,18 @@ def provider_factory(
 
     :param use_case: the call site, for the gateway header.
     :param policy: the resolved policy, for the client timeouts.
-    :param settings: the gateway routes and Azure credentials.
+    :param settings: the gateway routes, Azure credentials, and Together key.
     :returns: a factory from a provider name to the provider.
     :rtype: Callable[[str], Provider[Any]]
 
     It runs again for each event loop a model's requests run on (see
-    ``PolicyModel``). The boto3 client is synchronous, so every loop shares the
-    first one built: creating clients from boto3's default session on several
-    threads at once is not thread-safe.
+    ``PolicyModel``). The boto3 client is synchronous, so every loop in a process
+    shares the first one built there, under a per-process lock. A forked child
+    builds its own rather than share the parent's pooled connection.
     """
-    bedrock_clients: list[Any] = []
+    bedrock_clients: dict[int, Any] = {}
+    # One per process, so a child never waits on a lock held at the fork.
+    bedrock_locks: dict[int, threading.Lock] = {}
 
     def factory(provider: str) -> Provider[Any]:  # noqa: PLR0911
         if provider in _OPENAI_PROVIDERS:
@@ -972,15 +1058,17 @@ def provider_factory(
                 settings.gateway_routes.get("anthropic"), use_case
             )
         if provider == "bedrock":
-            if not bedrock_clients:
-                bedrock_clients.append(_bedrock_client(policy))
-            return _bedrock_provider(bedrock_clients[0])
+            pid = os.getpid()
+            with bedrock_locks.setdefault(pid, threading.Lock()):
+                if (client := bedrock_clients.get(pid)) is None:
+                    client = bedrock_clients[pid] = _bedrock_client(policy)
+            return _bedrock_provider(client)
         if provider in {"google", "google-cloud"}:
             return _google_provider(provider, policy)
         if provider == "mistral":
             return _mistral_provider()
         if provider == "together":
-            return _together_provider()
+            return _together_provider(settings)
         msg = (
             f"ol-llm does not build {provider!r} models; "
             f"supported providers are {sorted(SUPPORTED_PROVIDERS)}"
@@ -1440,8 +1528,9 @@ def shared_model(use_case: UseCase) -> Model:
 
     Built on the first call for a use case and reused on every thread and event
     loop, since ``PolicyModel`` keeps a provider model per loop. A model is rebuilt
-    after ``configure`` replaces the settings. Under ``override_models`` every call
-    builds a new one, so an override never outlives its block.
+    after ``configure`` replaces the settings, or once its use case has fallen out
+    of ``UseCaseCache``. Under ``override_models`` every call builds a new one, so an
+    override never outlives its block.
 
     :param use_case: the call site.
     :returns: the model.
@@ -1452,11 +1541,12 @@ def shared_model(use_case: UseCase) -> Model:
         return build_model(use_case)
     settings = get_settings()
     with _shared_models_lock:
-        cached = _shared_models.get(use_case)
-        if cached is None or cached[0] is not settings:
-            cached = (settings, build_model(use_case, settings=settings))
-            _shared_models[use_case] = cached
-    return cached[1]
+        return reuse_or_build(
+            _shared_models,
+            use_case,
+            settings,
+            lambda: build_model(use_case, settings=settings),
+        )
 
 
 def usage_limits(use_case: UseCase) -> UsageLimits:

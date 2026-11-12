@@ -43,9 +43,15 @@ The agent's model has a timeout on every request, retries rate limits and outage
 nothing else, falls back once the primary has spent its retries, and raises `LLMError`
 subclasses (`LLMRateLimited`, `LLMUnavailable`, `LLMRejected`, ...) with the provider's
 exception as the cause. Build agents once, not per request: each build creates new provider
-clients. An agent built once can run on any thread or event loop (`run_sync` from a thread pool,
-`asyncio.run` per task); its model keeps one set of provider clients per event loop, released
-with the thread that ran the loop. A call site that needs a new agent per run (per-run
+clients. An agent built once can run on any thread or event loop; its model keeps one set of
+provider clients per event loop. The `*_sync` entry points run on one long-lived event loop per
+thread that ol-llm owns, so a thread builds its clients once and reuses them on every call. Sync
+code that awaits ol-llm itself uses `ol_llm.run_coroutine(coro)` for the same reason, not
+`asyncio.run` or `async_to_sync`: those start a loop per call, and the clients built for a loop
+ol-llm does not own are dropped, not closed, once it has closed. `ol_llm.close_thread_loop()` closes
+the calling thread's loop and its clients, for a worker thread about to finish; the main
+thread's closes at exit. A forked child (a Celery prefork worker) sets the parent's loops and
+clients aside without closing them and builds its own, and gets new tracing clients too. A call site that needs a new agent per run (per-run
 instructions, output schema, or validators) builds the model once with `ol_llm.build_model` and
 each agent over it with `ol_llm.agent_over(model, ...)`, which takes the agent arguments
 `build_agent` does (`settings` belongs to `build_model`). Agents over one model share its
@@ -53,7 +59,8 @@ provider clients.
 
 Set `OL_LLM_ENVIRONMENT`, or call `ol_llm.configure(ol_llm.Settings(environment=...))` at
 startup. Provider credentials are each SDK's own (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, the AWS
-and Google default credential chains, and so on). Operators can change a use case's limits
+and Google default credential chains, and so on), except that a host configuring in code can
+pass Together's key as `Settings(together_api_key=...)`. Operators can change a use case's limits
 without a release, e.g. `OL_LLM_CONTENT_SUMMARY_TIMEOUT_SECONDS=120`.
 
 Call sites not built on PydanticAI (LangGraph, a plain SDK) apply the same numbers with
@@ -201,11 +208,14 @@ should return a partial one unchanged.
 ### Prompts
 
 Prompts live in the app's Opik project and are fetched by environment label. Each call site
-passes an embedded default: the text of the version production points at, exported into the
-image at build time.
+passes an embedded default: the text of the version production points at, which
+`ol-llm-prompts export` writes beside the pointer file and the pointer's pull request commits
+([prompt promotion](../docs/prompt-promotion.md)).
 
 ```python
-SUMMARY_PROMPT = ol_llm.TextTemplate(template=EXPORTED_TEXT, version="v7")
+SUMMARY_PROMPT = ol_llm.load_default(
+    "content-summary", directory=PROMPTS_DIR, template=ol_llm.TextTemplate
+)
 
 
 def summarize(text: str, audience: str) -> Summary:
@@ -258,14 +268,19 @@ are built on in place of the version. A run that fell back to the embedded defau
 the same key as one that fetched the same text, so an Opik outage does not trigger
 reprocessing.
 
-The CI jobs use `ol_llm.create_prompt(name, template, project_name=...)`, which adds a version
-only when the text or template type changed, and `ol_llm.promote_prompt(name, version="v7",
-environment="production", project_name=...)`, which moves one label and leaves the version's
-other labels in place. Opik seeds only `development`, `staging`, and `production`; create `ci`
-and `qa` once per instance before promoting to them. `ol_llm.fetch_prompt(name,
-project_name=..., version="v7")` (or `environment="production"`) reads one version back, text
-or chat, with no embedded default, cache, or fallback, and returns `None` when Opik has no such
-version or label, so a CI job can refuse a pointer to a version that does not exist.
+Production moves by pull request: the app's pointer file names the version production runs,
+per prompt, and `ol-llm-prompts` exports the embedded defaults for the pull request to commit,
+checks both on the pull request, and moves the `production` label on merge. [Prompt promotion](../docs/prompt-promotion.md)
+has the file format and the workflow to call.
+
+Underneath, `ol_llm.create_prompt(name, template, project_name=...)` adds a version only when
+the text or template type changed, and `ol_llm.promote_prompt(name, version="v7",
+environment="production", project_name=...)` moves one label and leaves the version's other
+labels in place. Opik seeds only `development`, `staging`, and `production`; create `ci` and
+`qa` once per instance before promoting to them. `ol_llm.fetch_prompt(name, project_name=...,
+version="v7")` (or `environment="production"`) reads one version back, text or chat, with no
+embedded default, cache, or fallback, and returns `None` when Opik has no such version or
+label.
 
 ### Embeddings
 
@@ -433,7 +448,9 @@ SUMMARY = ol_llm.UseCase(
     profile="batch",
     model="bedrock:global.anthropic.claude-haiku-4-5-20251001-v1:0",
 )
-SUMMARY_PROMPT = ol_llm.TextTemplate(template=EXPORTED_TEXT, version="v3")
+SUMMARY_PROMPT = ol_llm.load_default(
+    "feedback-summary", directory=PROMPTS_DIR, template=ol_llm.TextTemplate
+)
 
 
 @dg.asset(pool=ol_llm.dagster_pool(SUMMARY))
@@ -497,7 +514,9 @@ import ol_llm
 SUMMARY = ol_llm.UseCase(
     app="mit-learn", name="content-summary", profile="batch", model="openai:gpt-4o-mini"
 )
-SUMMARY_PROMPT = ol_llm.TextTemplate(template=EXPORTED_TEXT, version="v2")
+SUMMARY_PROMPT = ol_llm.load_default(
+    "content-summary", directory=PROMPTS_DIR, template=ol_llm.TextTemplate
+)
 FILES_PER_TASK = 20
 
 
@@ -538,7 +557,7 @@ The breaker lives in one task, so each task of a group has its own. A task time 
 (Celery `soft_time_limit`, Dagster `dagster/max_runtime`) has to sit above
 `ol_llm.worst_case_seconds(use_case)`, the longest one model request can take under the
 policy (3,300 s per model on the batch profile's defaults), or it kills a call that is still
-retrying.
+retrying. Double it for a run that counts tokens before each request.
 
 With `max_workers` above 1, rows run on threads, as in the Dagster example. `complete_sync`
 and `run_sync` over an agent built once both work there, since each thread's event loop gets
@@ -670,6 +689,127 @@ ol-llm-eval gate evaluation/feedback-summary.gate.toml --change pr-123 --report 
 [`docs/evaluation-gate.md`](../docs/evaluation-gate.md) has the declaration format and the
 reusable workflow that runs it on pull requests.
 
+### Memory
+
+`ol_llm.memory` is the one interface to learner memory (cross-session recall and durable
+facts about a learner) and general memory (facts that belong to no learner, e.g. about
+courses). The backend is chosen by configuration, not by import, so it can change without
+touching call sites: `hindsight` for the deployed service, which needs the `memory` extra,
+and `in-memory` for tests and local development, which needs none.
+
+Build one client at startup and ask it for the learner's memory at the start of each
+request, with the learner's session token as the gateway forwards it (APISIX's
+`X-Access-Token`):
+
+```python
+memory = ol_llm.memory.build_memory()  # reads OL_LLM_MEMORY_*
+
+notes = await memory.learner(session_token, use_case="tutor-recall")
+await notes.put("pace", "Has 30 minutes per weekday.")
+found = await notes.search("how much time does the learner have?", limit=3)
+everything = await notes.list()
+pace = await notes.get("pace")
+goal = await notes.get("goal", app="mit-learn")  # another app's note
+await notes.delete("pace")
+```
+
+The learner is whoever the session token belongs to. Nothing else names the learner, so
+an app can only reach the memory of a learner whose session it holds. `learner` exchanges
+the session token for a memory-service token by Keycloak standard token exchange, as the
+app's own exchange client. Exchanged tokens last 300 seconds, so call it per request and do
+not keep the handle.
+
+A learner has one memory, shared by every app. Every app reads every app's notes; an app
+writes and deletes only its own, because each note is stored under the writing app's name
+and its key (`<app>.<key>`). There is no update in place: `put` again with the same key
+replaces a note. Keys are lowercase letters, digits, `_` and `-`, and must never carry
+learner content, because the service redacts note text and metadata (emails, phone numbers,
+secrets) but not keys. Names and assessment content are not redacted, so keeping them out
+is the extraction gate's job.
+
+General memory is read with any app's learner handle (`notes.general("courses")`) and
+written only under a client-credentials grant carrying `ol-memory-general`
+(`memory.general("courses", use_case=...)`). No client holds the grant yet.
+
+Only the platform's account-deletion path forgets a learner. It runs as the platform admin
+client and deletes everything stored for the learner, for every app, in one call:
+
+```python
+removed = await memory.admin(use_case="account-deletion").forget(learner_id)
+```
+
+After a forget, writes for the learner are refused with `MemoryFenced` for an hour, so work
+still in flight cannot bring the memory back. Repeating a forget is safe, and a caller that
+gets an error must repeat it.
+
+The interface is async. Sync code (a Django view, a Celery task) wraps the client in
+`SyncMemory`, which has the same methods and runs each call on the thread's ol-llm event
+loop, as `run_coroutine` does, so the memory service's connections are reused across calls:
+
+```python
+memory = ol_llm.memory.SyncMemory(ol_llm.memory.build_memory())
+
+notes = memory.learner(session_token, use_case="tutor-recall")
+notes.put("pace", "Has 30 minutes per weekday.")
+```
+
+Do not wrap the async client in `asyncio.run` or `async_to_sync`: each call would then build
+and abandon its own connections. The library closes its connections when it shuts down a
+thread's loop, so there is nothing to close by hand.
+
+Failures raise typed errors, classified by status and type, never by message text:
+
+| Error | When | Retryable |
+| --- | --- | --- |
+| `MemoryNotFound` | `get` of a note that does not exist | no |
+| `MemoryForbidden` | a write the credential may not make, e.g. general memory with a learner token | no |
+| `MemoryFenced` | a write while the learner's memory is being forgotten | no |
+| `MemoryUnauthenticated` | the session token was refused or expired; exchange from a fresh one | no |
+| `MemoryUnavailable` (`MemoryTimeout` for a timeout) | a dropped connection, a 408, 429 or 5xx | yes |
+| `MemoryRejected` | a malformed request or a misconfigured client | no |
+| `MemoryUnsupported` | the configured backend lacks the capability | no |
+
+All of them subclass `MemoryStoreError` and carry `operation` and `status_code`. Each
+request is bounded by `OL_LLM_MEMORY_TIMEOUT_SECONDS` and is not retried, except `forget`,
+which starts over after a retryable failure, up to five attempts in all.
+
+Every operation is a span inside the calling trace, named `memory <operation>`, with the
+app, use case, environment, the `Attribution` fields, and the keys involved. Note text,
+queries, metadata and results are on the span only when `OL_LLM_TRACE_CONTENT` is on.
+
+Configuration, from the environment or as a `MemoryConfig` passed to `build_memory`:
+
+| Variable | Meaning |
+| --- | --- |
+| `OL_LLM_MEMORY_BACKEND` | `hindsight` or `in-memory`, or a backend another package registers |
+| `OL_LLM_MEMORY_APP` | the app's name as the service knows it, e.g. `learn-ai` |
+| `OL_LLM_MEMORY_URL` | the service, e.g. `http://hindsight.hindsight.svc.cluster.local:8888` |
+| `OL_LLM_MEMORY_TIMEOUT_SECONDS` | bound on each request; 10 by default |
+| `OL_LLM_MEMORY_TOKEN_URL` | the Keycloak realm's token endpoint, for every client below |
+| `OL_LLM_MEMORY_EXCHANGE_CLIENT_ID`, `_CLIENT_SECRET` | the app's exchange client, one only the app holds: learn-ai's `ol-learn-ai-client`, mit-learn's `ol-mitlearn-memory-client` |
+| `OL_LLM_MEMORY_GENERAL_CLIENT_ID`, `_CLIENT_SECRET` | a client holding the general grant, for general writes |
+| `OL_LLM_MEMORY_ADMIN_CLIENT_ID`, `_CLIENT_SECRET` | `ol-memory-admin-client`, for the forget path only |
+| `OL_LLM_MEMORY_AUDIENCE`, `OL_LLM_MEMORY_AUDIENCE_SCOPE`, `OL_LLM_MEMORY_GENERAL_SCOPE` | override the service's Keycloak names (`ol-memory-client`, `ol-memory-audience`, and `ol-memory-audience ol-memory-general`) |
+
+Each client's id and secret are set together. Leave the exchange client unset for the
+in-memory backend, which takes the session token as the learner id.
+
+Tests use the in-memory backend, which enforces the same rules as the service:
+
+```python
+store = ol_llm.memory.InMemoryStore()
+memory = ol_llm.memory.Memory(ol_llm.memory.InMemoryBackend("learn-ai", store=store))
+notes = await memory.learner("learner-1", use_case="tutor-recall")
+```
+
+A new backend implements `ol_llm.memory.MemoryBackend`, registers with
+`ol_llm.memory.register_backend` or an entry point in the `ol_llm.memory_backends` group,
+and passes the checks in `ol_llm.memory.conformance`, which the library runs against the
+in-memory backend in CI. `python/tests/test_memory_hindsight.py` runs the same checks
+against a live Hindsight when `OL_LLM_MEMORY_IT_CONFIG` names its configuration. It creates
+users and forgets them, so point it only at a disposable stack such as ol-infrastructure's
+`scripts/hindsight` harness.
+
 ### Tracing
 
 Tracing reads the variables the Opik SDK reads, so the SDK and the span exporter always send
@@ -680,7 +820,7 @@ to the same instance:
 | `OPIK_URL_OVERRIDE` | the Opik API, e.g. `https://opik-qa.ol.mit.edu/api` |
 | `OPIK_WORKSPACE` | `default` on our instances |
 | `OPIK_KEYCLOAK_TOKEN_URL`, `OPIK_KEYCLOAK_CLIENT_ID`, `OPIK_KEYCLOAK_CLIENT_SECRET` | the Keycloak client the app authenticates to Opik with; `OPIK_KEYCLOAK_SCOPE` if it needs one. Leave `OPIK_API_KEY` unset |
-| `OPIK_TRACK_DISABLE` | `true` turns tracing off, for local development without an Opik |
+| `OPIK_TRACK_DISABLE` | `true` turns tracing off, for local development without an Opik. Runs open no root trace and export no spans; SDK calls the app makes itself (prompt sync, datasets, experiments) still send the Keycloak token |
 | `OL_LLM_TRACE_CONTENT` | `false` keeps prompts, completions, tool arguments, and error messages out of traces. On by default until the data-handling policy decides |
 
 Without a call, tracing reads these the first time an agent or embedder is built or a run
@@ -697,8 +837,11 @@ SDK should drop it when it adopts the library.
 
 `ol_llm.testing.override_models` makes `build_model` and `build_agent` use PydanticAI's
 `TestModel` or `FunctionModel` in place of a provider, still under the library's retry and
-error handling. Set `OPIK_TRACK_DISABLE=true` for a test suite that should send nothing, or
-use `ol_llm.testing.tracing_disabled` around one test. `opik.record_traces_locally()`
+error handling. Set `OPIK_TRACK_DISABLE=true` for a test suite that should export no traces,
+or use `ol_llm.testing.tracing_disabled` around one test. Neither stops SDK calls a test
+makes itself (`fetch_prompt`, `create_prompt`, `promote_prompt`, datasets): those still reach
+Opik, authenticated when `OPIK_KEYCLOAK_*` is set, so mock them in a test that must not touch
+the network. `opik.record_traces_locally()`
 captures the root traces a test produces. Script responses and failures with
 `FunctionModel`; do not commit recorded provider responses. `override_embedding_models` does
 the same for `embed` and `embed_sync`, e.g. with PydanticAI's `TestEmbeddingModel`.
@@ -714,7 +857,7 @@ else is opt-in:
 | `langchain` | `langchain-core` | `traced_chat`, for call sites that keep their LangChain or LangGraph chat models |
 | `openai`, `anthropic`, `bedrock`, `google`, `mistral` | the matching `pydantic-ai-slim` extra | A provider SDK; each also installs PydanticAI |
 | `harness` | `pydantic-ai-harness` | In-session memory, compaction, and conversation search. Each harness release pins PydanticAI exactly |
-| `memory` | `hindsight-client` | The shared memory service's client. Provisional: the backend is still being evaluated |
+| `memory` | `hindsight-client` | The `hindsight` backend of `ol_llm.memory`. Follows the deployed server's minor version |
 
 For example, `ol-llm[bedrock,harness]`.
 
@@ -753,3 +896,39 @@ package so releases are usable the day they ship:
 [tool.uv.exclude-newer-package]
 ol-llm = "0d"
 ```
+
+## Overriding opik's version caps
+
+opik 2.2.139 and later cap each direct dependency at a recent release (`name<=X` in the
+package metadata, e.g. `openai<=3.42.1` and `pydantic<=2.14.2` in 2.2.143), and opik
+releases move the caps over time. ol-llm pins opik exactly, so an application inherits the
+caps of the pinned release until ol-llm bumps opik, which it does once a month. An application that
+requires a newer version than a cap fails to resolve (`openai==3.46.0` next to opik 2.2.143 is
+unsatisfiable), and one that does not gets the capped version without a warning (pydantic
+2.14.2 under opik 2.2.143, with 2.14.3 out).
+
+The opik release ol-llm pins now, 2.2.94, has no caps, so there is nothing to add. When ol-llm
+moves to a release that has them, the changelog says so and this section gives the block to
+copy into `[tool.uv] override-dependencies`. The block has one entry for every capped package.
+
+- Every uv consumer needs the cap overrides, evaluation environments included, which copy the
+  whole block because they do not slim (see above). An application on the `openai` extra keeps
+  the `openai` cap entry, since it drops `openai` from the slimming list.
+- A slimmed runtime image keeps the slimming entry for each package the slimming list drops and
+  leaves out that package's cap entry. uv applies both entries when a package has two, so the
+  cap entry would install the package the slimming entry drops.
+- uv uses an override in place of every requirement on that package from every package in the
+  graph, the application's own included, so each entry restates the bounds the rest of the
+  graph needs and opik's environment markers, not a bare name, e.g. `"pydantic>=2.14,<3"` keeps
+  ol-llm's floor. The block covers ol-llm's own dependencies; before copying it, add the bounds
+  the application's other dependencies put on each package in it.
+- opik also bounds litellm with `<1.106` on Python 3.11 and later, separately from its cap. The
+  litellm entry replaces that bound too, so it keeps `<1.106` and opik's excluded versions
+  unless the application has checked opik's evaluation path against a newer litellm. Since
+  `<1.106` is stricter than the cap, that entry resolves the same as having none until it is
+  raised.
+- pip has no equivalent of `override-dependencies`. A pip consumer gets the caps of the pinned
+  opik release.
+
+[comet-ml/opik#9491](https://github.com/comet-ml/opik/issues/9491) asks for the caps to move
+into an extra. Once a release does that, these overrides can go.

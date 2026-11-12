@@ -6,6 +6,91 @@ All notable changes to ol-llm are recorded here. The format follows
 
 <!-- scriv-insert-here -->
 
+<a id='changelog-0.0.12'></a>
+## [0.0.12] - 2026-11-10
+
+### Added
+
+- The prompt pointer file (`ol_llm.pointers.PromptPointers`): an app's Opik project, the directory of its committed embedded defaults, and, per prompt, the version production runs. `ol-llm-prompts export` writes each pointed version's text into that directory for the pull request to commit; `check` refuses a pointer to a version Opik does not have or a committed export that is not its pointed version and, with `--environment`, reports a label that is not on its pointed version; `promote` moves the `production` label to the pointed versions after resolving all of them. See `docs/prompt-promotion.md`. (#64)
+- `ol_llm.load_default(name, directory=..., template=...)` reads a committed export as the embedded default for `get_prompt`. (#64)
+- The reusable workflow `.github/workflows/prompt-promotion.yml`: `check` on a pull request, the drift report on a schedule, and `promote` on a push or manual run, which reads the pointer file from the default branch's head, runs one promotion at a time per pointer file, and takes the promotion client from a GitHub environment so no pull request job holds it. The check runs ol-llm at the workflow's own commit and reads only the pointer file and exports from the pull request, so the pull request's code never runs next to the read client. Any other event fails. (#64)
+
+### Changed
+
+- An evaluation gate declaration takes its prompt versions from the pointer file: replace the `[prompts]` table with `pointers = "<path from the declaration>"` and `prompts = ["<name>", ...]`, and add the pointer file (its `project` must equal the gate's `app`). A declaration with a `[prompts]` table can no longer run. (#64)
+
+<a id='changelog-0.0.11'></a>
+## [0.0.11] - 2026-11-10
+
+### Added
+
+- `ol_llm.memory`: one interface to learner memory and general memory, with the backend chosen by configuration (`OL_LLM_MEMORY_BACKEND`, or a `MemoryConfig` passed to `build_memory`). `Memory.learner(session_token, use_case=...)` exchanges the learner's session token and returns `put`, `get`, `search`, `delete` and `list` for that learner; the learner always comes from the token. `Memory.general(name, ...)` writes general memory under the general grant, and `Memory.admin(...).forget(learner_id)` deletes everything for one learner and fences later writes.
+- `SyncMemory`, the same operations for sync code, run on the thread's ol-llm event loop (`run_coroutine`).
+- The `hindsight` backend for the deployed Hindsight service, on `hindsight-client`'s generated API (the `memory` extra), and an `in-memory` backend for tests and local development that enforces the same rules. Other packages add backends with `register_backend` or an `ol_llm.memory_backends` entry point.
+- `KeycloakTokenExchange` (RFC 8693 standard token exchange of a session token for the memory audience) and `ClientCredentialsTokens` for general writes and forget. A backend without Keycloak takes neither.
+- Typed memory errors: `MemoryNotFound`, `MemoryForbidden`, `MemoryFenced`, `MemoryUnauthenticated`, `MemoryUnavailable` (with `MemoryTimeout`, both retryable), `MemoryRejected`, and `MemoryUnsupported` for a capability the backend lacks.
+- `ol_llm.memory.conformance`, the checks every memory backend must pass. Each memory operation is a span in the calling trace with the §4 attribution fields; note text and queries are on it only when `OL_LLM_TRACE_CONTENT` is on.
+- `Settings.together_api_key`, so a host that configures with `ol_llm.configure()` can supply Together's key. Unset, the key is still read from `TOGETHER_API_KEY`.
+
+### Changed
+
+- The `memory` extra now installs `hindsight-client` 1.2.x, matching the deployed Hindsight server (1.2.0), in place of 0.10.x.
+- ol-llm now requires `httpx2`, the maintained continuation of `httpx` that the openai, anthropic, mistralai and pydantic-ai-slim SDKs already require. The memory package sends with it: `HindsightBackend(http=...)` and `KeycloakTokenExchange(http=...)` take an `httpx2.AsyncClient`. `ClientCredentialsTokens(http=...)` still takes an `httpx.Client`, because it shares the token cache the Opik SDK's `httpx` hooks use.
+
+### Fixed
+
+- When every model in a fallback chain fails on a request that continues a suspended response (OpenAI background mode), the caller gets the primary's error. It got the error of the member holding the suspended job, which is tried first.
+- On a retry that starts at a fallback model, the request's span names the model that answered instead of the whole chain.
+- With `UsageLimits(count_tokens_before_request=True)` on a use case with no fallback models, the token count request gets the use case's timeout, retries, and error classes. It was sent with the caller's timeout in place of the policy's, never retried, and a provider failure reached the caller as PydanticAI's `ModelHTTPError`.
+- Together requests go to the base URL of the installed `TogetherProvider` instead of a copy of it.
+
+<a id='changelog-0.0.10'></a>
+## [0.0.10] - 2026-11-10
+
+### Added
+
+- The README documents how uv consumers override the version caps (`name<=X`) that opik 2.2.139 and later put on each of its dependencies, which an application inherits through ol-llm's exact opik pin. Without the overrides, uv fails to resolve an application that needs a newer version than a cap (e.g. `openai==3.46.0` next to opik 2.2.143's `openai<=3.42.1`), or installs the capped version. The opik release ol-llm pins now (2.2.94) has no caps, so nothing needs to change yet. pip has no equivalent. ol-llm now bumps opik once a month to keep the caps close to current.
+
+### Changed
+
+- The reusable evaluation gate workflow (`.github/workflows/evaluation-gate.yml`) installs and runs the calling project with uv 0.13.7 instead of 0.12.20. uv 0.13 makes Python 3.15 the default it downloads: a calling project that pins no Python version (no `.python-version`) and whose `requires-python` allows 3.15 now gets 3.15 when the runner has no matching interpreter, where it got 3.14 before. Pin the version with `uv python pin 3.14` or cap `requires-python` below 3.15 to keep 3.14. uv 0.13 also extracts source distributions with a stricter tar reader that rejects archives containing hard links or unsupported tar extensions; a locked dependency installed from such an sdist fails the gate's install step. The lockfile format is unchanged, so a lock written by uv 0.12 still passes `uv sync --frozen`.
+
+### Fixed
+
+- `ol_llm.evaluation.evaluate` puts `Settings.environment` on each item's trace and on the task's and judges' calls under it. `opik.evaluate` opens those traces with no environment and Opik gives nested spans their parent's, so experiment task and judge spend sat in Opik's default environment instead of the app's, and Opik logged a "nested span under the environment" warning for every call.
+
+- With tracing off (`OPIK_TRACK_DISABLE=true` or `TracingConfig(enabled=False)`), Opik SDK calls made after tracing is configured (`fetch_prompt`, `create_prompt`, `promote_prompt`, datasets, experiments) now send the Keycloak token when the `OPIK_KEYCLOAK_*` client is configured. Before, ol-llm registered the SDK's auth hook only with tracing on, so these calls reached Opik without credentials and got a 401. Tracing off still opens no root trace and exports no spans, and `get_prompt` still returns the embedded default without asking Opik.
+
+### Security
+
+- `check_chat_model`, the embedding catalog check, and the models and embedders `complete` and `embed` (and their `_sync` forms) run on are no longer kept for every use case for the life of the process. An application that builds a use case from a request's model id kept one of each, provider clients included, for every distinct id a caller sent. A use case whose models the catalog all lists stays cached, up to 1,024 of them (`CHECKED_USE_CASES_MAX`). A use case naming any model the catalog does not list, and an embedder asked for a `dimensions` other than the catalog's, is kept only among the 64 most recently used (`UNCATALOGED_USE_CASES_MAX`), so a caller cycling ids can't evict the application's cataloged use cases. Such a use case builds new clients, and its unlisted-model warning is logged again, once it falls out of those 64. An application's own use case on an unlisted model shares those 64; list its model in the catalog to keep it protected. Only a use case's `model` may come from a request: `fallback_models` and `embed`'s `dimensions` must be defined by the application.
+- `UseCase` raises `ValueError` when `model` or any of `fallback_models` is longer than 512 characters (`ol_llm.policy.MODEL_ID_MAX_CHARS`), so an application that builds a use case from a request's model id refuses an oversized id before it reaches a cache, a log line or a provider. The error gives the id's length, not the id.
+- `UseCase` raises `ValueError` when `fallback_models` names more than 8 models (`ol_llm.policy.MAX_FALLBACK_MODELS`), so a use case built from a request can't make a call build and try an arbitrarily long chain. The error gives the count, not the ids.
+- The catalog's unlisted-model and deprecation warnings write the model id with `repr`, so an id carrying a newline can't start a forged log line.
+
+<a id='changelog-0.0.9'></a>
+## [0.0.9] - 2026-11-09
+
+### Added
+
+- `ol_llm.run_coroutine(coro)` runs a coroutine on one long-lived event loop per thread that ol-llm owns, so the provider clients built for that loop are reused by every later call in the thread. Sync code that awaits ol-llm should use it in place of `asyncio.run` or `async_to_sync`, which start a loop per call and leave a client behind per call. It refuses to run inside a running loop, and an interrupted coroutine is cancelled and cleaned up before the exception propagates.
+- `ol_llm.close_thread_loop()` closes the calling thread's loop and the provider clients built for it. The main thread's loop closes at interpreter exit.
+
+### Changed
+
+- `run_sync`, `complete_sync`, and `embed_sync` run on that per-thread loop instead of PydanticAI's `run_sync`, so a Celery task or Dagster asset reuses one set of provider clients per worker thread.
+- On models without mid-conversation system messages (in the catalog: every Bedrock and Google model, and `anthropic:claude-sonnet-5`), every request with a system prompt or instructions now carries a fixed sentence explaining PydanticAI's `<system>` tag in its system field. It goes after any `system_prompt=` text and ahead of the instructions, so for an agent built with `instructions=` alone, as ol-llm's entry points are, it is the first system block. PydanticAI 2.63 added it (pydantic/pydantic-ai#11506) and offers no setting to turn it off. Each cached prompt prefix takes one cache miss after the upgrade, and tests that assert the first system block is the app's prompt need updating. OpenAI, Azure, Mistral and `anthropic:claude-haiku-5-5` requests are unchanged.
+
+### Fixed
+
+- A process forked after ol-llm was used (a Celery prefork worker whose app configured tracing at startup) no longer shares the parent's sockets or waits on its dead threads. The child keeps every parent thread's event loop alive without closing it, drops the parent's provider clients without closing them, builds its own Bedrock client, gets new HTTP clients for the Keycloak token endpoint and the span exporter, and a new Opik SDK client, whose sender threads did not survive the fork. It also starts with fresh module locks (shared models, embedders, settings, tracing) and no in-flight prompt fetches, so a lock or fetch a parent thread held at the fork can't block it. Before, `ol_llm.tracing.flush()` in the child hung waiting on the parent's sender threads.
+- Each Bedrock client is built from a boto3 session of its own instead of boto3's default session, which isn't thread-safe, so first calls from several models on different threads no longer race. Threads using one model share one client.
+
+### Security
+
+- Every PydanticAI extra now requires `pydantic-ai-slim>=2.66`, which fixes eight advisories published on 2026-11-04 that affect 2.65 and earlier, among them GHSA-m5vj-8mcw-82qx (high) and GHSA-jp94-mmr3-2pvv.
+- The `harness` extra moves to `pydantic-ai-harness` 0.66, which fixes exponential backtracking in the `private_key` secret-redaction pattern (GHSA-mfx5-pc32-32m8). The extra's old `<0.61` cap held consumers on affected releases. 0.66 pins PydanticAI 2.66.
+
 <a id='changelog-0.0.8'></a>
 ## [0.0.8] - 2026-11-05
 

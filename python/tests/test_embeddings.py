@@ -1,19 +1,17 @@
 import asyncio
 import gc
-import json
 import threading
 import time
 import weakref
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Sequence
 from decimal import Decimal
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import ol_llm.catalog as catalog_module
 import opik
 import pytest
 from botocore.exceptions import ReadTimeoutError
-from conftest import assert_error_kept_without_content
+from conftest import assert_error_kept_without_content, runner_loop
 from ol_llm import (
     Attribution,
     EmbedResult,
@@ -30,7 +28,15 @@ from ol_llm import (
     embeddings,
     tracing,
 )
-from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
+from ol_llm.catalog import (
+    CHECKED_USE_CASES_MAX,
+    UNCATALOGED_USE_CASES_MAX,
+    Catalog,
+    CatalogEntry,
+    UseCaseCache,
+    is_cataloged_embedder,
+    load_catalog,
+)
 from ol_llm.embeddings import PolicyEmbeddingModel, build_embedder, shared_embedder
 from ol_llm.settings import GatewayRoute
 from ol_llm.testing import override_embedding_models, tracing_disabled
@@ -209,6 +215,53 @@ def test_first_calls_on_several_threads_build_the_embedder_once(
 
     assert len(built) == 1
     assert found == built * 4
+
+
+def test_uncataloged_use_cases_never_evict_a_cataloged_embedder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller cycling unlisted model ids can't push out the app's own use cases"""
+    fresh = UseCaseCache(is_cataloged_embedder)
+    monkeypatch.setattr(embeddings, "_shared_embedders", fresh)
+    monkeypatch.setattr(embeddings, "build_embedder", lambda *_, **__: object())
+    cataloged = shared_embedder(SEARCH)
+
+    for n in range(CHECKED_USE_CASES_MAX + 1):
+        shared_embedder(
+            UseCase(
+                app="mit-learn",
+                name="search-query",
+                profile="request",
+                model=f"openai:unlisted-{n}",
+            )
+        )
+
+    assert shared_embedder(SEARCH) is cataloged
+    assert fresh.sizes() == (1, UNCATALOGED_USE_CASES_MAX)
+
+
+def test_request_dimensions_never_evict_a_cataloged_embedder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller cycling vector lengths can't push out the app's own embedders"""
+    monkeypatch.setattr(embeddings, "build_embedder", lambda *_, **__: object())
+    embeddings._shared_embedders.clear()  # noqa: SLF001
+    try:
+        cataloged = shared_embedder(SEARCH)
+        for dimensions in range(1, CHECKED_USE_CASES_MAX + 2):
+            shared_embedder(SEARCH, dimensions)
+
+        assert shared_embedder(SEARCH) is cataloged
+        assert embeddings._shared_embedders.sizes() == (  # noqa: SLF001
+            1,
+            UNCATALOGED_USE_CASES_MAX,
+        )
+        listed = load_catalog().get(MODEL)
+        assert listed is not None
+        shared_embedder(SEARCH, listed.dimensions)
+        assert embeddings._shared_embedders.sizes()[0] == 2  # noqa: SLF001
+    finally:
+        embeddings._shared_embedders.clear()  # noqa: SLF001
 
 
 @pytest.mark.usefixtures("provider_env")
@@ -637,43 +690,11 @@ def test_the_embedder_model_carries_the_policy() -> None:
 # A real OpenAI client against a local server that keeps connections alive, so a
 # second call reuses the first call's pooled connection.
 
-EMBEDDINGS_REPLY = {
-    "object": "list",
-    "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]}],
-    "model": "text-embedding-3-small",
-    "usage": {"prompt_tokens": 1, "total_tokens": 1},
-}
-
-
-class KeepAliveProvider(BaseHTTPRequestHandler):
-    """Answers OpenAI embeddings requests over persistent connections."""
-
-    protocol_version = "HTTP/1.1"
-
-    def do_POST(self) -> None:
-        self.rfile.read(int(self.headers.get("content-length", 0)))
-        body = json.dumps(EMBEDDINGS_REPLY).encode()
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *_args: object) -> None:
-        pass
-
 
 @pytest.fixture
-def real_client(provider_env: None) -> Generator[None]:  # noqa: ARG001
-    server = ThreadingHTTPServer(("127.0.0.1", 0), KeepAliveProvider)
-    server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    url = f"http://127.0.0.1:{server.server_address[1]}/v1"
-    route = GatewayRoute(base_url=url, api_key="app-key")
+def real_client(keepalive_url: str) -> None:
+    route = GatewayRoute(base_url=f"{keepalive_url}/v1", api_key="app-key")
     configure(Settings(environment="ci", gateway_routes={"openai": route}))
-    yield
-    server.shutdown()
-    server.server_close()
 
 
 @pytest.mark.usefixtures("real_client")
@@ -703,7 +724,7 @@ def test_a_finished_threads_loop_is_released() -> None:
 
     def call() -> None:
         embed_sync(SEARCH, ["hi"], input_type="query")
-        loops.append(weakref.ref(asyncio.get_event_loop()))
+        loops.append(weakref.ref(runner_loop()))
 
     thread = threading.Thread(target=call)
     thread.start()

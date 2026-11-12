@@ -12,9 +12,14 @@ import opik
 import pytest
 from ol_llm import UseCase, run_sync
 from ol_llm.catalog import (
+    CHECKED_USE_CASES_MAX,
     TOKENS_PER_MTOK,
+    UNCATALOGED_USE_CASES_MAX,
     Catalog,
     CatalogEntry,
+    ModelKind,
+    UseCaseCache,
+    check_chat_model,
     check_model_ids,
     load_catalog,
     main,
@@ -119,6 +124,57 @@ def test_unlisted_model_builds_and_warns(caplog: pytest.LogCaptureFixture) -> No
     assert model.catalog_entry is None
     assert "openai:gpt-3.5-turbo" in caplog.text
     assert "does not list" in caplog.text
+
+
+def test_unlisted_model_id_is_logged_escaped(caplog: pytest.LogCaptureFixture) -> None:
+    """An id from a request can't break the log line it is written into"""
+    model_id = "openai:gpt\nERROR forged line"
+
+    with caplog.at_level(logging.WARNING, logger="ol_llm.catalog"):
+        build_model(use_case(model_id))
+
+    assert repr(model_id) in caplog.text
+    assert model_id not in caplog.text
+
+
+def test_uncataloged_use_cases_never_evict_a_cataloged_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller cycling unlisted model ids can't push out the app's own use cases"""
+    checked: list[UseCase] = []
+    entries = catalog_module.catalog_entries
+
+    def counting(checking: UseCase, *, kind: ModelKind) -> list[CatalogEntry | None]:
+        checked.append(checking)
+        return entries(checking, kind=kind)
+
+    monkeypatch.setattr(catalog_module, "catalog_entries", counting)
+    cataloged = use_case("openai:gpt-4o-mini")
+    check_chat_model.cache_clear()
+    try:
+        check_chat_model(cataloged)
+        for n in range(CHECKED_USE_CASES_MAX + 1):
+            check_chat_model(use_case(f"openai:unlisted-{n}"))
+        check_chat_model(cataloged)
+
+        assert checked.count(cataloged) == 1
+        assert check_chat_model.cache.sizes() == (1, UNCATALOGED_USE_CASES_MAX)
+    finally:
+        check_chat_model.cache_clear()
+
+
+def test_the_uncataloged_tier_keeps_the_most_recently_used() -> None:
+    cache: UseCaseCache[str, int] = UseCaseCache(lambda _: False)
+    ids = [f"openai:unlisted-{n}" for n in range(UNCATALOGED_USE_CASES_MAX + 1)]
+    for n, model_id in enumerate(ids[:-1]):
+        cache.put(model_id, n)
+    assert cache.get(ids[0]) == 0
+
+    cache.put(ids[-1], -1)
+
+    assert cache.get(ids[0]) == 0
+    assert cache.get(ids[1]) is None
+    assert cache.sizes() == (0, UNCATALOGED_USE_CASES_MAX)
 
 
 def test_unlisted_fallback_builds() -> None:
@@ -414,19 +470,6 @@ OPIK_PROVIDERS: Mapping[str, frozenset[str]] = {
 }
 
 
-# Entries Opik prices differently from the catalog on purpose, as Opik's (input,
-# output) USD per Mtok. A change on either side fails the test so the gap is
-# looked at again.
-OPIK_PRICE_MISMATCHES: Mapping[str, tuple[Decimal, Decimal]] = {
-    # Opik prices these at Azure's DataZone rate (the "text embedding 3 large/small
-    # DZ Tokens" meters, $0.000143 and $0.000022 per 1K tokens in eastus). The
-    # catalog's Azure deployments are GlobalStandard, so it keeps that rate and
-    # Opik's trace cost reads about 10% high.
-    "azure:text-embedding-3-large": (Decimal("0.143"), Decimal(0)),
-    "azure:text-embedding-3-small": (Decimal("0.022"), Decimal(0)),
-}
-
-
 def _opik_key(name: str, provider: str) -> tuple[str, str] | None:
     canonical = next((p for p, raw in OPIK_PROVIDERS.items() if provider in raw), None)
     if canonical is None or (canonical == "bedrock" and "/" in name):
@@ -471,8 +514,9 @@ def test_opik_prices_every_model_at_the_catalog_price(
     assert row is not None, f"Opik has no price for {entry.opik_model}"
     opik_input = row.get("input_cost_per_token", Decimal(0)) * TOKENS_PER_MTOK
     opik_output = row.get("output_cost_per_token", Decimal(0)) * TOKENS_PER_MTOK
-    assert (opik_input, opik_output) == OPIK_PRICE_MISMATCHES.get(
-        entry.id, (entry.input_usd_per_mtok, entry.output_usd_per_mtok)
+    assert (opik_input, opik_output) == (
+        entry.input_usd_per_mtok,
+        entry.output_usd_per_mtok,
     )
     # Opik's table records the default vector size for some embedding models.
     if (size := row.get("output_vector_size")) is not None:

@@ -8,7 +8,7 @@ from typing import Any
 
 import opik
 import pytest
-from conftest import PromptLibrary, assert_error_kept_without_content
+from conftest import PromptLibrary, assert_error_kept_without_content, runner_loop
 from ol_llm import (
     Attribution,
     LLMInvalidOutput,
@@ -26,6 +26,12 @@ from ol_llm import (
     models,
     run_sync,
     tracing,
+)
+from ol_llm.catalog import (
+    CHECKED_USE_CASES_MAX,
+    UNCATALOGED_USE_CASES_MAX,
+    UseCaseCache,
+    is_cataloged,
 )
 from ol_llm.models import build_agent, override_models, shared_model
 from ol_llm.tracing import TracingConfig, configure_tracing
@@ -410,6 +416,29 @@ def test_first_calls_on_several_threads_build_the_model_once(
     assert found == built * 4
 
 
+def test_uncataloged_use_cases_never_evict_a_cataloged_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller cycling unlisted model ids can't push out the app's own use cases"""
+    fresh = UseCaseCache(is_cataloged)
+    monkeypatch.setattr(models, "_shared_models", fresh)
+    monkeypatch.setattr(models, "build_model", lambda *_, **__: object())
+    cataloged = shared_model(SUMMARY)
+
+    for n in range(CHECKED_USE_CASES_MAX + 1):
+        shared_model(
+            UseCase(
+                app="mit-learn",
+                name="summary",
+                profile="request",
+                model=f"openai:unlisted-{n}",
+            )
+        )
+
+    assert shared_model(SUMMARY) is cataloged
+    assert fresh.sizes() == (1, UNCATALOGED_USE_CASES_MAX)
+
+
 def test_an_override_never_reaches_the_shared_model() -> None:
     with override_models(replying("one")):
         first = shared_model(SUMMARY)
@@ -443,7 +472,7 @@ def test_a_finished_threads_loop_is_released(real_client: UseCase) -> None:
 
     def call() -> None:
         complete_sync(real_client, "hi")
-        loops.append(weakref.ref(asyncio.get_event_loop()))
+        loops.append(weakref.ref(runner_loop()))
 
     thread = threading.Thread(target=call)
     thread.start()

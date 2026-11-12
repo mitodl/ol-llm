@@ -10,12 +10,14 @@ fail.
 A cold fetch with Opik unreachable raises, after as long as the SDK's own retries
 take. ``get_prompt`` waits ``COLD_FETCH_DEADLINE_SECONDS`` for it and then returns
 the embedded default the caller passed, the text of the pointed production
-version exported into the image at build time, marked degraded with
+version committed beside the pointer file (``ol_llm.pointers``), marked degraded with
 ``embedded_prompt``. The fetch carries on in the background and fills the cache,
 so the next call gets the managed version.
 
-With tracing off (``OPIK_TRACK_DISABLE=true``) there is no Opik to fetch from, so
-``get_prompt`` returns the embedded default unmarked: that is local development.
+With tracing off (``OPIK_TRACK_DISABLE=true``) ``get_prompt`` does not fetch and
+returns the embedded default unmarked: that is local development. ``fetch_prompt``,
+``create_prompt`` and ``promote_prompt`` still call Opik, with the Keycloak token
+when a client is configured.
 
 ``create_prompt`` and ``promote_prompt`` are for the CI jobs that sync prompts
 and move the ``production`` label from the pointer file (spec §2.3).
@@ -48,6 +50,7 @@ from opik.rest_api.types import PromptVersionDetail
 
 from ol_llm import tracing
 from ol_llm.attribution import DegradedReason
+from ol_llm.loops import register_at_fork
 from ol_llm.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -102,7 +105,7 @@ class TextTemplate(_Template):
     :param template: the template text.
     :param type: how placeholders are written.
     :param version: the Opik version this text is, e.g. ``v7``, when known. For an
-        embedded default it is the pointed version the build exported.
+        embedded default it is the pointed version that was exported.
     """
 
     template: str
@@ -451,6 +454,17 @@ class _Lookup:
 
 _inflight_lock = threading.Lock()
 _inflight: dict[_Lookup, Future[BasePrompt | None]] = {}
+
+
+def _after_fork_in_child() -> None:
+    # The parent's fetch threads didn't survive the fork, so their futures would
+    # never resolve, and a parent thread may have held the lock.
+    global _inflight_lock, _inflight  # noqa: PLW0603
+    _inflight_lock = threading.Lock()
+    _inflight = {}
+
+
+register_at_fork(after_in_child=_after_fork_in_child)
 
 
 def _fetch(lookup: _Lookup) -> BasePrompt | None:

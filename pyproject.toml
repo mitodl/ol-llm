@@ -8,6 +8,7 @@ requires-python = ">=3.11"
 prek = ["prek==0.5.10"]
 dev = [
     { include-group = "prek" },
+    "asgiref>=3.8",
     "mypy>=1.18",
     "ol-llm[anthropic,bedrock,google,harness,langchain,memory,mistral,openai,pydantic-ai]",
     "pytest>=8.4",
@@ -16,15 +17,15 @@ dev = [
 ]
 
 [tool.uv]
+required-version = ">=0.12.22,<0.14"
 package = false
-# Floors for transitive packages with advisories, so a full relock can't resolve
-# a vulnerable version again. Recent litellm releases require filelock<4, and
-# 1.108 is the first stable one that allows openai 3. opik 2.2.138 caps litellm
-# <1.106, which keeps 1.108 out for now; once an opik bump lifts that cap, a full
-# relock without the floor takes 1.108 and drops filelock to 3.x
-# (GHSA-v4x8-3wr5-3wq8, fixed only in 4.2.1). pyasn1 comes in through the google
-# extra (GHSA-2qm8-x737-gmw5 and three other decoder DoS advisories).
-constraint-dependencies = ["filelock>=4.2.1", "pyasn1>=0.6.5"]
+# Floors for transitive dependencies with advisories against earlier releases, so a
+# relock can't resolve back into them. They shape this lockfile only, not the wheel.
+constraint-dependencies = [
+    "filelock>=4.2.1",  # GHSA-v4x8-3wr5-3wq8; litellm up to 1.108.0 requires filelock<4
+    "litellm>=1.95.0",  # GHSA-g5ff-637f-6q2m and earlier; opik requires litellm
+    "pyasn1>=0.6.5",    # GHSA-fm9c-5rcf-2q5p and three others; via google-auth
+]
 
 [tool.uv.workspace]
 members = ["python"]
@@ -61,12 +62,14 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # The error names are the contract's (spec §3.2 rule 5), shared with other languages.
 "python/src/ol_llm/errors.py" = ["N818"]
+"python/src/ol_llm/memory/errors.py" = ["N818"]
 "**/tests/**" = ["D", "INP001", "PLR2004", "S101", "S106"]
 "python/smoke/smoke_test.py" = ["T201", "INP001"]
 
 [tool.pytest.ini_options]
 markers = [
     "network: fetches from the internet; deselect offline with -m 'not network'",
+    "hindsight: writes to and forgets from a live Hindsight; skipped unless OL_LLM_MEMORY_IT_CONFIG is set",
 ]
 
 [tool.mypy]

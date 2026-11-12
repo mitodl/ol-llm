@@ -1,6 +1,6 @@
 [project]
 name = "ol-llm"
-version = "0.0.8"
+version = "0.0.12"
 description = "Shared library for LLM calls at MIT Open Learning, with Opik tracing, prompt management, and evaluation built in"
 readme = "README.md"
 license = "BSD-3-Clause"
@@ -29,15 +29,17 @@ dependencies = [
     # 2026.10.19 it trusts emSign intermediates whose keys are compromised
     # (GHSA-6q48-6c7w-9gw2), and a floor here reaches every consuming app.
     "certifi>=2026.10.19",
+    # opik requires httpx, and the provider SDKs (openai, anthropic, mistralai,
+    # pydantic-ai-slim) require its maintained continuation, httpx2. Code that
+    # does not share a client or hook with Opik sends with httpx2.
     "httpx>=0.28",
+    "httpx2>=2.13",
     "opentelemetry-exporter-otlp-proto-http>=1.38",
     "opentelemetry-sdk>=1.38",
-    # 2.2.139 onward caps every direct dependency at its newest release that is
-    # 3+ days old (comet-ml/opik#9273), and the exact pin would freeze those caps
-    # onto consumers, so this stays on the last release without them. 2.2.138
-    # caps litellm<1.106, and with the openai 3 that PydanticAI's openai extra
-    # needs, that leaves litellm 1.80.17: the README's overrides drop it.
-    "opik==2.2.138",
+    # 2.2.138 and later bound litellm<1.106. Every litellm from the workspace's
+    # 1.95.0 advisory floor up to that bound requires openai<3, which the openai
+    # extra's openai 3 excludes, so a bump waits for an opik release that lifts it.
+    "opik==2.2.94",
     # Validates the model catalog. opik requires it already. 2.14 makes rebuilding a
     # deferred model thread-safe (pydantic/pydantic#13438); the openai SDK defers
     # its response models, so batch workers' first concurrent responses failed to
@@ -67,14 +69,15 @@ openai = ["pydantic-ai-slim[openai]>=2.66,<3"]
 # fixes eight that affect 2.65 and earlier (GHSA-m5vj-8mcw-82qx and others),
 # hence the 2.66 floor on every extra above.
 harness = ["pydantic-ai-harness>=0.66,<0.67"]
-# Client for the shared memory service (cross-session recall and user-scoped
-# facts). Hindsight is the leading candidate and its PoC is still open, so this
-# extra may change backend before the memory interface ships.
-memory = ["hindsight-client>=0.10,<0.11"]
+# The Hindsight backend of ol_llm.memory. The client is generated from the
+# server's API, so it follows the deployed server's minor version
+# (ol-infrastructure src/bridge/lib/versions.py HINDSIGHT_VERSION).
+memory = ["hindsight-client>=1.2,<1.3"]
 
 [project.scripts]
 ol-llm-catalog = "ol_llm.catalog:main"
 ol-llm-eval = "ol_llm.evaluation:main"
+ol-llm-prompts = "ol_llm.pointers:main"
 
 [project.urls]
 Homepage = "https://github.com/mitodl/ol-llm"
