@@ -6,6 +6,23 @@ All notable changes to ol-llm are recorded here. The format follows
 
 <!-- scriv-insert-here -->
 
+<a id='changelog-0.0.13'></a>
+## [0.0.13] - 2026-11-12
+
+### Changed
+
+- The opik pin moves from 2.2.94 to 2.2.143, the first pin with opik's dependency caps (`name<=X` on each direct dependency, e.g. `openai<=3.42.1`, `pydantic<=2.14.2`, `httpx<=0.28.1`). Without overrides an application gets the capped versions, or fails to resolve if it needs a newer one. The README's "Overriding opik's version caps" section now has the block uv applications copy into `override-dependencies`; pip consumers get the caps.
+- opik 2.2.143 also bounds litellm below 1.106, and every litellm from 1.95 below that bound requires `openai<3`, so an install with the `openai` extra that keeps litellm (an evaluation environment, or one without the README's slimming overrides) resolves litellm 1.80.17, which has known advisories. The README's litellm entry (`litellm>=1.108.3,<2`) lifts that bound for uv consumers; pip consumers on the `openai` extra stay on 1.80.17, as edxapp already does on 0.0.12 because edx-platform pins `importlib-metadata==10.1.0`. The slimming overrides drop litellm and are unchanged.
+- The `anthropic:claude-haiku-5-5` and `bedrock:us.anthropic.claude-haiku-5-5` catalog entries now name their Opik model, which opik 2.2.143's price table lists at the catalog price.
+
+- The `harness` extra moves to `pydantic-ai-harness` 0.68, which pins PydanticAI 2.68. 0.68 renames several capability parameters, event classes, and event fields (e.g. `num_results` to `max_results`, `max_duration_secs` to `max_duration_seconds`, `DelegationEndEvent` to `DelegationFinishedEvent`). Passing or importing an old name still works and emits a `HarnessDeprecationWarning`, but reading `ExaSearch.num_results` or `YouSearch.num_results` now returns `None` (the value is in `max_results`), and the old event class names are no longer in `__all__`, so type checkers stop seeing them. The PydanticAI 2.67 and 2.68 release notes list the other compatibility changes.
+- PydanticAI 2.67 and later cap `google-genai<3` (pydantic/pydantic-ai#12700). An install with the `harness` and `google` extras was held on PydanticAI 2.66 and could resolve google-genai 3, which sends Gemini Developer API requests to `v1`; it now resolves google-genai 2.x and sends them to `v1beta` again.
+
+- `ol-llm-prompts export` writes `<exports>/<name>.prompt.yaml` instead of `<name>.json`, so a pull request that moves a pointer shows the new prompt as readable text: a multi-line template is a YAML literal block. Text a literal block cannot hold exactly is written double-quoted and escaped, so no line of an export ends in whitespace, and every export reads back as exactly the version's text or `export` refuses to write it. `load_default` and `check` read the new files. Re-export after upgrading. PyYAML is now a dependency.
+- The pointer file names its app with `app` instead of `project`, matching the gate declaration's `app`.
+- `get_prompt`, `fetch_prompt`, `create_prompt` and `promote_prompt` take `app=` instead of `project_name=`.
+- `ManagedPrompt.source` is `"registry"` for a fetched prompt (was `"opik"`), and `ManagedPrompt.opik_prompt` is renamed `registry_ref`. Code that compares `source` with `"opik"` has to change.
+
 <a id='changelog-0.0.12'></a>
 ## [0.0.12] - 2026-11-10
 
