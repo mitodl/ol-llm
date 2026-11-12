@@ -80,6 +80,7 @@ import opik
 import pydantic
 from opik import url_helpers
 from opik.api_objects.dataset.dataset_item import DatasetItem
+from opik.api_objects.prompt import BasePrompt
 from opik.evaluation.metrics import BaseMetric
 from opik.exceptions import DatasetVersionNotFound
 from opik.rest_api.core import ApiError
@@ -780,13 +781,13 @@ def find_baseline(
     production: dict[str, ManagedPrompt[Any]] = {}
     for name in declaration.prompts:
         prompt = fetch_prompt(name, app=declaration.app, environment=PRODUCTION_LABEL)
-        if prompt is None or prompt.registry_ref is None:
+        if prompt is None or not isinstance(prompt.registry_ref, BasePrompt):
             return None, f"no version of `{name}` carries the production label."
         production[name] = prompt
     wanted = {
         p.registry_ref.__internal_api__version_id__
         for p in production.values()
-        if p.registry_ref is not None
+        if isinstance(p.registry_ref, BasePrompt)
     }
     versions = _versions(
         {name: prompt.version or "" for name, prompt in production.items()}

@@ -323,7 +323,7 @@ def test_evaluate_refuses_an_embedded_default() -> None:
         degraded_reasons=("embedded_prompt",),
     )
 
-    with pytest.raises(ValueError, match="embedded defaults"):
+    with pytest.raises(ValueError, match="not Opik versions"):
         evaluate(
             lambda item: item,
             dataset="summary-golden",

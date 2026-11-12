@@ -1,6 +1,7 @@
 """The prompt pointer file and the jobs that act on it (lifecycle spec §2.3).
 
-Prompts are authored in Opik. Each app repository holds one pointer file naming,
+Prompts are authored in the prompt registry (``ol_llm.prompt_registry``,
+Opik by default). Each app repository holds one pointer file naming,
 for every managed prompt, the version production runs::
 
     app = "dagster-ml"                  # the app's namespace in the registry
@@ -13,7 +14,7 @@ Changing production is a pull request that changes a number and commits the new
 version's text, which ``ol-llm-prompts export`` writes into ``exports``. That text
 is what ``load_default`` reads as the embedded default ``get_prompt`` falls back
 to, so the fallback is reviewed in the pull request and the image build needs no
-Opik. ``ol-llm-prompts`` also runs:
+registry. ``ol-llm-prompts`` also runs:
 
 - ``check`` on the pull request: every pointed version exists and the committed
   export for each is that version's text. With ``--environment`` it also reports
@@ -41,8 +42,8 @@ from typing import Annotated, Any
 
 import pydantic
 import yaml
-from opik.exceptions import EnvironmentNotFoundError
 
+from ol_llm.prompt_registry.files import EXPORT_SUFFIX, PRODUCTION, read_export
 from ol_llm.prompts import (
     ChatTemplate,
     ManagedPrompt,
@@ -52,17 +53,11 @@ from ol_llm.prompts import (
     promote_prompt,
 )
 
-PRODUCTION = "production"
-"""The label the pointer file controls."""
-
 POINTER_ERROR_STATUS = 2
 """What ``ol-llm-prompts`` exits with when the pointer file cannot be acted on."""
 
 DRIFT_STATUS = 1
 """What ``ol-llm-prompts check --environment`` exits with when a label drifted."""
-
-EXPORT_SUFFIX = ".prompt.yaml"
-"""What ``export`` names a prompt's file: ``<name>.prompt.yaml``."""
 
 _NO_WRAP = 1_000_000_000
 """A line width no export reaches, so YAML never folds a long line."""
@@ -129,13 +124,13 @@ class PromptPointers(pydantic.BaseModel):
 
 
 def resolve(pointers: PromptPointers) -> dict[str, ManagedPrompt[Any]]:
-    """Fetch every pointed version from Opik.
+    """Fetch every pointed version from the prompt registry.
 
     :param pointers: the pointer file.
     :returns: each prompt at its pointed version.
     :rtype: dict[str, ManagedPrompt]
-    :raises PointerError: naming every pointer whose prompt or version Opik does
-        not have.
+    :raises PointerError: naming every pointer whose prompt or version the
+        registry does not have.
     """
     found: dict[str, ManagedPrompt[Any]] = {}
     missing: list[str] = []
@@ -203,15 +198,16 @@ def promote(
 
     Every pointer is resolved before the first state is yielded, so a pointer to
     a missing version moves no label. Each state is yielded once its move is done,
-    so a caller can report what moved before a failure partway (e.g. Opik going
-    away). Running it again finishes the rest, since a label in place is left.
+    so a caller can report what moved before a failure partway (e.g. the registry
+    going away). Running it again finishes the rest, since a label in place is
+    left.
 
     :param pointers: the pointer file, read from the default branch's head.
     :param environment: the label to move.
     :returns: the state of each prompt before its move; ``drifted`` ones moved.
     :rtype: Iterator[LabelState]
-    :raises PointerError: if a pointed version does not exist, or the label is
-        not a registered environment in the workspace.
+    :raises PointerError: if a pointed version does not exist, or the registry
+        is read-only.
     """
     resolve(pointers)
     for state in label_states(pointers, environment=environment):
@@ -223,12 +219,8 @@ def promote(
                     environment=environment,
                     app=pointers.app,
                 )
-            except EnvironmentNotFoundError as exc:
-                msg = (
-                    f"{environment!r} is not a registered environment in this Opik "
-                    "workspace; create it once with Opik's create_environment"
-                )
-                raise PointerError(msg) from exc
+            except NotImplementedError as exc:
+                raise PointerError(str(exc)) from exc
         yield state
 
 
@@ -343,7 +335,7 @@ def check_exports(
     for name, prompt in prompts.items():
         path = pointers.exports / f"{name}{EXPORT_SUFFIX}"
         try:
-            exported = _read_export(path)
+            exported = read_export(path).template
         except FileNotFoundError:
             problems.append(f"{name}: no export at {path}")
             continue
@@ -371,27 +363,12 @@ def load_default(name: str, *, directory: Path, template: type[TemplateT]) -> Te
     :raises FileNotFoundError: if nothing was exported for the prompt.
     :raises TypeError: if the export is of the other structure.
     """
-    loaded = _read_export(directory / f"{name}{EXPORT_SUFFIX}")
+    loaded = read_export(directory / f"{name}{EXPORT_SUFFIX}").template
     if not isinstance(loaded, template):
         structure = "chat" if isinstance(loaded, ChatTemplate) else "text"
         msg = f"{name!r} was exported as a {structure} prompt, not {template.__name__}"
         raise TypeError(msg)
     return loaded
-
-
-def _read_export(path: Path) -> TextTemplate | ChatTemplate:
-    exported: Mapping[str, Any] = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if "messages" in exported:
-        return ChatTemplate(
-            messages=exported["messages"],
-            type=exported["type"],
-            version=exported["version"],
-        )
-    return TextTemplate(
-        template=exported["template"],
-        type=exported["type"],
-        version=exported["version"],
-    )
 
 
 def _unpointed_exports(pointers: PromptPointers) -> list[Path]:

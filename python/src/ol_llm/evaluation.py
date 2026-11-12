@@ -57,6 +57,7 @@ import pydantic
 from opik import context_storage
 from opik.api_objects.experiment.experiment import Experiment
 from opik.api_objects.experiment.experiment_item import ExperimentItemContent
+from opik.api_objects.prompt import BasePrompt
 from opik.evaluation.evaluation_result import EvaluationResult
 from opik.evaluation.metrics import BaseMetric, arguments_helpers, score_result
 from opik.evaluation.metrics.arguments_validator import validate_score_arguments
@@ -621,16 +622,20 @@ def evaluate(  # noqa: PLR0913
     :param experiment_tags: tags beside the app and environment ones.
     :returns: Opik's result, with the experiment's id and URL.
     :rtype: EvaluationResult
-    :raises ValueError: if ``prompts`` is empty or holds an embedded default,
-        which has no Opik version to link.
+    :raises ValueError: if ``prompts`` is empty or holds an embedded default or
+        a version from another registry, which has no Opik version to link.
     """
     if not prompts:
         msg = "Pass every managed prompt the task uses, so the experiment links them"
         raise ValueError(msg)
-    if embedded := [p.name for p in prompts if p.registry_ref is None]:
+    linked = [p.registry_ref for p in prompts if isinstance(p.registry_ref, BasePrompt)]
+    if len(linked) != len(prompts):
+        unlinked = [
+            p.name for p in prompts if not isinstance(p.registry_ref, BasePrompt)
+        ]
         msg = (
-            f"Prompts {embedded} are embedded defaults, not Opik versions; an "
-            "evaluation needs Opik reachable to link what it ran"
+            f"Prompts {unlinked} are not Opik versions (embedded defaults, or from "
+            "another prompt registry); an evaluation links the Opik versions it ran"
         )
         raise ValueError(msg)
     environment = get_settings().environment
@@ -643,7 +648,7 @@ def evaluate(  # noqa: PLR0913
         scoring_metrics=[_guard_metric(metric) for metric in metrics],
         experiment_name=experiment_name,
         experiment_config={"environment": environment, **(experiment_config or {})},
-        prompts=[p.registry_ref for p in prompts if p.registry_ref is not None],
+        prompts=linked,
         scoring_key_mapping=dict(scoring_key_mapping or {}),
         experiment_tags=[
             f"app:{project_name}",

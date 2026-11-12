@@ -34,6 +34,9 @@ dependencies = [
     # does not share a client or hook with Opik sends with httpx2.
     "httpx>=0.28",
     "httpx2>=2.13",
+    # Renders jinja2 prompt templates (`ol_llm.templates`) in its sandbox, as Opik
+    # does. opik requires it already.
+    "jinja2>=3.1.6",
     "opentelemetry-exporter-otlp-proto-http>=1.38",
     "opentelemetry-sdk>=1.38",
     "opik==2.2.143",

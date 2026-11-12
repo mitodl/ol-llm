@@ -44,6 +44,7 @@ from ol_llm import (
     embeddings,
     loops,
     models,
+    prompt_registry,
     prompts,
     run_coroutine,
     tracing,
@@ -428,6 +429,7 @@ def test_a_worker_threads_loop_still_wakes_after_a_child_collects_garbage() -> N
         (embeddings, "_shared_embedders_lock"),
         (settings_module, "_lock"),
         (prompts, "_inflight_lock"),
+        (prompt_registry, "_lock"),
         (tracing, "_lock"),
         (models._shared_models, "_lock"),  # noqa: SLF001
         (embeddings._shared_embedders, "_lock"),  # noqa: SLF001

@@ -16,6 +16,7 @@ from ol_llm.pointers import (
     promote,
     resolve,
 )
+from ol_llm.prompt_registry import FilePromptRegistry, configure_prompt_registry
 
 APP = "mit-learn"
 CHAT = [
@@ -127,13 +128,25 @@ def test_a_pointer_to_a_missing_version_moves_no_label(
     assert prompt_library.labels("summary") == {"v1": ["production"], "v2": []}
 
 
-def test_promoting_to_an_unregistered_environment_says_what_to_do(
+def test_promoting_to_an_unregistered_environment_registers_it(
     prompt_library: PromptLibrary,
 ) -> None:
     prompt_library.add("summary", "one")
 
-    with pytest.raises(PointerError, match="'qa' is not a registered environment"):
-        list(promote(pointers(summary="v1"), environment="qa"))
+    list(promote(pointers(summary="v1"), environment="qa"))
+
+    assert prompt_library.labels("summary") == {"v1": ["qa"]}
+
+
+def test_promoting_through_a_read_only_registry_says_so(
+    prompt_library: PromptLibrary, tmp_path: Path
+) -> None:
+    prompt_library.add("summary", "one")
+    export(pointers(tmp_path, summary="v1"))
+    configure_prompt_registry(FilePromptRegistry(tmp_path))
+
+    with pytest.raises(PointerError, match="read-only"):
+        list(promote(pointers(tmp_path, summary="v1"), environment="qa"))
 
 
 # Exports

@@ -233,9 +233,10 @@ def summarize(text: str, audience: str) -> Summary:
 ```
 
 The label defaults to `Settings.environment`; pass `environment=` to choose another, or
-`version="v7"` to pin one for a batch run or evaluation. The SDK caches each prompt for
-`OPIK_PROMPT_CACHE_TTL_SECONDS` (300) and refreshes it in the background, so fetching on every
-call, as above, costs nothing and picks up a moved label within five minutes.
+`version="v7"` to pin one for a batch run or evaluation. ol-llm caches each fetched version
+for five minutes (`ol_llm.prompts.PROMPT_CACHE_TTL_SECONDS`), then keeps serving it while a
+background thread fetches it again, and keeps it if that fetch fails. So fetching on every
+call, as above, costs nothing and picks up a moved label within about five minutes.
 
 An agent keeps the instructions it was built with, so a label move does not reach an agent
 built once at startup; `run`, `run_sync`, and `run_stream` take `prompt=` for the trace link
@@ -246,7 +247,8 @@ version, and uses it throughout.
 When nothing is cached and Opik does not answer within two seconds, `get_prompt` returns the
 embedded default, and a run given it is marked degraded with `embedded_prompt` on the result
 and the trace. A missing prompt, label, or version raises `LookupError`, and any other refusal
-from Opik (a 401, say) raises the SDK's error: those are configuration errors, not an outage.
+from Opik (a 401, say) raises that error: those are configuration errors, not an outage. A
+default of the other structure (text where the registry holds chat) raises `TypeError`.
 With tracing off (`OPIK_TRACK_DISABLE=true`) `get_prompt` returns the embedded default
 unmarked, so local development needs no Opik.
 
@@ -260,8 +262,18 @@ fallback itself with `degraded_metadata(prompt.degraded_reasons)`.
 
 `ChatTemplate(messages=[...])` declares a chat prompt; text or chat is fixed per prompt name.
 Templates are mustache (`{{key}}`, every placeholder must be given) unless declared
-`type="jinja2"`. The fetched version and the embedded default render through the same SDK
-code.
+`type="jinja2"`. ol-llm renders both itself, so the fetched version and the embedded default
+render through the same code whatever the registry. Mustache is placeholder substitution only,
+with Opik's matching rules (`{{ key }}` is `{{key}}`, and a third brace is literal text); a
+variable missing or extra raises `PromptVariablesError`. Jinja2 renders in Jinja's sandbox and
+is not portable to a registry that does not render it.
+
+The registry is Opik unless `OL_LLM_PROMPT_REGISTRY` names another. `file` with
+`OL_LLM_PROMPT_REGISTRY_PATH` set to the exports directory serves the committed exports, each
+at its version and under the `production` label, and refuses to move labels or create
+versions; it is for tests and local work without Opik. In code,
+`ol_llm.prompt_registry.configure_prompt_registry(FilePromptRegistry(path))` does the same,
+and a package can add a registry under the `ol_llm.prompt_registries` entry-point group.
 
 `prompt.template_hash` is a hash of the template text and type, which batch idempotency keys
 are built on in place of the version. A run that fell back to the embedded default then gets
