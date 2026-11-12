@@ -73,7 +73,11 @@ template: |-
 Text a literal block cannot hold exactly (a line ending in spaces, U+0085) is written
 double-quoted and escaped instead, so no line of an export ends in whitespace and hooks such as
 `trailing-whitespace` leave it alone. Every export reads back as exactly the version's text, or
-`export` refuses to write it.
+`export` refuses to write it. An export is generated, so exclude `\.prompt\.yaml$` from YAML
+formatters (yamlfmt, prettier): `export` rewrites whatever they change, and `check` fails if a
+reformat ever changes the text. detect-secrets flags the `template_hash` line as a high-entropy
+string; exclude it with `--exclude-lines '^\s*template_hash:\s*["'']?[0-9a-f]{64}["'']?\s*$'`
+(detect-secrets reads YAML values back quoted).
 
 `export` also removes its own earlier export of a prompt the file no longer names and leaves
 every other file. `exports` must be a directory beneath the pointer file's. The app reads an
