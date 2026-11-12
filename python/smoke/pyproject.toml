@@ -11,9 +11,10 @@ dependencies = ["ol-llm[pydantic-ai]"]
 
 [tool.uv]
 package = false
-# Not consumer guidance. litellm is overridden away below, but the lock still
-# records it and advisory scanners read the lock, so it keeps the root's floor.
-constraint-dependencies = ["litellm>=1.95.0"]
+# Not consumer guidance. litellm (and filelock, reachable only through it) is
+# overridden away below, but the lock still records both and advisory scanners
+# read the lock, so it keeps the root's floors.
+constraint-dependencies = ["filelock>=4.2.1", "litellm>=1.95.0"]
 override-dependencies = [
     "boto3-stubs; sys_platform == 'never'",
     "click; sys_platform == 'never'",
