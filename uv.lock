@@ -2057,6 +2057,7 @@ dependencies = [
     { name = "opentelemetry-sdk" },
     { name = "opik" },
     { name = "pydantic" },
+    { name = "pyyaml" },
     { name = "requests" },
 ]
 
@@ -2107,6 +2108,7 @@ requires-dist = [
     { name = "pydantic-ai-slim", extras = ["google"], marker = "extra == 'google'", specifier = ">=2.66,<3" },
     { name = "pydantic-ai-slim", extras = ["mistral"], marker = "extra == 'mistral'", specifier = ">=2.66,<3" },
     { name = "pydantic-ai-slim", extras = ["openai"], marker = "extra == 'openai'", specifier = ">=2.66,<3" },
+    { name = "pyyaml", specifier = ">=6" },
     { name = "requests", specifier = ">=2.32" },
 ]
 provides-extras = ["pydantic-ai", "langchain", "anthropic", "bedrock", "google", "mistral", "openai", "harness", "memory"]
@@ -2125,6 +2127,7 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
     { name = "scriv" },
+    { name = "types-pyyaml" },
 ]
 prek = [
     { name = "prek" },
@@ -2141,6 +2144,7 @@ dev = [
     { name = "pytest", specifier = ">=8.4" },
     { name = "ruff", specifier = ">=0.15" },
     { name = "scriv", specifier = ">=1.8" },
+    { name = "types-pyyaml", specifier = ">=6" },
 ]
 prek = [{ name = "prek", specifier = "==0.5.10" }]
 
@@ -3618,6 +3622,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/ee/9f/c5201d42a484c061e528825fc8e2d565f5abd50a4ced6fb7d29c4ec99b2b/truststore-0.10.5.tar.gz", hash = "sha256:30d36967ccaded5cbb38d602c433f53600036c79d502f4533a49b60a03bbefcd", size = 28091, upload-time = "2026-10-12T22:27:31.808Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/51/e9/3a7820be2bb0fe53b6bc9c3be26d3d1158004e4c3ab953aa6840b955b1e9/truststore-0.10.5-py3-none-any.whl", hash = "sha256:9aaaedaefaf06d8b206278cf8b5012bc897f485a874503501e12d776df78951c", size = 19017, upload-time = "2026-10-12T22:27:30.377Z" },
+]
+
+[[package]]
+name = "types-pyyaml"
+version = "6.0.12.20261111"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/80/49/96041fdb54de08a5b47bcfcbb4881873b25bae367d1e4dec79d19dfeb84b/types_pyyaml-6.0.12.20261111.tar.gz", hash = "sha256:c511f563eaf820b948c4ff6f43fe0b9d48b227be442a69058d9f68f139cae1fb", size = 18970, upload-time = "2026-11-11T08:32:30.036Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/54/ec/b23dd6911cd0e870e9396b48929ef7c92b58a551c3651d184bb573f371eb/types_pyyaml-6.0.12.20261111-py3-none-any.whl", hash = "sha256:b7e46cbc847dc235305e95e3e3570792d72e6ccf64bf9b831306f48da490322d", size = 21317, upload-time = "2026-11-11T08:32:29.148Z" },
 ]
 
 [[package]]

@@ -48,7 +48,7 @@ SUMMARY = UseCase(
     fallback_models=(FALLBACK,),
 )
 TEMPLATE = TextTemplate(template="Summarize the feedback.", version="v3")
-PROMPT = ManagedPrompt(name="feedback-summary", template=TEMPLATE, source="opik")
+PROMPT = ManagedPrompt(name="feedback-summary", template=TEMPLATE, source="registry")
 KEYS = BatchKeys(model=PRIMARY, prompt=PROMPT)
 
 
@@ -121,7 +121,7 @@ def test_a_chat_prompt_is_keyed_on_its_messages() -> None:
         return ManagedPrompt(
             name="feedback-summary",
             template=ChatTemplate(messages=messages),
-            source="opik",
+            source="registry",
         )
 
     first = BatchKeys(model=PRIMARY, prompt=chat("Summarize."))
@@ -168,7 +168,7 @@ def test_provenance_names_the_model_that_answered(
     )
     prompt = get_prompt(
         "feedback-summary",
-        project_name="ol-data-platform",
+        app="ol-data-platform",
         default=TEMPLATE,
         environment="production",
     )

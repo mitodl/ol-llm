@@ -495,7 +495,7 @@ def test_a_managed_prompt_is_linked_to_the_call(
     prompt_library.add("summary", "Summarize {{tone}}.", environments=("production",))
     prompt = get_prompt(
         "summary",
-        project_name="mit-learn",
+        app="mit-learn",
         default=TextTemplate(template="Summarize {{tone}}."),
         environment="production",
     )

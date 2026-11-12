@@ -488,7 +488,7 @@ def test_a_managed_prompt_is_linked_to_the_stream(
     prompt_library.add("summary", "Summarize.", environments=("production",))
     prompt = get_prompt(
         "summary",
-        project_name="mit-learn",
+        app="mit-learn",
         default=TextTemplate(template="Summarize."),
         environment="production",
     )

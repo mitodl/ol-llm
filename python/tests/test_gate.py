@@ -81,8 +81,7 @@ direction = "higher"
 def write_gate(directory: Path, gate: str = GATE_TOML, *, version: str = "v2") -> Path:
     """Write a declaration and the pointer file it names into a directory."""
     (directory / "prompts.toml").write_text(
-        f'project = "{APP}"\nexports = "prompts"\n\n'
-        f'[prompts]\n{USE_CASE} = "{version}"\n',
+        f'app = "{APP}"\nexports = "prompts"\n\n[prompts]\n{USE_CASE} = "{version}"\n',
         encoding="utf-8",
     )
     path = directory / "gate.toml"
@@ -394,12 +393,12 @@ def test_a_declaration_loads_from_toml(tmp_path: Path) -> None:
         ),
         (
             GATE_TOML,
-            f'project = "other"\nexports = "p"\n[prompts]\n{USE_CASE} = "v2"\n',
+            f'app = "other"\nexports = "p"\n[prompts]\n{USE_CASE} = "v2"\n',
             "other",
         ),
         (
             GATE_TOML,
-            f'project = "{APP}"\nexports = "p"\n[prompts]\nanother = "v2"\n',
+            f'app = "{APP}"\nexports = "p"\n[prompts]\nanother = "v2"\n',
             "no pointer",
         ),
         (GATE_TOML.replace('"prompts.toml"', '"missing.toml"'), None, "missing.toml"),
@@ -1134,22 +1133,22 @@ def test_fetch_prompt_reads_text_and_chat_prompts(
         "chat", [{"role": "user", "content": "Hi {{name}}."}], project_name=APP
     )
 
-    text = fetch_prompt("text", project_name=APP, environment="production")
-    chat = fetch_prompt("chat", project_name=APP, version="v1")
+    text = fetch_prompt("text", app=APP, environment="production")
+    chat = fetch_prompt("chat", app=APP, version="v1")
 
     assert text is not None
     assert (text.version, text.format(name="Ada")) == ("v1", "Hi Ada.")
     assert chat is not None
     assert chat.format(name="Ada") == [{"role": "user", "content": "Hi Ada."}]
-    assert fetch_prompt("text", project_name=APP, version="v2") is None
-    assert fetch_prompt("chat", project_name=APP, environment="production") is None
+    assert fetch_prompt("text", app=APP, version="v2") is None
+    assert fetch_prompt("chat", app=APP, environment="production") is None
 
 
 def test_fetch_prompt_takes_one_selector() -> None:
     with pytest.raises(ValueError, match="exactly one"):
-        fetch_prompt("text", project_name=APP)
+        fetch_prompt("text", app=APP)
     with pytest.raises(ValueError, match="exactly one"):
-        fetch_prompt("text", project_name=APP, version="v1", environment="production")
+        fetch_prompt("text", app=APP, version="v1", environment="production")
 
 
 # The workflow

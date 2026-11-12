@@ -65,7 +65,8 @@ SUPPORTED_MODALITIES: SupportedModalities = {"vision": True, "video": True}
 TemplateType = Literal["mustache", "jinja2"]
 """Mustache unless the prompt needs conditionals or loops (spec §3 item 9)."""
 
-PromptSource = Literal["opik", "embedded"]
+PromptSource = Literal["registry", "embedded"]
+"""Where a prompt came from: the prompt registry, or the embedded default."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -165,28 +166,29 @@ TemplateT = TypeVar("TemplateT", TextTemplate, ChatTemplate)
 
 @dataclass(frozen=True, kw_only=True)
 class ManagedPrompt(Generic[TemplateT]):
-    """A prompt from Opik, or the embedded default standing in for it.
+    """A prompt from the prompt registry, or the embedded default standing in for it.
 
     Pass it to ``run`` as ``prompt=`` so the run's trace links the version and the
     result carries its name and version.
 
     :param name: the prompt's name, ``<use_case>`` or ``<use_case>.<part>``.
     :param template: the template that was used.
-    :param source: ``opik`` when fetched, ``embedded`` for the default.
-    :param degraded_reasons: ``embedded_prompt`` when Opik could not be reached.
-    :param opik_prompt: the SDK's prompt, for the trace link; ``None`` for the
-        embedded default.
+    :param source: ``registry`` when fetched, ``embedded`` for the default.
+    :param degraded_reasons: ``embedded_prompt`` when the registry could not be
+        reached.
+    :param registry_ref: the registry's own object for this version, for the trace
+        link; ``None`` for the embedded default. Opaque to callers.
     """
 
     name: str
     template: TemplateT
     source: PromptSource
     degraded_reasons: tuple[DegradedReason, ...] = ()
-    opik_prompt: BasePrompt | None = field(default=None, repr=False, compare=False)
+    registry_ref: BasePrompt | None = field(default=None, repr=False, compare=False)
 
     @property
     def version(self) -> str | None:
-        """The Opik version, e.g. ``v7``, when known."""
+        """The registry's version, e.g. ``v7``, when known."""
         return self.template.version
 
     @property
@@ -219,7 +221,7 @@ class ManagedPrompt(Generic[TemplateT]):
 def get_prompt(
     name: str,
     *,
-    project_name: str,
+    app: str,
     default: TemplateT,
     environment: str | None = None,
     version: str | None = None,
@@ -232,7 +234,8 @@ def get_prompt(
     Opik trace, it links the version to the trace as the SDK does.
 
     :param name: the prompt's name.
-    :param project_name: the app's Opik project, which holds its prompts.
+    :param app: the app, whose namespace in the registry holds its prompts (its
+        Opik project).
     :param default: the embedded default: what to use when Opik is unreachable or
         tracing is off. Its class says whether the prompt is text or chat.
     :param environment: the label to resolve; the deployment environment
@@ -256,7 +259,7 @@ def get_prompt(
         environment = get_settings().environment
     lookup = _Lookup(
         name=name,
-        project_name=project_name,
+        app=app,
         chat=isinstance(default, ChatTemplate),
         environment=environment,
         version=version,
@@ -281,13 +284,13 @@ def get_prompt(
         )
     if fetched is None:
         selector = f"version {version}" if version else f"environment {environment}"
-        msg = f"Opik has no prompt {name!r} in {project_name!r} for {selector}"
+        msg = f"Opik has no prompt {name!r} in {app!r} for {selector}"
         raise LookupError(msg)
     prompt = ManagedPrompt(
         name=name,
         template=cast("TemplateT", _template(fetched)),
-        source="opik",
-        opik_prompt=fetched,
+        source="registry",
+        registry_ref=fetched,
     )
     attach_prompt(prompt)
     return prompt
@@ -300,16 +303,16 @@ def attach_prompt(prompt: ManagedPrompt[Any]) -> None:
 
     :param prompt: the prompt.
     """
-    if prompt.opik_prompt is not None:
-        opik_context.attach_prompt_to_current_trace(prompt.opik_prompt)
-        opik_context.attach_prompt_to_current_span(prompt.opik_prompt)
+    if prompt.registry_ref is not None:
+        opik_context.attach_prompt_to_current_trace(prompt.registry_ref)
+        opik_context.attach_prompt_to_current_span(prompt.registry_ref)
 
 
 def create_prompt(
     name: str,
     template: TemplateT,
     *,
-    project_name: str,
+    app: str,
     change_description: str | None = None,
 ) -> ManagedPrompt[TemplateT]:
     """Make ``template`` the latest version of a prompt, for a CI sync job.
@@ -321,7 +324,7 @@ def create_prompt(
     :param name: the prompt's name.
     :param template: the template; its class says whether the prompt is text or
         chat, which cannot change once the prompt exists.
-    :param project_name: the app's Opik project.
+    :param app: the app, whose namespace in the registry holds the prompt.
     :param change_description: recorded on a new version.
     :returns: the latest version, new or existing.
     :rtype: ManagedPrompt
@@ -331,17 +334,17 @@ def create_prompt(
     client = tracing.opik_client()
     latest = client.get_prompts_client().get_prompt(
         name=name,
-        project_name=project_name,
+        project_name=app,
         raise_if_not_template_structure=_structure(template),
     )
     if latest is not None:
-        existing = _prompt_from_detail(name, latest, project_name)
+        existing = _prompt_from_detail(name, latest, app)
         if _template(existing).template_hash == template.template_hash:
             return ManagedPrompt(
                 name=name,
                 template=cast("TemplateT", _template(existing)),
-                source="opik",
-                opik_prompt=existing,
+                source="registry",
+                registry_ref=existing,
             )
     created: BasePrompt
     if isinstance(template, TextTemplate):
@@ -350,7 +353,7 @@ def create_prompt(
             prompt=template.template,
             type=PromptType(template.type),
             change_description=change_description,
-            project_name=project_name,
+            project_name=app,
         )
     else:
         created = client.create_chat_prompt(
@@ -358,19 +361,17 @@ def create_prompt(
             messages=template._content(),  # noqa: SLF001
             type=PromptType(template.type),
             change_description=change_description,
-            project_name=project_name,
+            project_name=app,
         )
     return ManagedPrompt(
         name=name,
         template=cast("TemplateT", _template(created)),
-        source="opik",
-        opik_prompt=created,
+        source="registry",
+        registry_ref=created,
     )
 
 
-def promote_prompt(
-    name: str, *, version: str, environment: str, project_name: str
-) -> None:
+def promote_prompt(name: str, *, version: str, environment: str, app: str) -> None:
     """Move an environment label to a version, for the promotion CI job.
 
     The version keeps the labels it already has; the SDK's
@@ -381,7 +382,7 @@ def promote_prompt(
     :param name: the prompt's name.
     :param version: the version to label, e.g. ``v7``.
     :param environment: the label to move, e.g. ``production``.
-    :param project_name: the app's Opik project.
+    :param app: the app, whose namespace in the registry holds the prompt.
     :raises opik.exceptions.PromptNotFoundError: if there is no such prompt or
         version.
     :raises opik.exceptions.EnvironmentNotFoundError: if the environment is not
@@ -390,18 +391,18 @@ def promote_prompt(
     """
     client = tracing.opik_client()
     detail = client.get_prompts_client().get_prompt(
-        name=name, version=version, project_name=project_name
+        name=name, version=version, project_name=app
     )
     current = (detail.environments or []) if detail is not None else []
     client.set_prompt_environments(
-        name, [*current, environment], version=version, project_name=project_name
+        name, [*current, environment], version=version, project_name=app
     )
 
 
 def fetch_prompt(
     name: str,
     *,
-    project_name: str,
+    app: str,
     version: str | None = None,
     environment: str | None = None,
 ) -> ManagedPrompt[Any] | None:
@@ -412,7 +413,7 @@ def fetch_prompt(
     cannot reach Opik should fail.
 
     :param name: the prompt's name.
-    :param project_name: the app's Opik project.
+    :param app: the app, whose namespace in the registry holds the prompt.
     :param version: the version, e.g. ``v7``.
     :param environment: the label to resolve, e.g. ``production``.
     :returns: the prompt, or ``None`` when Opik has no such prompt, version, or
@@ -431,21 +432,24 @@ def fetch_prompt(
             name=name,
             version=version,
             environment=environment,
-            project_name=project_name,
+            project_name=app,
         )
     )
     if detail is None:
         return None
-    fetched = _prompt_from_detail(name, detail, project_name)
+    fetched = _prompt_from_detail(name, detail, app)
     return ManagedPrompt(
-        name=name, template=_template(fetched), source="opik", opik_prompt=fetched
+        name=name,
+        template=_template(fetched),
+        source="registry",
+        registry_ref=fetched,
     )
 
 
 @dataclass(frozen=True, kw_only=True)
 class _Lookup:
     name: str
-    project_name: str
+    app: str
     chat: bool
     environment: str | None
     version: str | None
@@ -472,7 +476,7 @@ def _fetch(lookup: _Lookup) -> BasePrompt | None:
     getter = client.get_chat_prompt if lookup.chat else client.get_prompt
     return getter(
         name=lookup.name,
-        project_name=lookup.project_name,
+        project_name=lookup.app,
         environment=lookup.environment,
         version=lookup.version,
     )

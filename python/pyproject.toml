@@ -42,6 +42,9 @@ dependencies = [
     # its response models, so batch workers' first concurrent responses failed to
     # parse before it.
     "pydantic>=2.14,<3",
+    # Reads and writes the committed prompt exports (`ol_llm.pointers`), which
+    # `load_default` reads at runtime.
+    "pyyaml>=6",
     # The OTLP exporter takes a requests session, which is where the refreshing
     # Keycloak auth for span export attaches.
     "requests>=2.32",

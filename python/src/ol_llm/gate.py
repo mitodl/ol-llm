@@ -258,9 +258,9 @@ class GateDeclaration(pydantic.BaseModel):
             )
             raise PointerError(msg)
         pointers = PromptPointers.load(path.parent / declared)
-        if pointers.project != raw.get("app"):
+        if pointers.app != raw.get("app"):
             msg = (
-                f"The pointer file {declared} is for project {pointers.project!r}, "
+                f"The pointer file {declared} is for app {pointers.app!r}, "
                 f"not the gate's app {raw.get('app')!r}"
             )
             raise PointerError(msg)
@@ -752,7 +752,7 @@ def _get_dataset(name: str, project_name: str) -> opik.Dataset | None:
 def _pinned_prompt(
     declaration: GateDeclaration, name: str, version: str
 ) -> ManagedPrompt[Any]:
-    prompt = fetch_prompt(name, project_name=declaration.app, version=version)
+    prompt = fetch_prompt(name, app=declaration.app, version=version)
     if prompt is None:
         msg = (
             f"Opik project {declaration.app!r} has no prompt {name!r} at {version}. "
@@ -779,16 +779,14 @@ def find_baseline(
     """
     production: dict[str, ManagedPrompt[Any]] = {}
     for name in declaration.prompts:
-        prompt = fetch_prompt(
-            name, project_name=declaration.app, environment=PRODUCTION_LABEL
-        )
-        if prompt is None or prompt.opik_prompt is None:
+        prompt = fetch_prompt(name, app=declaration.app, environment=PRODUCTION_LABEL)
+        if prompt is None or prompt.registry_ref is None:
             return None, f"no version of `{name}` carries the production label."
         production[name] = prompt
     wanted = {
-        p.opik_prompt.__internal_api__version_id__
+        p.registry_ref.__internal_api__version_id__
         for p in production.values()
-        if p.opik_prompt is not None
+        if p.registry_ref is not None
     }
     versions = _versions(
         {name: prompt.version or "" for name, prompt in production.items()}

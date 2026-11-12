@@ -217,7 +217,7 @@ def failed_task() -> list[str]:
     items = [{"input": "ping"}]
     prompt = ol_llm.get_prompt(
         "smoke",
-        project_name=APP,
+        app=APP,
         default=ol_llm.TextTemplate(template="Reply {{word}}."),
         environment="production",
     )
@@ -267,7 +267,7 @@ def check() -> list[str]:  # noqa: C901
     # capabilities, and the import graph are the library's own.
     prompt = ol_llm.get_prompt(
         "smoke",
-        project_name=APP,
+        app=APP,
         default=ol_llm.TextTemplate(template="Reply {{word}}."),
         environment="production",
     )
@@ -328,7 +328,7 @@ def check() -> list[str]:  # noqa: C901
         failures.append(f"root trace fields were {got}")
     if "use_case:smoke" not in trace.get("tags", []):
         failures.append(f"root trace tags were {trace.get('tags')}")
-    if (prompt.source, result.prompt_version) != ("opik", "v2"):
+    if (prompt.source, result.prompt_version) != ("registry", "v2"):
         failures.append(f"the prompt was {prompt}, the result named {result}")
     linked = (trace.get("metadata") or {}).get("opik_prompts", [])
     if [p.get("version", {}).get("version_number") for p in linked] != ["v2"]:

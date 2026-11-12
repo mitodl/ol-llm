@@ -627,7 +627,7 @@ def evaluate(  # noqa: PLR0913
     if not prompts:
         msg = "Pass every managed prompt the task uses, so the experiment links them"
         raise ValueError(msg)
-    if embedded := [p.name for p in prompts if p.opik_prompt is None]:
+    if embedded := [p.name for p in prompts if p.registry_ref is None]:
         msg = (
             f"Prompts {embedded} are embedded defaults, not Opik versions; an "
             "evaluation needs Opik reachable to link what it ran"
@@ -643,7 +643,7 @@ def evaluate(  # noqa: PLR0913
         scoring_metrics=[_guard_metric(metric) for metric in metrics],
         experiment_name=experiment_name,
         experiment_config={"environment": environment, **(experiment_config or {})},
-        prompts=[p.opik_prompt for p in prompts if p.opik_prompt is not None],
+        prompts=[p.registry_ref for p in prompts if p.registry_ref is not None],
         scoring_key_mapping=dict(scoring_key_mapping or {}),
         experiment_tags=[
             f"app:{project_name}",

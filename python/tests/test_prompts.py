@@ -41,7 +41,7 @@ CHAT = [
 def fetch(
     name: str = "summary", default: TextTemplate = DEFAULT, **kwargs: str
 ) -> prompts.ManagedPrompt[TextTemplate]:
-    return get_prompt(name, project_name=PROJECT, default=default, **kwargs)
+    return get_prompt(name, app=PROJECT, default=default, **kwargs)
 
 
 def unreachable(exc: Exception) -> object:
@@ -59,7 +59,7 @@ def test_fetches_the_version_the_label_points_at(
 
     prompt = fetch(environment="production")
 
-    assert prompt.source == "opik"
+    assert prompt.source == "registry"
     assert prompt.version == "v1"
     assert prompt.degraded_reasons == ()
     assert prompt.format(text="this") == "Summarize this."
@@ -101,7 +101,7 @@ def test_a_chat_prompt_renders_every_message(prompt_library: PromptLibrary) -> N
 
     prompt = get_prompt(
         "tutor",
-        project_name=PROJECT,
+        app=PROJECT,
         default=ChatTemplate(messages=[]),
         environment="production",
     )
@@ -258,7 +258,7 @@ def test_a_worker_that_cannot_start_leaves_nothing_in_flight(
             fetch(environment="production")
 
     assert prompts._inflight == {}  # noqa: SLF001
-    assert fetch(environment="production").source == "opik"
+    assert fetch(environment="production").source == "registry"
 
 
 def test_the_worker_sees_the_callers_masks_but_not_its_trace(
@@ -301,7 +301,7 @@ def test_a_slow_cold_fetch_falls_back_and_then_fills_the_cache(
     second = fetch(environment="production")
 
     assert first.degraded_reasons == ("embedded_prompt",)
-    assert (second.source, second.degraded_reasons) == ("opik", ())
+    assert (second.source, second.degraded_reasons) == ("registry", ())
     assert prompt_library.retrievals == 1
 
 
@@ -316,7 +316,7 @@ def test_a_cached_prompt_is_served_while_opik_is_down(
 
     prompt = fetch(environment="production")
 
-    assert (prompt.source, prompt.version) == ("opik", "v1")
+    assert (prompt.source, prompt.version) == ("registry", "v1")
     assert prompt_library.retrievals == 0
 
 
@@ -342,9 +342,7 @@ def test_with_tracing_off_an_sdk_fetch_still_sends_the_keycloak_token(
     reset_global_client()
     prompt_library.add("summary", "Summarize {{text}}.", environments=("production",))
 
-    prompt = prompts.fetch_prompt(
-        "summary", project_name=PROJECT, environment="production"
-    )
+    prompt = prompts.fetch_prompt("summary", app=PROJECT, environment="production")
 
     assert prompt is not None
     assert prompt.version == "v1"
@@ -390,15 +388,15 @@ def test_create_prompt_adds_a_version_only_on_change(
 ) -> None:
     template = TextTemplate(template="Summarize {{text}}.")
 
-    first = create_prompt("summary", template, project_name=PROJECT)
-    again = create_prompt("summary", template, project_name=PROJECT)
+    first = create_prompt("summary", template, app=PROJECT)
+    again = create_prompt("summary", template, app=PROJECT)
     changed = create_prompt(
-        "summary", TextTemplate(template="Summarize {{text}}!"), project_name=PROJECT
+        "summary", TextTemplate(template="Summarize {{text}}!"), app=PROJECT
     )
     retyped = create_prompt(
         "summary",
         TextTemplate(template="Summarize {{text}}!", type="jinja2"),
-        project_name=PROJECT,
+        app=PROJECT,
     )
 
     assert [first.version, again.version, changed.version, retyped.version] == [
@@ -416,7 +414,7 @@ def test_create_prompt_ignores_metadata_set_in_the_ui(
     prompt_library.add("summary", "Summarize {{text}}.", metadata={"by": "ui"})
 
     created = create_prompt(
-        "summary", TextTemplate(template="Summarize {{text}}."), project_name=PROJECT
+        "summary", TextTemplate(template="Summarize {{text}}."), app=PROJECT
     )
 
     assert created.version == "v1"
@@ -426,8 +424,8 @@ def test_create_prompt_ignores_metadata_set_in_the_ui(
 def test_create_prompt_for_a_chat_prompt(prompt_library: PromptLibrary) -> None:
     template = ChatTemplate(messages=CHAT)
 
-    create_prompt("tutor", template, project_name=PROJECT)
-    created = create_prompt("tutor", template, project_name=PROJECT)
+    create_prompt("tutor", template, app=PROJECT)
+    created = create_prompt("tutor", template, app=PROJECT)
 
     assert created.template.messages == CHAT
     assert prompt_library.versions("tutor") == ["v1"]
@@ -440,9 +438,7 @@ def test_promote_keeps_the_versions_other_labels(
     prompt_library.add("summary", "one", environments=("production",))
     prompt_library.add("summary", "two", environments=("qa",))
 
-    promote_prompt(
-        "summary", version="v2", environment="production", project_name=PROJECT
-    )
+    promote_prompt("summary", version="v2", environment="production", app=PROJECT)
 
     assert prompt_library.labels("summary") == {"v1": [], "v2": ["qa", "production"]}
 
@@ -454,9 +450,7 @@ def test_promote_reaches_the_next_fetch_in_this_process(
     prompt_library.add("summary", "two {{text}}")
     assert fetch(environment="production").version == "v1"
 
-    promote_prompt(
-        "summary", version="v2", environment="production", project_name=PROJECT
-    )
+    promote_prompt("summary", version="v2", environment="production", app=PROJECT)
 
     assert fetch(environment="production").version == "v2"
 
@@ -467,4 +461,4 @@ def test_promote_to_an_unregistered_environment_raises(
     prompt_library.add("summary", "one")
 
     with pytest.raises(EnvironmentNotFoundError):
-        promote_prompt("summary", version="v1", environment="ci", project_name=PROJECT)
+        promote_prompt("summary", version="v1", environment="ci", app=PROJECT)
