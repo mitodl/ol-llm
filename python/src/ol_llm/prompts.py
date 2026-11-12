@@ -364,7 +364,8 @@ def _cached_fetch(lookup: _Lookup) -> RegistryVersion | None:
     Otherwise fetch in a worker thread and wait at most the deadline. Concurrent
     fetches of one lookup share a worker, which keeps going after the deadline so
     its result reaches the cache. A stale entry is served when its refresh fails,
-    finds nothing, or misses the deadline, as the Opik SDK's cache did.
+    finds nothing, or misses the deadline, as the Opik SDK's cache did, and at once
+    to every caller but the one that started the refresh.
 
     :raises TimeoutError: if a cold fetch missed the deadline.
     """
@@ -372,7 +373,9 @@ def _cached_fetch(lookup: _Lookup) -> RegistryVersion | None:
         entry = _cache.get(lookup)
         if entry is not None:
             _cache.move_to_end(lookup)
-            if time.monotonic() - entry.checked_at < PROMPT_CACHE_TTL_SECONDS:
+            fresh = time.monotonic() - entry.checked_at < PROMPT_CACHE_TTL_SECONDS
+            # Only the caller that starts a refresh waits for it.
+            if fresh or lookup in _inflight:
                 return entry.found
         future = _start(lookup)
     try:

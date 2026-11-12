@@ -1,3 +1,4 @@
+import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -258,8 +259,14 @@ def test_a_chat_template_keeps_its_media_and_other_keys() -> None:
 
 def test_a_media_part_whose_url_renders_empty_is_left_out() -> None:
     image = {"type": "image_url", "image_url": {"url": "{{image}}"}}
+    no_url = {"type": "image_url", "image_url": {"detail": "high"}}
     template = ChatTemplate(
-        messages=[{"role": "user", "content": [{"type": "text", "text": "Hi"}, image]}]
+        messages=[
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "Hi"}, image, no_url],
+            }
+        ]
     )
 
     [message] = template.format(image="")
@@ -536,6 +543,23 @@ def test_a_slow_refresh_serves_the_stale_prompt(
     fresh = fetch(environment="production")
 
     assert (stale.version, fresh.version) == ("v1", "v2")
+
+
+def test_only_the_caller_that_starts_a_refresh_waits_for_it(
+    monkeypatch: pytest.MonkeyPatch, prompt_library: PromptLibrary
+) -> None:
+    prompt_library.add("summary", "one {{text}}", environments=("production",))
+    fetch(environment="production")
+    make_stale()
+    prompt_library.delay_seconds = 1
+    monkeypatch.setattr(prompts, "COLD_FETCH_DEADLINE_SECONDS", 0.2)
+    fetch(environment="production")
+
+    started = time.monotonic()
+    prompt = fetch(environment="production")
+
+    assert prompt.version == "v1"
+    assert time.monotonic() - started < 0.1
 
 
 def test_the_cache_keeps_the_most_recently_used(

@@ -130,9 +130,9 @@ class ChatTemplate(_Template):
 
         A string ``content`` is a template. In a list of parts, a ``text`` part's
         ``text`` and the ``url`` of an ``image_url``, ``video_url`` or
-        ``audio_url`` part are templates, and a media part whose URL renders empty
-        is left out; every other key and part is kept as it is, so media reaches
-        the model as media.
+        ``audio_url`` part are templates, and a media part with no URL or one that
+        renders empty is left out; every other key and part is kept as it is, so
+        media reaches the model as media.
 
         :param variables: a value for every placeholder.
         :returns: the rendered messages.
@@ -222,10 +222,10 @@ def _map_content(content: object, apply: Callable[[str], str]) -> object:
                 part[media].get("url"), str
             ):
                 new[media] = {**part[media], "url": apply(part[media]["url"])}
-        # A media URL that renders empty (an optional image left out) drops the
-        # part, as Opik's renderer does.
+        # A media part with no URL, or one that renders empty (an optional image
+        # left out), is dropped, as Opik's renderer does.
         if not any(
-            isinstance(new.get(m), dict) and new[m]["url"] == "" for m in _MEDIA_PARTS
+            isinstance(new.get(m), dict) and not new[m].get("url") for m in _MEDIA_PARTS
         ):
             mapped.append(new)
     return mapped
