@@ -917,7 +917,7 @@ override-dependencies = [
     "click>=8.4.2,<9",
     "httpx[http2]>=0.28.1,<1",
     "jinja2>=3.1.6,<4",
-    "litellm>=1.108,<2",
+    "litellm>=1.108.3,<2",
     "openai>=3.31.0,<4",
     "orjson>=3.9.14; platform_python_implementation == 'CPython' and platform_machine in 'x86_64 AMD64 aarch64 arm64 ARM64 i686 x86' and (sys_platform != 'win32' or platform_machine != 'ARM64' or python_version >= '3.11')",
     "pydantic>=2.14,<3",
@@ -940,7 +940,8 @@ The litellm entry replaces opik's own `litellm<1.106` bound as well as its cap. 
 from 1.95 below 1.106 requires `openai<3`, and the `openai` extra requires openai 3, so under
 that bound an environment that keeps litellm resolves 1.80.17, which has known advisories (e.g.
 GHSA-g5ff-637f-6q2m, fixed in 1.95.0). litellm 1.108 is the first release that accepts
-openai 3. ol-llm's lockfile and its CI use the same override, and its evaluation tests import
+openai 3, and 1.108.3 the first of those that allows filelock 4 (1.108.0 to 1.108.2 require
+`filelock<4`, under GHSA-v4x8-3wr5-3wq8). ol-llm's lockfile and its CI use the same override, and its evaluation tests import
 litellm.
 
 - Every uv consumer needs the cap overrides, evaluation environments included, which copy the

@@ -19,7 +19,7 @@ constraints = [
     { name = "filelock", specifier = ">=4.2.1" },
     { name = "pyasn1", specifier = ">=0.6.5" },
 ]
-overrides = [{ name = "litellm", specifier = ">=1.108,<2" }]
+overrides = [{ name = "litellm", specifier = ">=1.108.3,<2" }]
 
 [[package]]
 name = "aiohappyeyeballs"

@@ -41,9 +41,9 @@ uv run prek run --all-files                     # the same hooks CI runs
   `uv tree --invert --package <name> --depth 1 --no-dev`, then read each one's requirement on
   it), with opik's environment markers kept, e.g. `"pydantic>=2.14,<3"`,
   `"tenacity>=8.2.3,!=8.4.0,<9.2.0"` (langchain-core excludes 8.4.0, google-genai caps 9.2).
-  The litellm entry is the exception: it replaces opik's `<1.106` bound with `>=1.108`, the
-  first litellm that accepts the `openai` extra's openai 3, and the root `pyproject.toml`
-  overrides litellm the same way. `python/smoke/pyproject.toml` takes the cap entries for the
+  The litellm entry is the exception: it replaces opik's `<1.106` bound with `>=1.108.3`, the
+  first litellm that accepts the `openai` extra's openai 3 and filelock 4, and the root
+  `pyproject.toml` overrides litellm the same way. `python/smoke/pyproject.toml` takes the cap entries for the
   packages its slimming list does not drop. Keep the smoke test passing with them. Drop them
   once comet-ml/opik#9491 moves the caps into an extra.
 - Do not add litellm as a dependency.
