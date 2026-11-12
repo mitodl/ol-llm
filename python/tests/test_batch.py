@@ -48,7 +48,7 @@ SUMMARY = UseCase(
     fallback_models=(FALLBACK,),
 )
 TEMPLATE = TextTemplate(template="Summarize the feedback.", version="v3")
-PROMPT = ManagedPrompt(name="feedback-summary", template=TEMPLATE, source="opik")
+PROMPT = ManagedPrompt(name="feedback-summary", template=TEMPLATE, source="registry")
 KEYS = BatchKeys(model=PRIMARY, prompt=PROMPT)
 
 
@@ -121,7 +121,7 @@ def test_a_chat_prompt_is_keyed_on_its_messages() -> None:
         return ManagedPrompt(
             name="feedback-summary",
             template=ChatTemplate(messages=messages),
-            source="opik",
+            source="registry",
         )
 
     first = BatchKeys(model=PRIMARY, prompt=chat("Summarize."))

@@ -268,16 +268,19 @@ def render_export(name: str, app: str, template: TextTemplate | ChatTemplate) ->
     """Return the YAML ``export`` writes for one prompt version.
 
     A multi-line string is written as a literal block, which reads as the prompt
-    does, when that reads back exactly; otherwise (e.g. trailing spaces, U+0085) it
-    is written double-quoted and escaped, so no line of the file ends in whitespace
-    for a hook to strip.
+    does, and any other string in YAML's usual style, when that form reads back
+    exactly and leaves no line ending in whitespace (Unicode whitespace included,
+    e.g. a no-break space). Otherwise (trailing spaces, U+0085, U+2028) the string
+    is written double-quoted and escaped, so no tool that strips trailing whitespace
+    can change an export's text.
 
     :param name: the prompt.
     :param app: the app, whose namespace in the registry holds the prompt.
     :param template: the version's template.
     :returns: the export's text.
     :rtype: str
-    :raises PointerError: if the text would not read back exactly.
+    :raises PointerError: if the text would not read back exactly, or a line would
+        end in whitespace.
     """
     content: dict[str, Any] = (
         {"messages": [dict(message) for message in template.messages]}
@@ -299,10 +302,17 @@ def render_export(name: str, app: str, template: TextTemplate | ChatTemplate) ->
         allow_unicode=True,
         width=_NO_WRAP,
     )
-    if yaml.safe_load(text) != record:
+    if not _clean(text, record):
         msg = f"{name}: the export would not read back as the version's text"
         raise PointerError(msg)
     return text
+
+
+def _clean(text: str, value: object) -> bool:
+    """Whether ``text`` reads back as ``value`` and no line ends in whitespace."""
+    return yaml.safe_load(text) == value and all(
+        line == line.rstrip() for line in text.split("\n")
+    )
 
 
 def check_exports(
@@ -406,26 +416,25 @@ def _is_export(path: Path, app: str) -> bool:
 
 
 class _ExportDumper(yaml.SafeDumper):
-    """Writes multi-line strings as literal blocks when they read back exactly."""
+    """Writes each string in its most readable form that reads back cleanly."""
 
 
-class _LiteralDumper(yaml.SafeDumper):
-    """Writes every string as a literal block, to test whether one reads back."""
-
-
-def _literal(dumper: yaml.SafeDumper, value: str) -> yaml.ScalarNode:
-    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style="|")
+_STR_TAG = "tag:yaml.org,2002:str"
 
 
 def _export_str(dumper: yaml.SafeDumper, value: str) -> yaml.ScalarNode:
-    if "\n" not in value:
-        return dumper.represent_str(value)
-    probe = yaml.dump(value, Dumper=_LiteralDumper, allow_unicode=True, width=_NO_WRAP)
-    style = "|" if yaml.safe_load(probe) == value else '"'
-    return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=style)
+    style = "|" if "\n" in value else None
+    probe = yaml.serialize(
+        yaml.ScalarNode(_STR_TAG, value, style=style),
+        Dumper=yaml.SafeDumper,
+        allow_unicode=True,
+        width=_NO_WRAP,
+    )
+    if not _clean(probe, value):
+        style = '"'
+    return dumper.represent_scalar(_STR_TAG, value, style=style)
 
 
-_LiteralDumper.add_representer(str, _literal)
 _ExportDumper.add_representer(str, _export_str)
 
 

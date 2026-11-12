@@ -183,6 +183,10 @@ def test_a_multi_line_template_is_exported_as_a_literal_block(
         "separator\u2028here\nend",
         "\ufeffmark\nend",
         "no final newline\nend",
+        "single\x85line",
+        "no-break space\u00a0\nend",
+        "ideographic space\u3000\nend",
+        "single line ending in a no-break space\u00a0",
     ],
 )
 def test_any_template_reads_back_exactly_with_no_trailing_whitespace(
