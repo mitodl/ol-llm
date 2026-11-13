@@ -1,23 +1,23 @@
-"""Evaluation in Opik (lifecycle spec §4.2 and §5): datasets, experiments, gates.
+"""Evaluation (lifecycle spec §4.2 and §5): datasets, experiments, gates.
 
-A use case whose output a learner or instructor sees keeps a golden dataset in Opik
-and runs an experiment on every prompt or model change. This module is the path
-for that:
+A use case whose output a learner or instructor sees keeps a golden dataset and runs
+an experiment on every prompt or model change. This module is the path for that,
+on the experiment backend ``ol_llm.experiments`` configures (Opik by default):
 
-- ``load_items`` and ``seed_dataset`` put a golden set from a local file into an
-  Opik dataset. Seeding again is a no-op for items already there, since the SDK
-  skips an item whose content hash the dataset already holds, so a seed job can
-  run on every change to the file. Each insert that adds items makes a new
-  dataset version, which a gate pins.
-- ``evaluate`` runs ``opik.evaluate`` with the managed prompts the task uses, so
-  the experiment links their versions. An ``LLMError`` from the task or a judge
-  fails that item's scores instead of aborting the run.
-- ``ValidatorMetric`` turns a deterministic check (an SRT structure check, a
-  placeholder check) into an Opik metric, and ``judge_model`` gives Opik's
-  LLM-judge metrics a model that calls through this library, so the judge is
+- ``load_items`` and ``seed_dataset`` put a golden set from a local file into a
+  dataset. Seeding again is a no-op for items already there, so a seed job can
+  run on every change to the file. Each seed that adds items makes a new dataset
+  version, which a gate pins.
+- ``evaluate`` runs an experiment linked to the versions of the managed prompts
+  the task uses. An ``LLMError`` from the task or a judge fails that item's
+  scores instead of aborting the run.
+- Metrics are ol-llm's (``Metric``, scoring an item to a ``Score``).
+  ``ValidatorMetric`` turns a deterministic check (an SRT structure check, a
+  placeholder check) into one. ``hallucination``, ``answer_relevance``,
+  ``context_precision`` and ``context_recall`` are LLM-judge metrics on
+  ``judge_model``, which calls through this library, so the judge is
   catalog-checked, routed, retried, and traced like any other call, under the
-  ``eval-judge`` use case. Opik's judge metrics that take a ``model`` accept any
-  ``OpikBaseModel``, and given one they do not import litellm.
+  ``eval-judge`` use case.
 - ``judge_pairwise`` has the judge compare a candidate experiment's answers with
   a reference experiment's, item by item, and logs each verdict on the
   candidate's items, so its win rate can be thresholded like any other metric.
@@ -27,13 +27,8 @@ for that:
 
 ``ol-llm-eval seed`` and ``ol-llm-eval check`` do the seeding and the threshold
 check from a CI job. Needs the ``pydantic-ai`` extra, and the provider extra for
-the judge's model.
-
-Run ``evaluate`` where the Opik SDK is installed whole, not with the slimming
-overrides: when a task or metric raises anything else, ``opik.evaluate`` checks
-whether it was a rate limit by importing ``openai`` and ``litellm``
-(``opik/evaluation/engine/exception_analyzer.py``), so without them that failure
-aborts the run with ``ModuleNotFoundError``.
+the judge's model. With the Opik backend, run experiments where the Opik SDK is
+installed whole (see ``ol_llm.experiments.opik_backend``).
 """
 
 import argparse
@@ -52,38 +47,68 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
-import opik
 import pydantic
-from opik import context_storage
-from opik.api_objects.experiment.experiment import Experiment
-from opik.api_objects.experiment.experiment_item import ExperimentItemContent
-from opik.evaluation.evaluation_result import EvaluationResult
-from opik.evaluation.metrics import BaseMetric, arguments_helpers, score_result
-from opik.evaluation.metrics.arguments_validator import validate_score_arguments
-from opik.evaluation.models import OpikBaseModel
-from opik.evaluation.models.base_model import ConversationDict
-from opik.types import BatchFeedbackScoreDict
-from pydantic_ai.messages import (
-    ModelMessage,
-    ModelRequest,
-    ModelResponse,
-    TextPart,
-    UserPromptPart,
-)
 
 from ol_llm import tracing
-from ol_llm.catalog import load_catalog
 from ol_llm.errors import LLMError
-from ol_llm.policy import UseCase
-from ol_llm.prompt_registry.opik_registry import opik_prompt
+from ol_llm.experiments import (
+    ExperimentItem,
+    ExperimentResult,
+    ExperimentRun,
+    Metric,
+    Score,
+    Task,
+    TraceScore,
+    answer_relevance,
+    context_precision,
+    context_recall,
+    experiment_backend,
+    hallucination,
+)
+from ol_llm.judge import JUDGE_USE_CASE, JudgeModel, judge_model
 from ol_llm.prompts import ManagedPrompt
-from ol_llm.runs import LLMResult, complete, complete_sync
+from ol_llm.runs import complete_sync
 from ol_llm.settings import get_settings
 
-log = logging.getLogger(__name__)
+__all__ = [
+    "JUDGE_USE_CASE",
+    "LLM_ERROR_FIELD",
+    "PAIRWISE_METRIC",
+    "PAIRWISE_SCORES",
+    "Direction",
+    "EvaluationGateError",
+    "ExperimentItem",
+    "ExperimentResult",
+    "GateMode",
+    "GateReport",
+    "JudgeModel",
+    "Metric",
+    "MetricOutcome",
+    "OutcomeStatus",
+    "PairVerdict",
+    "PairwiseComparison",
+    "PairwiseOutcome",
+    "Score",
+    "SkippedItem",
+    "Threshold",
+    "ValidatorMetric",
+    "Verdict",
+    "answer_relevance",
+    "check_experiment",
+    "check_thresholds",
+    "context_precision",
+    "context_recall",
+    "evaluate",
+    "hallucination",
+    "judge_model",
+    "judge_pairwise",
+    "load_items",
+    "main",
+    "score_report",
+    "seed_dataset",
+]
 
-JUDGE_USE_CASE = "eval-judge"
-"""The use case every judge call is attributed to (spec §4.2)."""
+log = logging.getLogger(__name__)
 
 GateMode = Literal["advisory", "blocking"]
 """Advisory reports and does not fail; blocking fails the check (spec §5.1)."""
@@ -93,210 +118,17 @@ Direction = Literal["higher", "lower"]
 
 LLM_ERROR_FIELD = "ol_llm_error"
 """The output field ``evaluate`` records, as the error's class name, for an item
-whose task raised an ``LLMError``. It shows on the item's trace in Opik."""
+whose task raised an ``LLMError``. It shows on the item's trace."""
 
 _FLOAT_SLACK = 1e-9
-
-MAX_EXPERIMENT_ITEMS = 10_000
-"""The most experiment items the Opik SDK reads (``Experiment.get_items``)."""
 
 Verdict = bool | Sequence[str]
 """What a validator returns: whether the output passed, or the problems it found,
 where none means it passed."""
 
 
-def judge_model(app: str, model: str) -> "JudgeModel":
-    """Return a judge for Opik's LLM-judge metrics that calls through ol-llm.
-
-    Pass it as the ``model`` of an Opik judge metric that takes one, e.g.
-    ``Hallucination(model=judge_model("learn-ai", "openai:gpt-4o-mini"))``.
-    ``SycEval`` also needs it as ``rebuttal_model``, or it builds a LiteLLM model
-    for the rebuttal; Opik's dataset-item evaluators (``LLMJudge``) take only a
-    model name and cannot use it. The judge should not be the model under test
-    (spec §5.1 item 7).
-
-    :param app: the app being evaluated; the judge's calls are traced and costed
-        under its project.
-    :param model: the judge's model id, in ``provider:model`` form.
-    :returns: the judge.
-    :rtype: JudgeModel
-    :raises ValueError: if the catalog does not list the model, or lists it as
-        retired or as an embedding model. Unlike a call site, a judge may not use
-        an uncataloged model: its spend is shared evaluation cost, and the catalog
-        is where that is priced.
-    """
-    return JudgeModel(
-        UseCase(app=app, name=JUDGE_USE_CASE, profile="batch", model=model)
-    )
-
-
-class JudgeModel(OpikBaseModel):
-    """An ``OpikBaseModel`` that answers through ``complete``, for judge metrics.
-
-    Opik's judge metrics send a system and a user message and, for a structured
-    verdict, a pydantic model as ``response_format``. The system messages become
-    the instructions, the rest the conversation, and a structured verdict comes
-    back as its JSON, which is what the metrics parse.
-
-    Build it with ``judge_model``, which names the use case ``eval-judge``.
-
-    :param use_case: the judge's use case.
-    :raises ValueError: if the catalog does not list the use case's model, or
-        lists it as retired or as an embedding model.
-    """
-
-    def __init__(self, use_case: UseCase) -> None:
-        """Check the model against the catalog; it is built on the first call."""
-        if load_catalog().buildable(use_case.model, kind="chat") is None:
-            msg = (
-                f"{use_case.model!r} is not in the model catalog; a judge must use "
-                "a listed model"
-            )
-            raise ValueError(msg)
-        super().__init__(model_name=use_case.model)
-        self.use_case = use_case
-
-    def generate_string(
-        self,
-        input: str,  # noqa: A002 - the base class's parameter name
-        response_format: type[pydantic.BaseModel] | None = None,
-        **kwargs: Any,  # noqa: ANN401
-    ) -> str:
-        """Answer one user message.
-
-        :param input: the message.
-        :param response_format: the verdict's model, for a structured answer.
-        :returns: the answer, as JSON for a structured one.
-        :rtype: str
-        :raises LLMError: on a failed call.
-        """
-        _no_options(kwargs)
-        return _content(
-            complete_sync(self.use_case, input, output_type=response_format or str)
-        )
-
-    async def agenerate_string(
-        self,
-        input: str,  # noqa: A002 - the base class's parameter name
-        response_format: type[pydantic.BaseModel] | None = None,
-        **kwargs: Any,  # noqa: ANN401
-    ) -> str:
-        """Answer one user message; see ``generate_string``."""
-        _no_options(kwargs)
-        result = await complete(
-            self.use_case, input, output_type=response_format or str
-        )
-        return _content(result)
-
-    def generate_chat_completion(
-        self,
-        messages: list[ConversationDict],
-        response_format: type[pydantic.BaseModel] | None = None,
-        **kwargs: Any,  # noqa: ANN401
-    ) -> ConversationDict:
-        """Answer a conversation, as every Opik judge metric asks.
-
-        :param messages: the conversation, in OpenAI's chat shape.
-        :param response_format: the verdict's model, for a structured answer.
-        :returns: the assistant's turn.
-        :rtype: ConversationDict
-        :raises ValueError: on a tool message, or a conversation that does not
-            end with a user message.
-        :raises LLMError: on a failed call.
-        """
-        _no_options(kwargs)
-        instructions, history = _conversation(messages)
-        result = complete_sync(
-            self.use_case,
-            history,
-            output_type=response_format or str,
-            instructions=instructions,
-        )
-        return {"role": "assistant", "content": _content(result)}
-
-    async def agenerate_chat_completion(
-        self,
-        messages: list[ConversationDict],
-        response_format: type[pydantic.BaseModel] | None = None,
-        **kwargs: Any,  # noqa: ANN401
-    ) -> ConversationDict:
-        """Answer a conversation; see ``generate_chat_completion``."""
-        _no_options(kwargs)
-        instructions, history = _conversation(messages)
-        result = await complete(
-            self.use_case,
-            history,
-            output_type=response_format or str,
-            instructions=instructions,
-        )
-        return {"role": "assistant", "content": _content(result)}
-
-    def generate_provider_response(
-        self,
-        messages: list[dict[str, Any]],
-        **kwargs: Any,  # noqa: ANN401
-    ) -> LLMResult[str]:
-        """Answer a conversation and return the whole result.
-
-        :param messages: the conversation, in OpenAI's chat shape.
-        :returns: the result.
-        :rtype: LLMResult
-        """
-        _no_options(kwargs)
-        instructions, history = _conversation(cast("list[ConversationDict]", messages))
-        return complete_sync(self.use_case, history, instructions=instructions)
-
-    async def agenerate_provider_response(
-        self,
-        messages: list[dict[str, Any]],
-        **kwargs: Any,  # noqa: ANN401
-    ) -> LLMResult[str]:
-        """Answer a conversation and return the whole result; see the sync form."""
-        _no_options(kwargs)
-        instructions, history = _conversation(cast("list[ConversationDict]", messages))
-        return await complete(self.use_case, history, instructions=instructions)
-
-
-def _no_options(kwargs: Mapping[str, Any]) -> None:
-    # Sampling options belong to the use case and the call policy, not to each
-    # metric; Opik's judge metrics pass none to a model they did not build.
-    if kwargs:
-        msg = f"JudgeModel takes no provider options, got {sorted(kwargs)}"
-        raise TypeError(msg)
-
-
-def _conversation(
-    messages: Sequence[ConversationDict],
-) -> tuple[str | None, list[ModelMessage]]:
-    """Split a chat conversation into instructions and PydanticAI messages."""
-    instructions: list[str] = []
-    history: list[ModelMessage] = []
-    for message in messages:
-        role = message["role"]
-        if role == "system":
-            instructions.append(message["content"])
-        elif role == "user":
-            history.append(ModelRequest(parts=[UserPromptPart(message["content"])]))
-        elif role == "assistant":
-            history.append(ModelResponse(parts=[TextPart(message["content"])]))
-        else:
-            msg = f"A judge conversation has no {role!r} messages"
-            raise ValueError(msg)
-    if not history or not isinstance(history[-1], ModelRequest):
-        msg = "A judge conversation must end with a user message"
-        raise ValueError(msg)
-    return "\n\n".join(instructions) or None, history
-
-
-def _content(result: LLMResult[Any]) -> str:
-    output = result.output
-    if isinstance(output, pydantic.BaseModel):
-        return output.model_dump_json()
-    return cast("str", output)
-
-
-class ValidatorMetric(BaseMetric):
-    """A deterministic check as an Opik metric, scored 1.0 on a pass and 0.0 not.
+class ValidatorMetric(Metric):
+    """A deterministic check as a metric, scored 1.0 on a pass and 0.0 not.
 
     The check takes the inputs it names from the dataset item and the task output
     (after ``scoring_key_mapping``) and returns a ``Verdict``: a bool, or the
@@ -304,7 +136,7 @@ class ValidatorMetric(BaseMetric):
     reused as it is, e.g. a placeholder check
     ``lambda source, output: placeholders(source) == placeholders(output)``.
 
-    Opik records an exception raised by the check as a failed score, which
+    An exception raised by the check is a failed score, which
     ``check_thresholds`` counts against the metric. An item whose task raised an
     ``LLMError`` in ``evaluate`` scores 0.0 without running the check.
 
@@ -317,7 +149,7 @@ class ValidatorMetric(BaseMetric):
         self, name: str, check: Callable[..., Verdict], *, track: bool = True
     ) -> None:
         """Hold the check and read which inputs it takes."""
-        super().__init__(name=name, track=track)
+        super().__init__(name, track=track)
         self._check = check
         parameters = inspect.signature(check).parameters.values()
         self._takes_any = any(p.kind is p.VAR_KEYWORD for p in parameters)
@@ -332,20 +164,18 @@ class ValidatorMetric(BaseMetric):
             if p.name in self._accepted and p.default is p.empty
         }
 
-    def score(self, **inputs: Any) -> score_result.ScoreResult:  # noqa: ANN401
+    def score(self, **inputs: Any) -> Score:  # noqa: ANN401
         """Run the check on one item.
 
         :param inputs: the item's fields and the task's output.
         :returns: 1.0 when the check passed, 0.0 with the problems when not.
-        :rtype: ScoreResult
+        :rtype: Score
         :raises ValueError: if an input the check needs is missing.
         :raises TypeError: if the check returns a string, which reads as neither a
             pass nor a list of problems.
         """
         if (error := inputs.get(LLM_ERROR_FIELD)) is not None:
-            return score_result.ScoreResult(
-                name=self.name, value=0.0, reason=f"the task raised {error}"
-            )
+            return Score(name=self.name, value=0.0, reason=f"the task raised {error}")
         if missing := sorted(self._required - inputs.keys()):
             msg = (
                 f"{self.name} needs {missing}; the item and output have "
@@ -366,7 +196,7 @@ class ValidatorMetric(BaseMetric):
         else:
             problems = list(verdict)
             passed = not problems
-        return score_result.ScoreResult(
+        return Score(
             name=self.name,
             value=1.0 if passed else 0.0,
             reason="; ".join(problems) or (None if passed else "check failed"),
@@ -406,92 +236,45 @@ def load_items(path: Path, *, group: str | None = None) -> list[dict[str, Any]]:
     return data
 
 
-_ITEM_FIELDS = frozenset(
-    {
-        "id",
-        "trace_id",
-        "span_id",
-        "source",
-        "description",
-        "evaluators",
-        "execution_policy",
-    }
-)
-"""The keys ``opik.api_objects.dataset.dataset_item.DatasetItem`` takes as its
-own fields rather than as the item's data."""
-
-
 def seed_dataset(
     name: str,
     items: Iterable[Mapping[str, Any]],
     *,
-    project_name: str,
+    app: str,
     description: str | None = None,
-) -> opik.Dataset:
-    """Add golden items to an Opik dataset, creating it if needed.
+) -> str | None:
+    """Add golden items to a dataset, creating it if needed.
 
-    Idempotent: the SDK hashes each item's content and skips one the dataset
-    already holds, reading the existing items' hashes before the first insert into
-    a dataset it fetched, and sends nothing when every item is already there. So
-    seeding the same file again adds no items and no version; changing or adding
-    items adds just those, as a new version. Items removed from the file stay in
-    the dataset: it is curated in Opik (spec §5.1 item 6), and deleting there is a
+    Idempotent: an item the dataset already holds is skipped, so seeding the same
+    file again adds no items and no version; changing or adding items adds just
+    those, as a new version. Items removed from the file stay in the dataset: it
+    is curated in the backend (spec §5.1 item 6), and deleting there is a
     deliberate change.
 
     :param name: the dataset, e.g. ``<use_case>-golden``.
     :param items: the items; an item's keys are its fields.
-    :param project_name: the app's Opik project.
+    :param app: the app, whose namespace holds the dataset.
     :param description: set on a dataset this creates.
-    :returns: the dataset; ``get_current_version_name()`` gives the version to
-        pin.
-    :rtype: opik.Dataset
-    :raises ValueError: if an item has a field Opik keeps for itself, e.g. ``id``
-        or ``description``.
+    :returns: the dataset's latest version, which a gate pins; ``None`` when it
+        has none.
+    :rtype: str | None
+    :raises ValueError: if an item has a field the backend keeps for itself, e.g.
+        ``id`` or ``description`` in Opik.
     """
-    rows = [dict(item) for item in items]
-    if reserved := sorted({key for row in rows for key in row} & _ITEM_FIELDS):
-        msg = (
-            f"Golden items may not have the fields {reserved}: Opik reads them as "
-            "the dataset item's own (an id must be a UUID, a description is dropped "
-            "from what the task sees). Rename them."
-        )
-        raise ValueError(msg)
-    dataset = tracing.opik_client().get_or_create_dataset(
-        name, description=description, project_name=project_name
+    return experiment_backend().seed_dataset(
+        name, [dict(item) for item in items], app=app, description=description
     )
-    dataset.insert(rows)
-    return dataset
 
 
-def _carry_environment() -> None:
-    """Put the deployment environment on the item's trace and its open span.
-
-    ``opik.evaluate`` opens each item's trace with no environment (``engine.py``),
-    and Opik gives a nested span its parent's environment, so without this the
-    task's and the judges' calls land in Opik's default environment instead of
-    ``Settings.environment``, with a warning for each.
-    ``opik_context`` hands out copies; these are the objects Opik sends when the
-    span and trace close. The exact opik pin keeps ``context_storage`` stable.
-    """
-    environment = get_settings().environment
-    if (trace := context_storage.get_trace_data()) is not None:
-        trace.environment = environment
-    if (span := context_storage.top_span_data()) is not None:
-        span.environment = environment
-
-
-def _guard_task(
-    task: Callable[[dict[str, Any]], dict[str, Any]],
-) -> Callable[[dict[str, Any]], dict[str, Any]]:
+def _guard_task(task: Task) -> Task:
     """Return the task with an ``LLMError`` turned into an output naming it.
 
-    Opik aborts the whole run on any task exception (``engine.py``), so one
-    content filter or exhausted retry would leave a gate with nothing to report.
+    A backend aborts the whole run on any task exception, so one content filter
+    or exhausted retry would leave a gate with nothing to report.
     """
 
     @functools.wraps(task)
     def guarded(item: dict[str, Any]) -> dict[str, Any]:
-        _carry_environment()
         try:
             return task(item)
         except LLMError as exc:
@@ -504,81 +287,49 @@ def _guard_task(
     return guarded
 
 
-class _MetricOnLLMError(BaseMetric):
+class _MetricOnLLMError(Metric):
     """A metric that reports a failed score for an item an ``LLMError`` cut short.
 
     Wraps every metric ``evaluate`` runs except ``ValidatorMetric``, which scores
     such an item 0.0 itself. A judge metric cannot do that: 0.0 is the passing
-    end of some, e.g. ``Hallucination``. So the item gets a failed score, which
-    Opik leaves out of the mean and does not store, and ``check_thresholds``
-    counts as unscored. A judge's own ``LLMError`` is reported the same way,
-    which also keeps Opik's rate-limit check, and its litellm import, off that
-    path.
+    end of some, e.g. ``hallucination``. So the item gets a failed score, which
+    is left out of the mean, and ``check_thresholds`` counts as unscored. A
+    judge's own ``LLMError`` is reported the same way, which also keeps Opik's
+    rate-limit check, and its litellm import, off that path.
 
     :param metric: the metric.
     """
 
-    def __init__(self, metric: BaseMetric) -> None:
-        """Take the metric's name; the metric keeps its own tracking."""
-        super().__init__(name=metric.name, track=False)
+    def __init__(self, metric: Metric) -> None:
+        """Take the metric's name and tracking."""
+        super().__init__(metric.name, track=metric.track)
         self.metric = metric
 
-    def score(
-        self,
-        **inputs: Any,  # noqa: ANN401
-    ) -> score_result.ScoreResult | list[score_result.ScoreResult]:
+    def score(self, **inputs: Any) -> Score | Sequence[Score]:  # noqa: ANN401
         """Score the item with the metric, or fail it after an ``LLMError``."""
-        # A span-reading metric runs under a trace Opik opens again, after the
-        # task's has closed.
-        _carry_environment()
         if (error := inputs.get(LLM_ERROR_FIELD)) is not None:
             return self._failed(f"the task raised {error}")
-        # What opik.evaluate does before calling a metric, so a missing input
-        # still aborts the run as it would without the wrapper.
-        validate_score_arguments(self.metric, inputs, None)
-        positional, keyword = arguments_helpers.select_score_arguments(
-            self.metric.score, inputs, self.name
-        )
         try:
-            return self.metric.score(*positional, **keyword)
+            return self.metric.score(**inputs)
         except LLMError as exc:
             return self._failed(f"the judge raised {type(exc).__name__}")
 
-    def _failed(self, reason: str) -> score_result.ScoreResult:
-        return score_result.ScoreResult(
-            name=self.name, value=0.0, reason=reason, scoring_failed=True
-        )
+    def _failed(self, reason: str) -> Score:
+        return Score(name=self.name, value=0.0, reason=reason, failed=True)
 
 
-class _SpanMetricOnLLMError(_MetricOnLLMError):
-    """``_MetricOnLLMError`` for a metric that reads the task span.
-
-    Opik passes ``task_span`` only to a metric whose ``score`` names it.
-    """
-
-    def score(
-        self,
-        task_span: Any = None,  # noqa: ANN401
-        **inputs: Any,  # noqa: ANN401
-    ) -> score_result.ScoreResult | list[score_result.ScoreResult]:
-        """Score the item with the metric and its task span."""
-        return super().score(task_span=task_span, **inputs)
-
-
-def _guard_metric(metric: BaseMetric) -> BaseMetric:
+def _guard_metric(metric: Metric) -> Metric:
     if isinstance(metric, ValidatorMetric):
         return metric
-    if "task_span" in inspect.signature(metric.score).parameters:
-        return _SpanMetricOnLLMError(metric)
     return _MetricOnLLMError(metric)
 
 
 def evaluate(  # noqa: PLR0913
-    task: Callable[[dict[str, Any]], dict[str, Any]],
+    task: Task,
     *,
     dataset: str,
-    project_name: str,
-    metrics: Sequence[BaseMetric],
+    app: str,
+    metrics: Sequence[Metric],
     prompts: Sequence[ManagedPrompt[Any]],
     dataset_version: str | None = None,
     experiment_name: str | None = None,
@@ -586,73 +337,69 @@ def evaluate(  # noqa: PLR0913
     scoring_key_mapping: Mapping[str, str] | None = None,
     task_threads: int = 16,
     experiment_tags: Sequence[str] = (),
-) -> EvaluationResult:
+) -> ExperimentResult:
     """Run an experiment on a dataset, linked to the prompt versions under test.
 
-    ``opik.evaluate`` with ``prompts=`` set from the managed prompts, so Opik
-    records which prompt versions and which dataset version the experiment ran
-    against. The experiment is tagged with the app and environment, and its
-    config records the environment. Buffered traces and spans are sent before it
-    returns, so a CI job can exit straight after. Each item's trace, and the
-    task's and judges' calls under it, are in the deployment environment.
+    The backend records which prompt versions and which dataset version the
+    experiment ran against. The experiment is tagged with the app and
+    environment, and its config records the environment. Buffered traces and
+    spans are sent before it returns, so a CI job can exit straight after.
 
-    An ``LLMError`` from the task does not abort the run, as Opik would: the
-    item's output becomes ``{"ol_llm_error": "<error class>"}``, a
-    ``ValidatorMetric`` scores it 0.0, and every other metric reports a failed
-    score, which ``check_thresholds`` counts as unscored. A judge metric's
-    ``LLMError`` is a failed score too. Any other exception from the task still
-    aborts the run.
+    An ``LLMError`` from the task does not abort the run: the item's output
+    becomes ``{"ol_llm_error": "<error class>"}``, a ``ValidatorMetric`` scores
+    it 0.0, and every other metric reports a failed score, which
+    ``check_thresholds`` counts as unscored. A judge metric's ``LLMError`` is a
+    failed score too. Any other exception from the task still aborts the run.
 
     :param task: called with each dataset item's fields; returns the output the
         metrics score.
     :param dataset: the dataset's name.
-    :param project_name: the app's Opik project, which holds the dataset.
-    :param metrics: the metrics, e.g. ``ValidatorMetric`` and Opik judge metrics
-        built on ``judge_model``.
-    :param prompts: every managed prompt the task uses, fetched from Opik. For a
-        prompt change, the version under review; for a model change, the
-        production version.
+    :param app: the app, whose namespace holds the dataset.
+    :param metrics: the metrics, e.g. ``ValidatorMetric`` and judge metrics on
+        ``judge_model``.
+    :param prompts: every managed prompt the task uses, fetched from the prompt
+        registry. For a prompt change, the version under review; for a model
+        change, the production version.
     :param dataset_version: the dataset version to run against, e.g. ``v3``; the
         latest when omitted. A gate pins it (spec §5.1 item 6).
-    :param experiment_name: the experiment's name; Opik generates one when omitted.
+    :param experiment_name: the experiment's name; the backend names it when
+        omitted.
     :param experiment_config: what describes the run, e.g. the model under test.
     :param scoring_key_mapping: metric input name to item or output field, e.g.
         ``{"input": "question"}``.
     :param task_threads: items run at once; 1 runs them in this thread.
     :param experiment_tags: tags beside the app and environment ones.
-    :returns: Opik's result, with the experiment's id and URL.
-    :rtype: EvaluationResult
+    :returns: the experiment, with its items and scores.
+    :rtype: ExperimentResult
     :raises ValueError: if ``prompts`` is empty or holds an embedded default or
-        a version from another registry, which has no Opik version to link.
+        a version the experiment backend cannot link.
     """
     if not prompts:
         msg = "Pass every managed prompt the task uses, so the experiment links them"
         raise ValueError(msg)
-    linked = {p.name: opik_prompt(p.registry_ref) for p in prompts}
-    if unlinked := [name for name, prompt in linked.items() if prompt is None]:
+    backend = experiment_backend()
+    if unlinked := [p.name for p in prompts if backend.linked_version(p) is None]:
         msg = (
-            f"Prompts {unlinked} are not Opik versions (embedded defaults, or from "
-            "another prompt registry); an evaluation links the Opik versions it ran"
+            f"Prompts {unlinked} are not versions the experiment backend can link "
+            "(embedded defaults, or from another prompt registry); an evaluation "
+            "links the versions it ran"
         )
         raise ValueError(msg)
     environment = get_settings().environment
-    source = tracing.opik_client().get_dataset(dataset, project_name=project_name)
-    result = opik.evaluate(
-        dataset=source
-        if dataset_version is None
-        else source.get_version_view(dataset_version),
-        task=_guard_task(task),
-        scoring_metrics=[_guard_metric(metric) for metric in metrics],
-        experiment_name=experiment_name,
-        experiment_config={"environment": environment, **(experiment_config or {})},
-        prompts=[prompt for prompt in linked.values() if prompt is not None],
-        scoring_key_mapping=dict(scoring_key_mapping or {}),
-        experiment_tags=[
-            f"app:{project_name}",
-            f"env:{environment}",
-            *experiment_tags,
-        ],
-        task_threads=task_threads,
+    result = backend.run_experiment(
+        ExperimentRun(
+            task=_guard_task(task),
+            metrics=[_guard_metric(metric) for metric in metrics],
+            app=app,
+            dataset=dataset,
+            dataset_version=dataset_version,
+            prompts=prompts,
+            name=experiment_name,
+            config={"environment": environment, **(experiment_config or {})},
+            tags=[f"app:{app}", f"env:{environment}", *experiment_tags],
+            scoring_key_mapping=dict(scoring_key_mapping or {}),
+            threads=task_threads,
+        )
     )
     tracing.flush()
     return result
@@ -666,8 +413,8 @@ class Threshold:
     """A bound on one metric's mean over an experiment.
 
     A deterministic validator that must pass on every item (spec §5.1 item 5) is
-    ``minimum=1.0``. A judge metric where higher is worse, such as Opik's
-    ``Hallucination``, takes a ``maximum``.
+    ``minimum=1.0``. A judge metric where higher is worse, such as
+    ``hallucination``, takes a ``maximum``.
 
     ``tolerance`` bounds the mean against a baseline, the last default-branch
     experiment for the production prompt version (spec §5.1 item 5): the mean may
@@ -861,7 +608,7 @@ class GateReport:
     """An experiment's scores against a use case's thresholds.
 
     :param experiment: the experiment's name, or its id when it has none.
-    :param url: the experiment in Opik, when known.
+    :param url: the experiment in the backend's UI, when known.
     :param mode: whether a miss fails the check.
     :param outcomes: one per threshold, in the order given.
     """
@@ -911,7 +658,7 @@ class EvaluationGateError(Exception):
 
 
 def check_thresholds(
-    result: EvaluationResult,
+    result: ExperimentResult,
     thresholds: Sequence[Threshold],
     *,
     mode: GateMode = "advisory",
@@ -935,7 +682,7 @@ def check_thresholds(
 
 
 def score_report(
-    result: EvaluationResult,
+    result: ExperimentResult,
     thresholds: Sequence[Threshold],
     *,
     mode: GateMode = "advisory",
@@ -956,17 +703,10 @@ def score_report(
     :rtype: GateReport
     :raises ValueError: if an item has two scores of the same name.
     """
-    items = [
-        _item_scores(
-            (score.name, None if score.scoring_failed else score.value)
-            for score in test_result.score_results
-        )
-        for test_result in result.test_results
-    ]
     return _report(
-        experiment=result.experiment_name or result.experiment_id,
-        url=result.experiment_url,
-        items=items,
+        experiment=result.name or result.experiment_id,
+        url=result.url,
+        items=_scores(result),
         thresholds=thresholds,
         mode=mode,
         baselines=baselines,
@@ -979,14 +719,14 @@ def check_experiment(
     *,
     mode: GateMode = "advisory",
 ) -> GateReport:
-    """Compare a finished experiment's scores in Opik to its thresholds.
+    """Compare a finished experiment's scores to its thresholds.
 
     For a CI step separate from the one that ran the experiment. Opik keeps only
-    the scores that succeeded, so an item whose scoring failed counts as
-    unscored, as in ``check_thresholds``. The SDK reads at most 10,000 items, so
-    a larger experiment is refused rather than judged on part of it.
+    the scores that succeeded, so there an item whose scoring failed counts as
+    unscored, as in ``check_thresholds``. A backend reads at most 10,000 items,
+    so a larger experiment is refused rather than judged on part of it.
 
-    :param experiment_id: the experiment's id, from ``EvaluationResult``.
+    :param experiment_id: the experiment's id, from ``ExperimentResult``.
     :param thresholds: the use case's thresholds.
     :param mode: ``advisory`` logs a miss as a warning; ``blocking`` raises.
     :returns: the report.
@@ -1001,39 +741,24 @@ def check_experiment(
 def _experiment_report(
     experiment_id: str, thresholds: Sequence[Threshold], *, mode: GateMode
 ) -> GateReport:
-    experiment, found = _experiment_items(experiment_id)
-    # Opik sends a null value for a score it has no value for.
-    items = [
-        _item_scores((score["name"], score["value"]) for score in item.feedback_scores)
-        for item in found
-    ]
+    result = experiment_backend().read_experiment(experiment_id)
     return _report(
-        experiment=experiment.name or experiment_id,
+        experiment=result.name or experiment_id,
         url=None,
-        items=items,
+        items=_scores(result),
         thresholds=thresholds,
         mode=mode,
     )
 
 
-def _experiment_items(
-    experiment_id: str,
-) -> tuple[Experiment, list[ExperimentItemContent]]:
-    """Read an experiment and its items from Opik.
-
-    :raises ValueError: if it has more items than the SDK reads, rather than
-        return part of them.
-    """
-    experiment = tracing.opik_client().get_experiment_by_id(experiment_id)
-    # One past the SDK's cap, which max_results=None does not lift.
-    found = experiment.get_items(max_results=MAX_EXPERIMENT_ITEMS + 1)
-    if len(found) > MAX_EXPERIMENT_ITEMS:
-        msg = (
-            f"Experiment {experiment_id} has more than {MAX_EXPERIMENT_ITEMS} items, "
-            "more than the Opik SDK reads"
+def _scores(result: ExperimentResult) -> list[dict[str, float | None]]:
+    """Return each item's scores by name, ``None`` for one that failed."""
+    return [
+        _item_scores(
+            (score.name, None if score.failed else score.value) for score in item.scores
         )
-        raise ValueError(msg)
-    return experiment, found
+        for item in result.items
+    ]
 
 
 def _item_scores(scores: Iterable[tuple[str, float | None]]) -> dict[str, float | None]:
@@ -1246,21 +971,13 @@ class PairwiseComparison:
         return " ".join(parts)
 
 
-@dataclass(frozen=True, kw_only=True)
-class _Answered:
-    dataset_item_id: str
-    trace_id: str
-    item: Mapping[str, Any]
-    output: Mapping[str, Any]
-
-
 def judge_pairwise(  # noqa: PLR0913
-    candidate: EvaluationResult | str,
+    candidate: ExperimentResult | str,
     reference: str,
     *,
     judge: JudgeModel,
     criteria: str,
-    project_name: str,
+    app: str,
     answer_fields: Sequence[str] = ("output",),
     metric: str = PAIRWISE_METRIC,
     threads: int = 16,
@@ -1273,19 +990,19 @@ def judge_pairwise(  # noqa: PLR0913
     is the verdict, and when they do not the pair is a tie, so a judge that
     favors a position cannot decide an item. Each verdict is logged as the
     ``metric`` score on the candidate's item, 1 for a win, 0.5 for a tie and 0
-    for a loss, with the judge's reasons, so Opik shows it beside the
+    for a loss, with the judge's reasons, so the backend shows it beside the
     experiment's other scores.
 
     The judge's calls go through ``complete_sync`` under the judge's use case
     (``eval-judge`` from ``judge_model``), so each is traced and costed there.
 
     :param candidate: the experiment under test: what ``evaluate`` returned, or
-        its id in Opik.
+        its id.
     :param reference: the experiment to compare with, e.g. the gate's baseline.
     :param judge: the judge, from ``judge_model``.
     :param criteria: what makes one answer better than the other, for this use
         case.
-    :param project_name: the app's Opik project, which holds the experiments.
+    :param app: the app, whose namespace holds the experiments.
     :param answer_fields: the task output fields the judge compares; it sees
         the whole dataset item.
     :param metric: the score's name.
@@ -1298,21 +1015,13 @@ def judge_pairwise(  # noqa: PLR0913
         leaves its item unpaired, so a gate whose answer fields changed can
         record a new baseline.
     """
+    backend = experiment_backend()
     candidate_id = candidate if isinstance(candidate, str) else candidate.experiment_id
     _check_same_dataset_version(candidate_id, reference)
     if isinstance(candidate, str):
-        candidates = _answers(_experiment_items(candidate)[1])
-    else:
-        candidates = _keyed(
-            _Answered(
-                dataset_item_id=test.test_case.dataset_item_id,
-                trace_id=test.test_case.trace_id,
-                item=test.test_case.dataset_item_content,
-                output=test.test_case.task_output,
-            )
-            for test in candidate.test_results
-        )
-    references = _answers(_experiment_items(reference)[1])
+        candidate = backend.read_experiment(candidate)
+    candidates = _keyed(candidate.items)
+    references = _keyed(backend.read_experiment(reference).items)
     unpaired = [
         SkippedItem(dataset_item_id=item_id, reason="only in the reference")
         for item_id in references.keys() - candidates.keys()
@@ -1362,7 +1071,7 @@ def judge_pairwise(  # noqa: PLR0913
     verdicts = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as pool:
         # Each call runs in a copy of this context, so model overrides and the
-        # Opik trace context set by the caller reach the judge's calls.
+        # trace context set by the caller reach the judge's calls.
         futures = [
             pool.submit(
                 contextvars.copy_context().run,
@@ -1391,18 +1100,18 @@ def judge_pairwise(  # noqa: PLR0913
                     )
                 )
     if verdicts:
-        tracing.opik_client().log_traces_feedback_scores(
-            scores=[
-                BatchFeedbackScoreDict(
-                    id=verdict.trace_id,
+        backend.log_scores(
+            [
+                TraceScore(
+                    trace_id=verdict.trace_id,
                     name=metric,
                     value=PAIRWISE_SCORES[verdict.outcome],
                     reason=verdict.reason,
-                    category_name=verdict.outcome,
-                    project_name=project_name,
+                    category=verdict.outcome,
                 )
                 for verdict in verdicts
-            ]
+            ],
+            app=app,
         )
     tracing.flush()
     return PairwiseComparison(
@@ -1416,13 +1125,9 @@ def judge_pairwise(  # noqa: PLR0913
 
 
 def _check_same_dataset_version(candidate: str, reference: str) -> None:
-    experiments = tracing.opik_client().rest_client.experiments
-    found = {
-        experiment_id: experiments.get_experiment_by_id(id=experiment_id)
-        for experiment_id in (candidate, reference)
-    }
-    versions = {(e.dataset_id, e.dataset_version_id) for e in found.values()}
-    if len(versions) > 1 or any(version is None for _, version in versions):
+    backend = experiment_backend()
+    versions = {backend.experiment_dataset_version(e) for e in (candidate, reference)}
+    if len(versions) > 1 or None in versions:
         msg = (
             f"Experiments {candidate} and {reference} did not run on the same "
             "dataset version, so their items cannot be paired"
@@ -1430,25 +1135,13 @@ def _check_same_dataset_version(candidate: str, reference: str) -> None:
         raise ValueError(msg)
 
 
-def _answers(items: Iterable[ExperimentItemContent]) -> dict[str, _Answered]:
-    return _keyed(
-        _Answered(
-            dataset_item_id=item.dataset_item_id,
-            trace_id=item.trace_id,
-            item=item.dataset_item_data or {},
-            output=item.evaluation_task_output or {},
-        )
-        for item in items
-    )
-
-
-def _keyed(answers: Iterable[_Answered]) -> dict[str, _Answered]:
+def _keyed(answers: Iterable[ExperimentItem]) -> dict[str, ExperimentItem]:
     """Key answers by dataset item id.
 
     :raises ValueError: if two answer one item, as with ``trial_count`` above 1,
         since then which to pair is ambiguous.
     """
-    keyed: dict[str, _Answered] = {}
+    keyed: dict[str, ExperimentItem] = {}
     for answered in answers:
         if answered.dataset_item_id in keyed:
             msg = (
@@ -1460,7 +1153,7 @@ def _keyed(answers: Iterable[_Answered]) -> dict[str, _Answered]:
     return keyed
 
 
-def _answer(answered: _Answered, fields: Sequence[str]) -> dict[str, Any]:
+def _answer(answered: ExperimentItem, fields: Sequence[str]) -> dict[str, Any]:
     if missing := [f for f in fields if f not in answered.output]:
         msg = (
             f"The candidate's answer to dataset item {answered.dataset_item_id} has no "
@@ -1474,7 +1167,7 @@ def _answer(answered: _Answered, fields: Sequence[str]) -> dict[str, Any]:
 def _judge_pair(
     judge: JudgeModel,
     instructions: str,
-    answered: _Answered,
+    answered: ExperimentItem,
     candidate: Mapping[str, Any],
     reference: Mapping[str, Any],
 ) -> PairVerdict:
@@ -1528,13 +1221,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     :rtype: int
     """
     parser = argparse.ArgumentParser(
-        prog="ol-llm-eval", description="Golden datasets and gates in Opik."
+        prog="ol-llm-eval", description="Golden datasets, experiments and gates."
     )
     commands = parser.add_subparsers(dest="command", required=True)
     seed = commands.add_parser("seed", help="add a file's golden items to a dataset")
     seed.add_argument("file", type=Path, help="a JSON list of items, or named lists")
     seed.add_argument("--dataset", required=True, help="the dataset's name")
-    seed.add_argument("--project", required=True, help="the app's Opik project")
+    seed.add_argument("--app", required=True, help="the app, which owns the dataset")
     seed.add_argument("--group", help="the named list to read from the file")
     check = commands.add_parser(
         "check", help="check an experiment's scores against thresholds"
@@ -1578,13 +1271,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             report=args.report,
         )
     if args.command == "seed":
-        dataset = seed_dataset(
-            args.dataset,
-            load_items(args.file, group=args.group),
-            project_name=args.project,
+        version = seed_dataset(
+            args.dataset, load_items(args.file, group=args.group), app=args.app
         )
-        version = dataset.get_current_version_name() or "unversioned"
-        sys.stdout.write(f"{args.dataset} {version}\n")
+        sys.stdout.write(f"{args.dataset} {version or 'unversioned'}\n")
         return 0
     report = _experiment_report(
         args.experiment_id, args.threshold, mode=cast("GateMode", args.mode)
