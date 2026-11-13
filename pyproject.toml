@@ -18,7 +18,6 @@ dev = [
 ]
 
 [tool.uv]
-required-version = ">=0.12.22,<0.14"
 package = false
 # Floors for transitive dependencies with advisories against earlier releases, so a
 # relock can't resolve back into them. They shape this lockfile only, not the wheel.
