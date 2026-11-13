@@ -580,38 +580,46 @@ is its own root trace.
 
 ### Evaluation
 
-A use case whose output a learner or instructor sees keeps a golden dataset in Opik and runs
-an experiment on every prompt or model change; gates start advisory
+A use case whose output a learner or instructor sees keeps a golden dataset and runs an
+experiment on every prompt or model change; gates start advisory
 ([lifecycle spec §4.2 and §5](https://github.com/mitodl/ol-infrastructure/blob/main/docs/plans/llm-opik-lifecycle-spec.md)).
 `ol_llm.evaluation` covers that path. It needs the `pydantic-ai` extra and the judge model's
-provider extra. Run it where the Opik SDK is installed whole (CI evaluation jobs, developer
-machines), not in a slimmed runtime image.
+provider extra.
+
+Datasets and experiments live in an experiment backend chosen by name
+([library spec §8.3](https://github.com/mitodl/ol-infrastructure/blob/main/docs/plans/shared-llm-library-spec.md)):
+`OL_LLM_EXPERIMENT_BACKEND` is `opik` (the default) or `memory`, which keeps them in the
+process for tests. Another package adds one with an entry point in the
+`ol_llm.experiment_backends` group, and a host can pass one to
+`ol_llm.experiments.configure_experiment_backend`. Metrics, results and the gate are ol-llm's
+types whatever the backend. With Opik, run experiments where the Opik SDK is installed whole
+(CI evaluation jobs, developer machines), not in a slimmed runtime image.
 
 Seed the dataset from a file in the repository. A JSON list of items, or an object of named
 lists such as learn-ai's `test_json/rag_evaluation.json`:
 
 ```sh
 ol-llm-eval seed test_json/rag_evaluation.json --group syllabus \
-    --dataset syllabus-golden --project learn-ai   # prints "syllabus-golden v1"
+    --dataset syllabus-golden --app learn-ai   # prints "syllabus-golden v1"
 ```
 
-or `seed_dataset("syllabus-golden", load_items(path, group="syllabus"),
-project_name="learn-ai")`. Seeding again adds only items whose content the dataset does not
-already hold, as a new version, so the job can run on every change to the file. Items deleted
-from the file stay in Opik, where the dataset is curated. Fields Opik keeps for itself (`id`,
-`description`, `source`, and the like) are refused.
+or `seed_dataset("syllabus-golden", load_items(path, group="syllabus"), app="learn-ai")`,
+which returns the latest version. Seeding again adds only items whose content the dataset does
+not already hold, as a new version, so the job can run on every change to the file. Items
+deleted from the file stay in the backend, where the dataset is curated. Fields Opik keeps for
+itself (`id`, `description`, `source`, and the like) are refused.
 
-
-Run the experiment with the managed prompts the task uses, so Opik links their versions:
+Run the experiment with the managed prompts the task uses, so the backend links their
+versions:
 
 ```python
-from opik.evaluation.metrics import AnswerRelevance, Hallucination
-
 from ol_llm.evaluation import (
     Threshold,
     ValidatorMetric,
+    answer_relevance,
     check_thresholds,
     evaluate,
+    hallucination,
     judge_model,
 )
 
@@ -632,11 +640,11 @@ result = evaluate(
     task,
     dataset="syllabus-golden",
     dataset_version="v3",
-    project_name="learn-ai",
+    app="learn-ai",
     prompts=[prompt],
     metrics=[
-        Hallucination(model=judge),
-        AnswerRelevance(model=judge),
+        hallucination(judge),
+        answer_relevance(judge),
         ValidatorMetric("cites_course", lambda output: "8.01" in output),
     ],
     scoring_key_mapping={"input": "question"},
@@ -651,22 +659,29 @@ check_thresholds(
 )
 ```
 
-`evaluate` refuses an embedded default prompt, since it has no version to link, and tags the
-experiment `app:` and `env:`. `dataset_version` pins what the gate runs against; the latest
-version when omitted.
+`evaluate` returns an `ExperimentResult`: the experiment's id, name and URL, and each item
+with its output and `Score`s. It refuses an embedded default prompt, since it has no version
+to link, and tags the experiment `app:` and `env:`. `dataset_version` pins what the gate runs
+against; the latest version when omitted.
 
-Opik aborts the whole run when a task raises. `evaluate` catches an `LLMError` from the task
+A backend aborts the whole run when a task raises. `evaluate` catches an `LLMError` from the task
 instead (a content filter, retries spent): the item's output becomes
 `{"ol_llm_error": "<error class>"}`, visible on its trace, a `ValidatorMetric` scores it 0.0,
 and every other metric gives it a failed score, which `check_thresholds` counts as unscored. A
 judge metric's own `LLMError` is a failed score too. Any other exception still aborts the run.
 
-`judge_model(app, model)` gives an Opik judge metric that takes `model=` a model that calls
-through `complete`, under the `eval-judge` use case in the app's project: the judge is
-routed, retried, traced, and costed like any other call. Its model must be in the catalog; an
-uncataloged id raises. It should not be the model under test. `SycEval` needs it as
-`rebuttal_model=` too, or it calls a LiteLLM model for the rebuttal; Opik's dataset-item
-evaluators (`LLMJudge`) take only a model name and cannot use it.
+`judge_model(app, model)` is a judge that calls through `complete`, under the `eval-judge`
+use case in the app's project: it is routed, retried, traced, and costed like any other call.
+Its model must be in the catalog; an uncataloged id raises. It should not be the model under
+test. The judge metrics `hallucination`, `answer_relevance`, `context_precision` and
+`context_recall` take it. They are Opik's metric classes, run in this process on the judge
+whatever the experiment backend, and keep Opik's score names (`hallucination_metric`,
+`answer_relevance_metric`, `context_precision_metric`, `context_recall_metric`). Apps do not
+import Opik's metrics; a judge metric an app needs that is not here is added to ol-llm first.
+
+A metric is a `Metric`: a name and a `score(**inputs)` that takes the item's and the output's
+fields by keyword (after `scoring_key_mapping`) and returns a `Score` (`name`, `value`,
+`reason`, `failed`) or a list of them. Subclass it for an app's own scoring function.
 
 `ValidatorMetric(name, check)` makes a deterministic check a metric, scored 1.0 on a pass and
 0.0 otherwise. The check names the item and output fields it takes as parameters and returns
@@ -899,7 +914,7 @@ override-dependencies = [
 Drop `openai` from that list if the application uses the `openai` extra. The overrides belong
 in runtime images, not in an environment that runs evaluations: `opik.evaluate` imports
 litellm and openai whenever a task or metric raises something other than the `LLMError`
-that `ol_llm.evaluation.evaluate` catches. Opik's judge metrics on
+that `ol_llm.evaluation.evaluate` catches. The judge metrics on
 `ol_llm.evaluation.judge_model` do not need litellm, and the smoke test scores one, and an
 item whose task raised an `LLMError`, in the slimmed install. CI checks this exact list on every change (`python/smoke/`).
 

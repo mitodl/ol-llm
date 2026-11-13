@@ -1,8 +1,9 @@
-import contextlib
+import dataclasses
+import inspect
 import json
 import logging
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,35 +19,39 @@ from ol_llm.errors import LLMContentFiltered, LLMUnavailable
 from ol_llm.evaluation import (
     JUDGE_USE_CASE,
     LLM_ERROR_FIELD,
-    MAX_EXPERIMENT_ITEMS,
     PAIRWISE_METRIC,
     EvaluationGateError,
+    ExperimentItem,
+    ExperimentResult,
     JudgeModel,
+    Metric,
     MetricOutcome,
+    MissingMetricInputError,
+    Score,
     SkippedItem,
     Threshold,
     ValidatorMetric,
     check_experiment,
     check_thresholds,
     evaluate,
+    hallucination,
     judge_model,
     judge_pairwise,
     load_items,
     main,
     seed_dataset,
 )
+from ol_llm.experiments import MAX_EXPERIMENT_ITEMS
 from ol_llm.models import PolicyModel, override_models, shared_model
 from ol_llm.prompts import ManagedPrompt
 from ol_llm.runs import complete_sync
-from opik.api_objects import local_recording
 from opik.api_objects.dataset.dataset_item import DatasetItem
 from opik.api_objects.experiment.experiment_item import ExperimentItemContent
 from opik.evaluation import test_case, test_result
 from opik.evaluation.evaluation_result import EvaluationResult
-from opik.evaluation.metrics import BaseMetric, Hallucination
+from opik.evaluation.metrics import Hallucination
 from opik.evaluation.metrics.score_result import ScoreResult
-from opik.exceptions import ScoreMethodMissingArguments
-from opik.message_processing.emulation.models import SpanModel, TraceModel
+from opik.message_processing.emulation.models import SpanModel
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import (
     ModelMessage,
@@ -134,21 +139,31 @@ def client(monkeypatch: pytest.MonkeyPatch) -> FakeClient:
     return fake
 
 
-def scored(*rows: list[ScoreResult]) -> EvaluationResult:
+def scored(*rows: list[Score]) -> ExperimentResult:
+    return ExperimentResult(
+        experiment_id="exp-1",
+        name="summary-ci",
+        url="https://opik.example/experiments/exp-1",
+        items=tuple(
+            ExperimentItem(
+                dataset_item_id=f"i{i}",
+                trace_id=f"t{i}",
+                item={},
+                output={},
+                scores=tuple(row),
+            )
+            for i, row in enumerate(rows)
+        ),
+    )
+
+
+def opik_result(*results: test_result.TestResult) -> EvaluationResult:
+    """What ``opik.evaluate`` returns for an experiment."""
     return EvaluationResult(
         experiment_id="exp-1",
         dataset_id="ds-1",
         experiment_name="summary-ci",
-        test_results=[
-            test_result.TestResult(
-                test_case=test_case.TestCase(
-                    trace_id=f"t{i}", dataset_item_id=f"i{i}", task_output={}
-                ),
-                score_results=row,
-                trial_id=0,
-            )
-            for i, row in enumerate(rows)
-        ],
+        test_results=list(results),
         experiment_url="https://opik.example/experiments/exp-1",
         trial_count=1,
     )
@@ -158,30 +173,29 @@ def nonempty(output: str) -> bool:
     return bool(output)
 
 
-def score(name: str, value: float, *, failed: bool = False) -> ScoreResult:
-    return ScoreResult(name=name, value=value, scoring_failed=failed)
+def score(name: str, value: float, *, failed: bool = False) -> Score:
+    return Score(name=name, value=value, failed=failed)
 
 
 # Datasets
 
 
 def test_seeding_twice_adds_nothing_the_second_time(client: FakeClient) -> None:
-    first = seed_dataset("summary-golden", GOLDEN, project_name=APP)
-    again = seed_dataset("summary-golden", [dict(i) for i in GOLDEN], project_name=APP)
+    first = seed_dataset("summary-golden", GOLDEN, app=APP)
+    again = seed_dataset("summary-golden", [dict(i) for i in GOLDEN], app=APP)
 
-    assert again is first
+    assert (first, again) == ("v1", "v1")
     assert len(client.datasets[APP, "summary-golden"].items) == len(GOLDEN)
-    assert again.get_current_version_name() == "v1"
 
 
 def test_seeding_a_changed_file_adds_only_the_new_items(client: FakeClient) -> None:
-    seed_dataset("summary-golden", GOLDEN, project_name=APP)
+    seed_dataset("summary-golden", GOLDEN, app=APP)
     extra = {"question": "Is 8.01 free?", "expected_output": "Yes"}
 
-    dataset = seed_dataset("summary-golden", [*GOLDEN, extra], project_name=APP)
+    version = seed_dataset("summary-golden", [*GOLDEN, extra], app=APP)
 
     assert len(client.datasets[APP, "summary-golden"].items) == len(GOLDEN) + 1
-    assert dataset.get_current_version_name() == "v2"
+    assert version == "v2"
 
 
 @pytest.mark.parametrize("field", ["id", "description"])
@@ -189,7 +203,7 @@ def test_seeding_refuses_a_field_opik_keeps_for_itself(
     client: FakeClient, field: str
 ) -> None:
     with pytest.raises(ValueError, match=f"fields \\['{field}'\\]"):
-        seed_dataset("summary-golden", [{**GOLDEN[0], field: "x"}], project_name=APP)
+        seed_dataset("summary-golden", [{**GOLDEN[0], field: "x"}], app=APP)
     assert not client.datasets
 
 
@@ -253,9 +267,20 @@ def test_evaluate_links_the_prompt_versions_to_the_experiment(
     monkeypatch: pytest.MonkeyPatch,
     production_prompt: ManagedPrompt[TextTemplate],
 ) -> None:
-    seed_dataset("summary-golden", GOLDEN, project_name=APP)
+    seed_dataset("summary-golden", GOLDEN, app=APP)
     calls: list[dict[str, Any]] = []
-    expected = scored([score("correct", 1.0)])
+    expected = opik_result(
+        test_result.TestResult(
+            test_case=test_case.TestCase(
+                trace_id="t0",
+                dataset_item_id="i0",
+                task_output={"output": "Who teaches 8.01?"},
+                dataset_item_content=GOLDEN[0],
+            ),
+            score_results=[ScoreResult(name="correct", value=1.0, reason="r")],
+            trial_id=0,
+        )
+    )
 
     def fake_evaluate(**kwargs: Any) -> EvaluationResult:  # noqa: ANN401
         calls.append(kwargs)
@@ -270,7 +295,7 @@ def test_evaluate_links_the_prompt_versions_to_the_experiment(
     result = evaluate(
         task,
         dataset="summary-golden",
-        project_name=APP,
+        app=APP,
         metrics=[metric],
         prompts=[production_prompt],
         dataset_version="v1",
@@ -278,14 +303,27 @@ def test_evaluate_links_the_prompt_versions_to_the_experiment(
         scoring_key_mapping={"input": "question"},
     )
 
-    assert result is expected
+    assert result == ExperimentResult(
+        experiment_id="exp-1",
+        name="summary-ci",
+        url="https://opik.example/experiments/exp-1",
+        items=(
+            ExperimentItem(
+                dataset_item_id="i0",
+                trace_id="t0",
+                item=GOLDEN[0],
+                output={"output": "Who teaches 8.01?"},
+                scores=(Score(name="correct", value=1.0, reason="r"),),
+            ),
+        ),
+    )
     [call] = calls
     assert production_prompt.registry_ref is not None
     assert production_prompt.version == "v2"
     assert call["prompts"] == [production_prompt.registry_ref]
     assert call["dataset"] == ("summary-golden", "v1")
-    assert call["task"].__wrapped__ is task
-    assert call["scoring_metrics"] == [metric]
+    assert inspect.unwrap(call["task"]) is task
+    assert [m.metric for m in call["scoring_metrics"]] == [metric]
     assert call["experiment_tags"] == [f"app:{APP}", "env:ci"]
     assert call["experiment_config"] == {
         "environment": "ci",
@@ -294,24 +332,29 @@ def test_evaluate_links_the_prompt_versions_to_the_experiment(
     assert call["scoring_key_mapping"] == {"input": "question"}
 
 
-@pytest.mark.usefixtures("client")
 def test_evaluate_runs_the_latest_dataset_version_unless_pinned(
+    client: FakeClient,
     monkeypatch: pytest.MonkeyPatch,
     production_prompt: ManagedPrompt[TextTemplate],
 ) -> None:
-    dataset = seed_dataset("summary-golden", GOLDEN, project_name=APP)
+    seed_dataset("summary-golden", GOLDEN, app=APP)
     calls: list[dict[str, Any]] = []
-    monkeypatch.setattr(opik, "evaluate", lambda **kwargs: calls.append(kwargs))
+
+    def fake_evaluate(**kwargs: Any) -> EvaluationResult:  # noqa: ANN401
+        calls.append(kwargs)
+        return opik_result()
+
+    monkeypatch.setattr(opik, "evaluate", fake_evaluate)
 
     evaluate(
         lambda item: item,
         dataset="summary-golden",
-        project_name=APP,
+        app=APP,
         metrics=[],
         prompts=[production_prompt],
     )
 
-    assert calls[0]["dataset"] is dataset
+    assert calls[0]["dataset"] is client.datasets[APP, "summary-golden"]
 
 
 @pytest.mark.usefixtures("client")
@@ -323,11 +366,11 @@ def test_evaluate_refuses_an_embedded_default() -> None:
         degraded_reasons=("embedded_prompt",),
     )
 
-    with pytest.raises(ValueError, match="not Opik versions"):
+    with pytest.raises(ValueError, match="not versions the experiment backend can"):
         evaluate(
             lambda item: item,
             dataset="summary-golden",
-            project_name=APP,
+            app=APP,
             metrics=[],
             prompts=[embedded],
         )
@@ -339,7 +382,7 @@ def test_evaluate_needs_the_prompts_it_runs() -> None:
         evaluate(
             lambda item: item,
             dataset="summary-golden",
-            project_name=APP,
+            app=APP,
             metrics=[],
             prompts=[],
         )
@@ -405,15 +448,15 @@ def run_rag(
     production_prompt: ManagedPrompt[TextTemplate],
     task: Callable[[dict[str, Any]], dict[str, Any]] = answer,
     mapping: dict[str, str] | None = None,
-) -> EvaluationResult:
-    seed_dataset("rag-golden", RAG, project_name=APP)
+) -> ExperimentResult:
+    seed_dataset("rag-golden", RAG, app=APP)
     return evaluate(
         task,
         dataset="rag-golden",
-        project_name=APP,
+        app=APP,
         metrics=[
             ValidatorMetric("nonempty", nonempty, track=False),
-            Hallucination(model=judge_model(APP, JUDGE), track=False),
+            hallucination(judge_model(APP, JUDGE), track=False),
         ],
         prompts=[production_prompt],
         scoring_key_mapping={"input": "question"} if mapping is None else mapping,
@@ -421,12 +464,9 @@ def run_rag(
     )
 
 
-def by_question(result: EvaluationResult) -> dict[str, dict[str, ScoreResult]]:
+def by_question(result: ExperimentResult) -> dict[str, dict[str, Score]]:
     return {
-        r.test_case.dataset_item_content["question"]: {
-            s.name: s for s in r.score_results
-        }
-        for r in result.test_results
+        item.item["question"]: {s.name: s for s in item.scores} for item in result.items
     }
 
 
@@ -440,19 +480,17 @@ def test_a_task_llm_error_fails_its_item_instead_of_the_run(
     scores = by_question(result)
     good, filtered = scores[RAG[0]["question"]], scores[FILTERED]
     assert (good["nonempty"].value, good["hallucination_metric"].value) == (1.0, 0.0)
-    assert not good["hallucination_metric"].scoring_failed
+    assert not good["hallucination_metric"].failed
     assert (filtered["nonempty"].value, filtered["nonempty"].reason) == (
         0.0,
         "the task raised LLMContentFiltered",
     )
-    assert not filtered["nonempty"].scoring_failed
+    assert not filtered["nonempty"].failed
     judged = filtered["hallucination_metric"]
-    assert judged.scoring_failed
+    assert judged.failed
     assert judged.reason == "the task raised LLMContentFiltered"
-    [failed] = [
-        r for r in result.test_results if r.test_case.task_output.get(LLM_ERROR_FIELD)
-    ]
-    assert failed.test_case.task_output == {LLM_ERROR_FIELD: "LLMContentFiltered"}
+    [failed] = [item for item in result.items if item.output.get(LLM_ERROR_FIELD)]
+    assert failed.output == {LLM_ERROR_FIELD: "LLMContentFiltered"}
 
     report = check_thresholds(
         result,
@@ -479,65 +517,59 @@ def test_a_judge_llm_error_is_a_failed_score(
 
     for scores in by_question(result).values():
         judged = scores["hallucination_metric"]
-        assert judged.scoring_failed
+        assert judged.failed
         assert judged.reason == "the judge raised LLMRejected"
         assert scores["nonempty"].value == 1.0
 
 
-class SpanJudge(BaseMetric):
-    """A judge that reads the task span, which Opik scores on a separate path."""
+class FlakyJudge(Metric):
+    """An app's own judge metric, whose judge is down for one item."""
 
     def __init__(self) -> None:
-        super().__init__(name="span_judge", track=False)
+        super().__init__("flaky_judge", track=False)
 
-    def score(
-        self,
-        input: str,  # noqa: A002
-        task_span: object,
-        **_: object,
-    ) -> ScoreResult:
+    def score(self, input: str, **_: object) -> Score:  # type: ignore[override]  # noqa: A002
         if input == FILTERED:
             msg = "judge down"
             raise LLMUnavailable(msg, use_case=JUDGE_USE_CASE, model=JUDGE)
-        return ScoreResult(name=self.name, value=float(task_span is not None))
+        return Score(name=self.name, value=1.0)
 
 
 @ON_OPIKS_ENGINE
-def test_a_span_reading_judges_llm_error_is_a_failed_score(
+def test_an_app_metrics_llm_error_is_a_failed_score(
     production_prompt: ManagedPrompt[TextTemplate],
 ) -> None:
-    seed_dataset("rag-golden", RAG, project_name=APP)
+    seed_dataset("rag-golden", RAG, app=APP)
     result = evaluate(
         lambda _item: {"output": "x"},
         dataset="rag-golden",
-        project_name=APP,
-        metrics=[SpanJudge()],
+        app=APP,
+        metrics=[FlakyJudge()],
         prompts=[production_prompt],
         scoring_key_mapping={"input": "question"},
         task_threads=1,
     )
 
     scores = by_question(result)
-    assert scores[RAG[0]["question"]]["span_judge"].value == 1.0
-    judged = scores[FILTERED]["span_judge"]
-    assert judged.scoring_failed
+    assert scores[RAG[0]["question"]]["flaky_judge"].value == 1.0
+    judged = scores[FILTERED]["flaky_judge"]
+    assert judged.failed
     assert judged.reason == "the judge raised LLMUnavailable"
 
 
 SUMMARY = UseCase(app=APP, name="summary", profile="request", model=JUDGE)
 
 
-class LibrarySpanJudge(BaseMetric):
-    """A span-reading judge that asks through the library, on Opik's second pass."""
+class LibraryJudge(Metric):
+    """A tracked judge metric that asks through the library."""
 
     def __init__(self) -> None:
-        super().__init__(name="library_span_judge")
+        super().__init__("library_judge")
         self.judge = judge_model(APP, JUDGE)
 
-    def score(self, output: str, task_span: object, **_: object) -> ScoreResult:
-        del task_span
+    def score(self, output: str, **_: object) -> Score:  # type: ignore[override]
         self.judge.generate_string(output)
-        return ScoreResult(name=self.name, value=1.0)
+        return Score(name=self.name, value=1.0)
 
 
 def all_spans(spans: list[SpanModel]) -> list[SpanModel]:
@@ -560,40 +592,33 @@ def test_the_items_traces_and_the_calls_under_them_keep_the_environment(
     def task(item: dict[str, Any]) -> dict[str, Any]:
         return {"output": complete_sync(SUMMARY, item["question"]).output}
 
-    # Opik records the run itself to score a span-reading metric and allows one
-    # recording at a time, so the test reads Opik's recording.
-    traces: list[TraceModel] = []
-    record = local_recording.record_traces_locally
-
-    @contextlib.contextmanager
-    def keeping(**kwargs: Any) -> Iterator[Any]:  # noqa: ANN401
-        with record(**kwargs) as recording:
-            yield recording
-            traces.extend(recording.trace_trees)
-
-    monkeypatch.setattr(local_recording, "record_traces_locally", keeping)
     monkeypatch.setattr(logging.getLogger("opik"), "propagate", True)
-    seed_dataset("rag-golden", RAG[:1], project_name=APP)
+    seed_dataset("rag-golden", RAG[:1], app=APP)
 
-    with override_models(FunctionModel(answer_or_verdict)):
+    with (
+        override_models(FunctionModel(answer_or_verdict)),
+        opik.record_traces_locally() as storage,
+    ):
         evaluate(
             task,
             dataset="rag-golden",
-            project_name=APP,
-            metrics=[Hallucination(model=judge_model(APP, JUDGE)), LibrarySpanJudge()],
+            app=APP,
+            metrics=[hallucination(judge_model(APP, JUDGE)), LibraryJudge()],
             prompts=[production_prompt],
             scoring_key_mapping={"input": "question"},
             task_threads=1,
         )
+        traces = storage.trace_trees
 
     spans = [span for trace in traces for span in all_spans(trace.spans)]
-    assert {span.name for span in spans} >= {"summary", JUDGE_USE_CASE}
-    assert {trace.environment for trace in traces} == {"ci"}
-    # On the span-reading pass Opik checks the metric's arguments in a span of
-    # its own before any ol-llm code runs. That span makes no call.
-    assert {span.name for span in spans if span.environment != "ci"} <= {
-        "library_span_judge_arg_validation"
+    assert {span.name for span in spans} >= {
+        "summary",
+        JUDGE_USE_CASE,
+        "hallucination_metric",
+        "library_judge",
     }
+    assert {trace.environment for trace in traces} == {"ci"}
+    assert {span.environment for span in spans} == {"ci"}
     assert "nested span under the environment" not in caplog.text
 
 
@@ -610,14 +635,47 @@ def test_any_other_task_error_still_aborts_the_run(
 
 
 @ON_OPIKS_ENGINE
-def test_a_missing_metric_input_still_aborts_the_run(
+@pytest.mark.parametrize("judged", [False, True])
+def test_a_missing_metric_input_aborts_the_run_with_the_librarys_error(
     production_prompt: ManagedPrompt[TextTemplate],
+    judged: bool,  # noqa: FBT001
 ) -> None:
+    # The memory backend's half of this is in test_experiments.py.
+    seed_dataset("rag-golden", RAG, app=APP)
+    metric = (
+        hallucination(judge_model(APP, JUDGE), track=False)
+        if judged
+        else ValidatorMetric("placeholders", same_placeholders, track=False)
+    )
+
     with (
         override_models(TestModel(custom_output_args=VERDICT)),
-        pytest.raises(ScoreMethodMissingArguments),
+        pytest.raises(MissingMetricInputError) as caught,
     ):
-        run_rag(production_prompt, task=lambda _item: {"output": "x"}, mapping={})
+        evaluate(
+            lambda _item: {"output": "x"},
+            dataset="rag-golden",
+            app=APP,
+            metrics=[metric],
+            prompts=[production_prompt],
+            task_threads=1,
+        )
+    assert caught.value.metric == metric.name
+    assert caught.value.missing == (["input"] if judged else ["source"])
+
+
+@pytest.mark.usefixtures("client")
+def test_evaluate_refuses_an_opik_metric(
+    production_prompt: ManagedPrompt[TextTemplate],
+) -> None:
+    with pytest.raises(TypeError, match=r"hallucination\(judge\)"):
+        evaluate(
+            lambda item: item,
+            dataset="summary-golden",
+            app=APP,
+            metrics=[Hallucination(model="gpt-4o-mini", track=False)],  # type: ignore[list-item]
+            prompts=[production_prompt],
+        )
 
 
 # Metrics
@@ -669,7 +727,7 @@ def test_a_validator_may_not_return_a_string() -> None:
 def test_an_opik_judge_metric_scores_through_the_library() -> None:
     judge = judge_model(APP, JUDGE)
     verdict = {"score": 0.0, "reason": ["Every claim is in the context."]}
-    metric = Hallucination(model=judge, track=False)
+    metric = hallucination(judge, track=False)
 
     with (
         override_models(TestModel(custom_output_args=verdict)),
@@ -683,7 +741,7 @@ def test_an_opik_judge_metric_scores_through_the_library() -> None:
         [trace] = storage.trace_trees
     tracing.flush()
 
-    assert isinstance(result, ScoreResult)
+    assert isinstance(result, Score)
     assert (result.name, result.value) == ("hallucination_metric", 0.0)
     assert result.reason == "Every claim is in the context."
     assert trace.name == JUDGE_USE_CASE
@@ -702,7 +760,7 @@ def test_the_judge_sends_system_messages_as_instructions() -> None:
         )
 
     with override_models(FunctionModel(reply)):
-        Hallucination(model=judge_model(APP, JUDGE), track=False).score(
+        hallucination(judge_model(APP, JUDGE), track=False).score(
             input="q", output="a", context=["c"]
         )
 
@@ -785,7 +843,7 @@ def test_a_retired_judge_model_is_rejected(monkeypatch: pytest.MonkeyPatch) -> N
     )
     catalog = Catalog({**load_catalog().entries, UNCATALOGED: retired})
     monkeypatch.setattr(catalog_module, "load_catalog", lambda: catalog)
-    monkeypatch.setattr("ol_llm.evaluation.load_catalog", lambda: catalog)
+    monkeypatch.setattr("ol_llm.judge.load_catalog", lambda: catalog)
 
     with pytest.raises(ValueError, match="retired"):
         judge_model(APP, UNCATALOGED)
@@ -1011,6 +1069,18 @@ def test_without_a_baseline_the_fixed_bounds_still_apply() -> None:
 # The command
 
 
+def opik_item(feedback_scores: list[dict[str, Any]]) -> ExperimentItemContent:
+    """An experiment item as the Opik SDK reads it, with only its scores set."""
+    return ExperimentItemContent(
+        id="e",
+        dataset_item_id="d",
+        trace_id="t",
+        dataset_item_data={},
+        evaluation_task_output={},
+        feedback_scores=feedback_scores,  # type: ignore[arg-type]
+    )
+
+
 def test_the_seed_command_prints_the_version(
     client: FakeClient, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1021,7 +1091,7 @@ def test_the_seed_command_prints_the_version(
         str(path),
         "--dataset",
         "syllabus-golden",
-        "--project",
+        "--app",
         APP,
         "--group",
         "syllabus",
@@ -1046,8 +1116,8 @@ def test_the_check_command_fails_only_when_blocking(
     status: int,
 ) -> None:
     items = [
-        SimpleNamespace(feedback_scores=[{"name": "placeholders", "value": 1.0}]),
-        SimpleNamespace(feedback_scores=[]),
+        opik_item(feedback_scores=[{"name": "placeholders", "value": 1.0}]),
+        opik_item(feedback_scores=[]),
     ]
     client.experiments["exp-1"] = SimpleNamespace(
         name="summary-ci", get_items=lambda max_results: items[:max_results]
@@ -1065,8 +1135,8 @@ def test_the_check_command_fails_only_when_blocking(
 
 def test_a_null_experiment_score_counts_as_unscored(client: FakeClient) -> None:
     items = [
-        SimpleNamespace(feedback_scores=[{"name": "placeholders", "value": 1.0}]),
-        SimpleNamespace(feedback_scores=[{"name": "placeholders", "value": None}]),
+        opik_item(feedback_scores=[{"name": "placeholders", "value": 1.0}]),
+        opik_item(feedback_scores=[{"name": "placeholders", "value": None}]),
     ]
     client.experiments["exp-1"] = SimpleNamespace(
         name="summary-ci", get_items=lambda max_results: items[:max_results]
@@ -1083,7 +1153,7 @@ def test_a_null_experiment_score_counts_as_unscored(client: FakeClient) -> None:
 def test_an_experiment_past_the_sdks_item_limit_is_refused(
     client: FakeClient,
 ) -> None:
-    item = SimpleNamespace(feedback_scores=[{"name": "placeholders", "value": 1.0}])
+    item = opik_item(feedback_scores=[{"name": "placeholders", "value": 1.0}])
     items = [item] * (MAX_EXPERIMENT_ITEMS + 5)
     client.experiments["exp-1"] = SimpleNamespace(
         name="summary-ci", get_items=lambda max_results: items[:max_results]
@@ -1098,7 +1168,7 @@ def test_an_experiment_past_the_sdks_item_limit_is_refused(
 def test_the_check_command_passes_a_met_threshold(
     client: FakeClient, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    items = [SimpleNamespace(feedback_scores=[{"name": "placeholders", "value": 1.0}])]
+    items = [opik_item(feedback_scores=[{"name": "placeholders", "value": 1.0}])]
     client.experiments["exp-1"] = SimpleNamespace(
         name="summary-ci", get_items=lambda max_results: items[:max_results]
     )
@@ -1139,26 +1209,20 @@ def store_experiment(
     )
 
 
-def candidate_result(outputs: dict[str, dict[str, Any]]) -> EvaluationResult:
-    return EvaluationResult(
+def candidate_result(outputs: dict[str, dict[str, Any]]) -> ExperimentResult:
+    return ExperimentResult(
         experiment_id="candidate",
-        dataset_id="ds-1",
-        experiment_name="summary pr-1",
-        test_results=[
-            test_result.TestResult(
-                test_case=test_case.TestCase(
-                    trace_id=f"candidate-trace-{item_id}",
-                    dataset_item_id=item_id,
-                    task_output=output,
-                    dataset_item_content={"question": f"Question {item_id}"},
-                ),
-                score_results=[],
-                trial_id=0,
+        name="summary pr-1",
+        url=None,
+        items=tuple(
+            ExperimentItem(
+                dataset_item_id=item_id,
+                trace_id=f"candidate-trace-{item_id}",
+                item={"question": f"Question {item_id}"},
+                output=output,
             )
             for item_id, output in outputs.items()
-        ],
-        experiment_url=None,
-        trial_count=1,
+        ),
     )
 
 
@@ -1202,7 +1266,7 @@ def test_pairwise_judges_each_pair_in_both_orders(client: FakeClient) -> None:
             "baseline",
             judge=judge_model(APP, JUDGE),
             criteria=PAIRWISE_CRITERIA,
-            project_name=APP,
+            app=APP,
         )
         tracing.flush()
         traces = storage.trace_trees
@@ -1268,7 +1332,7 @@ def test_the_win_rate_is_a_thresholdable_outcome(client: FakeClient) -> None:
             "baseline",
             judge=judge_model(APP, JUDGE),
             criteria=PAIRWISE_CRITERIA,
-            project_name=APP,
+            app=APP,
             threads=1,
         )
     outcome = comparison.outcome(threshold)
@@ -1304,7 +1368,7 @@ def test_a_judge_error_leaves_its_pair_unjudged(client: FakeClient) -> None:
             "baseline",
             judge=judge_model(APP, JUDGE),
             criteria=PAIRWISE_CRITERIA,
-            project_name=APP,
+            app=APP,
         )
 
     assert comparison.verdicts == ()
@@ -1330,15 +1394,15 @@ def test_pairwise_needs_one_dataset_version(
             "baseline",
             judge=judge_model(APP, JUDGE),
             criteria=PAIRWISE_CRITERIA,
-            project_name=APP,
+            app=APP,
         )
 
 
 def test_pairwise_refuses_two_trials_of_one_item(client: FakeClient) -> None:
     store_experiment(client, "baseline", {"a": UNKNOWN})
     client.records["candidate"] = client.records["baseline"]
-    twice = candidate_result({"a": LEWIN})
-    twice.test_results.extend(twice.test_results)
+    once = candidate_result({"a": LEWIN})
+    twice = dataclasses.replace(once, items=once.items * 2)
 
     with pytest.raises(ValueError, match="one trial per item"):
         judge_pairwise(
@@ -1346,7 +1410,7 @@ def test_pairwise_refuses_two_trials_of_one_item(client: FakeClient) -> None:
             "baseline",
             judge=judge_model(APP, JUDGE),
             criteria=PAIRWISE_CRITERIA,
-            project_name=APP,
+            app=APP,
         )
 
 
@@ -1364,7 +1428,7 @@ def test_pairwise_names_a_candidate_answer_field_it_lacks(client: FakeClient) ->
             "baseline",
             judge=judge_model(APP, JUDGE),
             criteria=PAIRWISE_CRITERIA,
-            project_name=APP,
+            app=APP,
             answer_fields=["answer"],
         )
 
@@ -1381,7 +1445,7 @@ def test_pairwise_names_a_field_neither_experiment_has(client: FakeClient) -> No
             "baseline",
             judge=judge_model(APP, JUDGE),
             criteria=PAIRWISE_CRITERIA,
-            project_name=APP,
+            app=APP,
             answer_fields=["answer"],
         )
 
@@ -1398,7 +1462,7 @@ def test_a_reference_without_the_answer_fields_is_not_compared(
         "baseline",
         judge=judge_model(APP, JUDGE),
         criteria=PAIRWISE_CRITERIA,
-        project_name=APP,
+        app=APP,
         answer_fields=["answer"],
     )
 
