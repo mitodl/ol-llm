@@ -800,8 +800,9 @@ class PolicyFallbackModel(FallbackModel):
 
         A fallback model that cannot count (Mistral, and OpenAI chat completions)
         ends the chain there, so the caller still gets the first model's error
-        rather than ``NotImplementedError``. A first model that cannot count raises
-        ``NotImplementedError``: the use case cannot count at all.
+        rather than ``NotImplementedError``. The model the count starts at (the
+        primary, or on a retry the model being retried) raises
+        ``NotImplementedError`` if it cannot count.
         """
         chain = self._starting_at(messages)
         errors: list[LLMError] = []
