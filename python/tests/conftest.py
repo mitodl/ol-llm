@@ -438,7 +438,7 @@ def exported(monkeypatch: pytest.MonkeyPatch) -> Generator[InMemorySpanExporter]
     """
     exporter = InMemorySpanExporter()
 
-    def in_memory(_destination: object) -> SpanExporter:
+    def in_memory(_destination: object, _app: str) -> SpanExporter:
         return exporter
 
     monkeypatch.setattr(opik_destination, "_exporter", in_memory)

@@ -5,10 +5,10 @@
 
 ### Changed
 
-- In Opik, span attributes ol-llm records that Opik has no rule for now show under the span's metadata instead of its input: the memory spans' app, use case, environment, user, run and `memory.*` keys and counts, and the embedding spans' input count and vector dimensions (`opik.metadata.inputs_count`, `opik.metadata.embedding_dimensions`). Note text, queries and results still show as input. The `ol_llm.opik_project` span attribute is gone; each span names its project with Opik's own `opik.project_name`, so all of an app's spans go in one export request.
+- In Opik, span attributes ol-llm records that Opik has no rule for now show under the span's metadata instead of its input: the memory spans' app, use case, environment, user, run and `memory.*` keys and counts, and the embedding spans' input count and vector dimensions (`opik.metadata.inputs_count`, `opik.metadata.embedding_dimensions`). Note text, queries and results still show as input. The `ol_llm.opik_project` span attribute is gone; each span names its project with Opik's own `opik.project_name`, so a span of a caller's trace no longer needs its own export request.
 - The memory spans' attributes are renamed: `app`, `use_case`, `environment`, `user_id` and `run_id` are `ol.app` and so on, `thread_id` is `gen_ai.conversation.id`, and the `memory.*` keys and counts are `ol.memory.*`. Content attributes (`memory.text`, `memory.query`, `memory.metadata`, `memory.results`) keep their names. The embedding span's `inputs_count` is `ol.inputs_count`.
 - The Keycloak auth classes moved to `ol_llm.keycloak`; `ol_llm.tracing` still exports them.
 
 ### Removed
 
-- `ol_llm.tracing.PROJECT_ATTRIBUTE`, `ProjectExporter`, `ProjectStampProcessor`, `OpikActiveSampler` (now `ActiveSampler`), `OTLP_TRACES_PATH` and `PROJECT_HEADER`, and `ol_llm.traces.error_info`. `ChatTracer`, `GRAPH_METADATA_KEY` and `CUT_OFF_METADATA_KEY` moved from `ol_llm.langchain` to `ol_llm.trace_destinations.opik_langchain`.
+- `ol_llm.tracing.PROJECT_ATTRIBUTE`, `ProjectExporter`, `ProjectStampProcessor`, `OpikActiveSampler` (now `ActiveSampler`), and `OTLP_TRACES_PATH` and `PROJECT_HEADER` (now in `ol_llm.trace_destinations.opik_destination`), and `ol_llm.traces.error_info`. `ChatTracer`, `GRAPH_METADATA_KEY` and `CUT_OFF_METADATA_KEY` moved from `ol_llm.langchain` to `ol_llm.trace_destinations.opik_langchain`.

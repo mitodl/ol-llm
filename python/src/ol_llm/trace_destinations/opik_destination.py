@@ -74,6 +74,7 @@ OTLP_TRACES_PATH = "/v1/private/otel/v1/traces"
 """Opik's OTLP/HTTP traces endpoint, relative to the SDK's API base URL."""
 
 WORKSPACE_HEADER = "Comet-Workspace"
+PROJECT_HEADER = "projectName"
 
 PROJECT_NAME = "opik.project_name"
 """Opik files a span under the project this names (``OpenTelemetryService``)."""
@@ -326,7 +327,9 @@ class OpikDestination(TraceDestination):
 
     def span_processor(self, app: str) -> SpanProcessor:
         """Batch the app's spans, mapped, to Opik's OTLP endpoint."""
-        return OpikSpans(app, self.default_project, BatchSpanProcessor(_exporter(self)))
+        return OpikSpans(
+            app, self.default_project, BatchSpanProcessor(_exporter(self, app))
+        )
 
     def active(self) -> bool:
         """Return whether the SDK's runtime switch has tracing on."""
@@ -445,8 +448,13 @@ class OpikDestination(TraceDestination):
             yield callbacks
 
 
-def _exporter(destination: OpikDestination) -> SpanExporter:
-    """Build the exporter to Opik's OTLP endpoint, authenticated with Keycloak."""
+def _exporter(destination: OpikDestination, app: str) -> SpanExporter:
+    """Build the exporter to Opik's OTLP endpoint, authenticated with Keycloak.
+
+    The ``projectName`` header names the app's project, where an Opik that reads
+    no ``opik.project_name`` attribute (before 2.2.143 was not checked) files every
+    span the exporter sends.
+    """
 
     def otlp() -> SpanExporter:
         session = requests.Session()
@@ -454,7 +462,7 @@ def _exporter(destination: OpikDestination) -> SpanExporter:
             session.auth = RequestsBearerAuth(destination.tokens)
         return OTLPSpanExporter(
             endpoint=destination.url.rstrip("/") + OTLP_TRACES_PATH,
-            headers={WORKSPACE_HEADER: destination.workspace},
+            headers={WORKSPACE_HEADER: destination.workspace, PROJECT_HEADER: app},
             session=session,
         )
 
