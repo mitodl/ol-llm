@@ -1,8 +1,12 @@
 """The plain OTLP trace destination, and the exporter both OTLP destinations use.
 
-``otlp`` sends ol-llm's spans as they are, ``gen_ai.*`` and ``ol.*`` attributes and
-all, to the endpoint the standard ``OTEL_EXPORTER_OTLP_*`` variables name, e.g. a
-Tempo or an OpenTelemetry collector.
+``otlp`` sends ol-llm's spans, unmapped, to the endpoint the standard
+``OTEL_EXPORTER_OTLP_*`` variables name, e.g. a Tempo or an OpenTelemetry
+collector. It keeps only the ``ol.*`` and ``gen_ai.*`` attributes, and without
+``OL_LLM_TRACE_OTLP_CONTENT=true`` it also drops what carries learner content or
+identifies a user: inputs, outputs, messages, note text and queries, user ids, and
+error messages (``trace_attributes.CONTENT``). The data-handling policy for learner
+content is not decided, so a second destination gets none by default.
 """
 
 import threading
@@ -10,15 +14,24 @@ import weakref
 from collections.abc import Callable, Sequence
 
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
+from opentelemetry.sdk.trace import Event, ReadableSpan, SpanProcessor
 from opentelemetry.sdk.trace.export import (
     BatchSpanProcessor,
     SpanExporter,
     SpanExportResult,
 )
+from opentelemetry.trace import Status
 
+from ol_llm import trace_attributes as attrs
 from ol_llm.loops import register_at_fork
-from ol_llm.trace_destinations.interface import DestinationSettings, TraceDestination
+from ol_llm.trace_destinations.interface import (
+    DestinationSettings,
+    TraceDestination,
+    copy_span,
+    parse_bool,
+)
+
+CONTENT_ENV = "OL_LLM_TRACE_OTLP_CONTENT"
 
 
 class ForkSafeExporter(SpanExporter):
@@ -66,18 +79,86 @@ class ForkSafeExporter(SpanExporter):
             exporter.shutdown()
 
 
-class OtlpDestination(TraceDestination):
-    """Spans as ol-llm records them, over OTLP/HTTP to a configured endpoint.
+def _kept(name: str, *, content: bool) -> bool:
+    if not name.startswith((attrs.OL_PREFIX, "gen_ai.")):
+        return False
+    if content:
+        return True
+    return (
+        name not in attrs.CONTENT
+        and name != attrs.USER_ID
+        and not name.startswith(attrs.GEN_AI_CONTENT_PREFIXES)
+    )
 
-    :param settings: unused; the exporter reads ``OTEL_EXPORTER_OTLP_*`` itself.
+
+def _filtered(span: ReadableSpan, *, content: bool) -> ReadableSpan:
+    """Return a copy of ``span`` with only what the destination may receive."""
+    attributes = {
+        name: value
+        for name, value in (span.attributes or {}).items()
+        if _kept(name, content=content)
+    }
+    if content:
+        return copy_span(span, attributes=attributes)
+    events = [
+        Event(
+            attrs.EXCEPTION_EVENT,
+            {
+                name: value
+                for name, value in (event.attributes or {}).items()
+                if name in {attrs.EXCEPTION_TYPE, attrs.EXCEPTION_ESCAPED}
+            },
+            timestamp=event.timestamp,
+        )
+        for event in span.events
+        if event.name == attrs.EXCEPTION_EVENT
+    ]
+    return copy_span(
+        span,
+        attributes=attributes,
+        events=events,
+        status=Status(span.status.status_code),
+    )
+
+
+class _Filtered(SpanProcessor):
+    """Hands each ended span to ``export`` with only what it may receive."""
+
+    def __init__(self, export: SpanProcessor, *, content: bool) -> None:
+        self._export = export
+        self._content = content
+
+    def on_end(self, span: ReadableSpan) -> None:
+        self._export.on_end(_filtered(span, content=self._content))
+
+    def shutdown(self) -> None:
+        self._export.shutdown()
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        return self._export.force_flush(timeout_millis)
+
+
+class OtlpDestination(TraceDestination):
+    """ol-llm's spans, unmapped, over OTLP/HTTP to a configured endpoint.
+
+    :param settings: ``OL_LLM_TRACE_OTLP_CONTENT=true`` in its environment lets
+        content and user ids through. The exporter reads
+        ``OTEL_EXPORTER_OTLP_*`` itself.
+    :raises ValueError: if ``OL_LLM_TRACE_OTLP_CONTENT`` is not a boolean.
     """
 
     def __init__(self, settings: DestinationSettings) -> None:
-        """Read nothing; the exporter reads its own configuration."""
+        """Read whether the destination may receive content."""
+        self.content = parse_bool(
+            settings.environ.get(CONTENT_ENV, "false"), CONTENT_ENV
+        )
 
     def span_processor(self, app: str) -> SpanProcessor:  # noqa: ARG002
-        """Batch the app's spans to the configured endpoint."""
-        return BatchSpanProcessor(ForkSafeExporter(OTLPSpanExporter))
+        """Batch the app's spans, filtered, to the configured endpoint."""
+        return _Filtered(
+            BatchSpanProcessor(ForkSafeExporter(OTLPSpanExporter)),
+            content=self.content,
+        )
 
 
 _fork_safe: "weakref.WeakSet[ForkSafeExporter]" = weakref.WeakSet()

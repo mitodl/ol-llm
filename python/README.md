@@ -850,10 +850,18 @@ span goes to every trace destination `OL_LLM_TRACE_DESTINATIONS` names:
   thread and tags, and every other span goes to Opik's OTLP endpoint, with the `ol.*`
   attributes as `opik.metadata.*`. A run inside a caller's own `@opik.track` is a span of the
   caller's trace, as before.
-- `otlp`: the spans as recorded, to the OTLP/HTTP endpoint the standard
-  `OTEL_EXPORTER_OTLP_*` variables name, e.g. a Tempo. LangChain runs from `traced_chat` are
-  not spans and do not reach it.
-- `memory`: kept in the process, for tests (`ol_llm.tracing.destinations()`).
+  It receives everything the trace records, content included when `OL_LLM_TRACE_CONTENT` is
+  on (the default).
+- `otlp`: the spans unmapped, to the OTLP/HTTP endpoint the standard `OTEL_EXPORTER_OTLP_*`
+  variables name, e.g. a Tempo. It receives only `ol.*` and `gen_ai.*` attributes, and by
+  default none that carry learner content or identify a user: no call input or output,
+  model messages, embedding inputs, note text or queries, `ol.user_id`, or error messages
+  (an error keeps its type). `OL_LLM_TRACE_OTLP_CONTENT=true` sends those too, as far as
+  `OL_LLM_TRACE_CONTENT` lets the trace record them; leave it off until the data-handling
+  policy approves the destination for learner content. LangChain runs from `traced_chat`
+  are not spans and do not reach it.
+- `memory`: every span as recorded, kept in the process, for tests
+  (`ol_llm.tracing.destinations()`).
 
 Another package adds a destination with an entry point in the `ol_llm.trace_destinations`
 group, or in code with `ol_llm.trace_destinations.register_trace_destination`. Attribute
@@ -866,6 +874,7 @@ always send to the same instance:
 | Variable | Meaning |
 | --- | --- |
 | `OL_LLM_TRACE_DESTINATIONS` | comma-separated destinations, `opik` when unset |
+| `OL_LLM_TRACE_OTLP_CONTENT` | `true` lets the `otlp` destination receive content and user ids; off by default |
 | `OPIK_URL_OVERRIDE` | the Opik API, e.g. `https://opik-qa.ol.mit.edu/api` |
 | `OPIK_WORKSPACE` | `default` on our instances |
 | `OPIK_KEYCLOAK_TOKEN_URL`, `OPIK_KEYCLOAK_CLIENT_ID`, `OPIK_KEYCLOAK_CLIENT_SECRET` | the Keycloak client the app authenticates to Opik with; `OPIK_KEYCLOAK_SCOPE` if it needs one. Leave `OPIK_API_KEY` unset |

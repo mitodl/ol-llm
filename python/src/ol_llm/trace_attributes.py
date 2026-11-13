@@ -71,6 +71,18 @@ that files unknown attributes as the span's input, as Opik does, shows them
 there."""
 
 
+GEN_AI_INPUT_MESSAGES = "gen_ai.input.messages"
+GEN_AI_OUTPUT_MESSAGES = "gen_ai.output.messages"
+GEN_AI_SYSTEM_INSTRUCTIONS = "gen_ai.system_instructions"
+GEN_AI_TOOL_CALL_ARGUMENTS = "gen_ai.tool.call.arguments"
+GEN_AI_TOOL_CALL_RESULT = "gen_ai.tool.call.result"
+GEN_AI_CONTENT_PREFIXES = ("gen_ai.prompt", "gen_ai.completion")
+"""PydanticAI's message content, and the older conventions' prompt and completion
+attributes."""
+
+USER_ID = "ol.user_id"
+
+
 def attribution(key: str) -> str:
     """Return the attribute for one §4 field or other trace metadata key.
 
@@ -79,3 +91,22 @@ def attribution(key: str) -> str:
     :rtype: str
     """
     return f"{OL_PREFIX}{key}"
+
+
+CONTENT = frozenset(
+    {
+        INPUT,
+        OUTPUT,
+        EMBEDDING_INPUTS,
+        MEMORY_TEXT,
+        MEMORY_METADATA,
+        MEMORY_QUERY,
+        MEMORY_RESULTS,
+        GEN_AI_INPUT_MESSAGES,
+        GEN_AI_OUTPUT_MESSAGES,
+        GEN_AI_SYSTEM_INSTRUCTIONS,
+        GEN_AI_TOOL_CALL_ARGUMENTS,
+        GEN_AI_TOOL_CALL_RESULT,
+    }
+)
+"""Attributes that carry prompts, completions, tool arguments, or learner text."""

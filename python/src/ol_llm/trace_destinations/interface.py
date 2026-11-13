@@ -18,8 +18,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from opentelemetry.sdk.trace import SpanProcessor
-from opentelemetry.trace import Span
+from opentelemetry.sdk.trace import Event, ReadableSpan, SpanProcessor
+from opentelemetry.trace import Span, Status
 
 from ol_llm.attribution import DegradedReason, TraceFields
 from ol_llm.keycloak import KeycloakTokens
@@ -28,6 +28,60 @@ from ol_llm.policy import UseCase
 if TYPE_CHECKING:
     from langchain_core.callbacks import BaseCallbackHandler
     from langchain_core.runnables.graph import Graph
+    from opentelemetry.util.types import AttributeValue
+
+
+def parse_bool(value: str, name: str) -> bool:
+    """Read a boolean setting.
+
+    :param value: the setting, e.g. ``true`` or ``0``.
+    :param name: the variable, for the error.
+    :returns: the value.
+    :rtype: bool
+    :raises ValueError: if it is not one of ``true``, ``1``, ``yes``, ``false``,
+        ``0``, ``no``.
+    """
+    lowered = value.strip().lower()
+    if lowered in {"true", "1", "yes"}:
+        return True
+    if lowered in {"false", "0", "no"}:
+        return False
+    msg = f"{name} must be true or false, not {value!r}"
+    raise ValueError(msg)
+
+
+def copy_span(
+    span: ReadableSpan,
+    *,
+    attributes: Mapping[str, "AttributeValue"],
+    events: Sequence[Event] | None = None,
+    status: Status | None = None,
+) -> ReadableSpan:
+    """Return a copy of an ended span with other attributes, events, or status.
+
+    How a destination maps spans without changing what the others get.
+
+    :param span: the span.
+    :param attributes: the copy's attributes.
+    :param events: the copy's events; the span's when omitted.
+    :param status: the copy's status; the span's when omitted.
+    :returns: the copy.
+    :rtype: ReadableSpan
+    """
+    return ReadableSpan(
+        name=span.name,
+        context=span.context,
+        parent=span.parent,
+        resource=span.resource,
+        attributes=attributes,
+        events=span.events if events is None else events,
+        links=span.links,
+        kind=span.kind,
+        status=span.status if status is None else status,
+        start_time=span.start_time,
+        end_time=span.end_time,
+        instrumentation_scope=span.instrumentation_scope,
+    )
 
 
 def error_frames(error: BaseException) -> str:

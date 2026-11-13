@@ -54,6 +54,7 @@ from ol_llm.trace_destinations import (
     TraceDestination,
     build_destinations,
 )
+from ol_llm.trace_destinations.interface import parse_bool
 
 __all__ = [
     "DEFAULT_TOKEN_LIFETIME_SECONDS",
@@ -128,7 +129,7 @@ class TracingConfig:
         return cls(
             enabled=not _opik.track_disabled(),
             keycloak=keycloak,
-            include_content=_parse_bool(env.get(_CONTENT_ENV, "true"), _CONTENT_ENV),
+            include_content=parse_bool(env.get(_CONTENT_ENV, "true"), _CONTENT_ENV),
             destinations=_parse_names(env.get(_DESTINATIONS_ENV)),
         )
 
@@ -147,16 +148,6 @@ def _keycloak_from_env(env: Mapping[str, str]) -> KeycloakClient | None:
         client_secret=env[f"{_ENV_PREFIX}_CLIENT_SECRET"],
         scope=env.get(f"{_ENV_PREFIX}_SCOPE") or None,
     )
-
-
-def _parse_bool(value: str, name: str) -> bool:
-    lowered = value.strip().lower()
-    if lowered in {"true", "1", "yes"}:
-        return True
-    if lowered in {"false", "0", "no"}:
-        return False
-    msg = f"{name} must be true or false, not {value!r}"
-    raise ValueError(msg)
 
 
 def _parse_names(value: str | None) -> tuple[str, ...]:

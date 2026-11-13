@@ -61,6 +61,7 @@ from ol_llm.trace_destinations.interface import (
     CallTrace,
     DestinationSettings,
     TraceDestination,
+    copy_span,
     error_frames,
 )
 from ol_llm.trace_destinations.otlp import ForkSafeExporter
@@ -260,20 +261,7 @@ def _mapped(span: ReadableSpan, ids: _OpikIds, app: str) -> ReadableSpan:
         mapped[SPAN_ID] = ids.span_id
         if ids.parent_span_id is not None:
             mapped[PARENT_SPAN_ID] = ids.parent_span_id
-    return ReadableSpan(
-        name=span.name,
-        context=span.context,
-        parent=span.parent,
-        resource=span.resource,
-        attributes=mapped,
-        events=span.events,
-        links=span.links,
-        kind=span.kind,
-        status=span.status,
-        start_time=span.start_time,
-        end_time=span.end_time,
-        instrumentation_scope=span.instrumentation_scope,
-    )
+    return copy_span(span, attributes=mapped)
 
 
 class OpikSpans(SpanProcessor):

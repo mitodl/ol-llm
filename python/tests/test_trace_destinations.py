@@ -1,3 +1,4 @@
+import contextlib
 import gzip
 import json
 import os
@@ -444,30 +445,100 @@ def test_opik_receives_the_trace_by_rest_and_the_spans_by_otlp(
         assert "ol_llm.opik_project" not in attributes
 
 
-def test_the_otlp_destination_sends_unmapped_spans_where_otel_says(
-    recording_opik: list[tuple[str, bytes]],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    endpoint = os.environ["OPIK_URL_OVERRIDE"].removesuffix("/api") + "/v1/traces"
-    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", endpoint)
-    tracing.reset()
-    configure_tracing(TracingConfig(destinations=("otlp",)))
-    run_sync(agent_for(replying("ok")), "hi", attribution=ATTRIBUTION)
-    assert tracing.flush(10_000)
-
+def otlp_spans(
+    received: list[tuple[str, bytes]],
+) -> dict[str, Any]:
+    """Return the spans an OTLP collector received at ``/v1/traces``, by name."""
     spans = {}
-    for path, body in recording_opik:
+    for path, body in received:
         if path == "/v1/traces":
             request = ExportTraceServiceRequest.FromString(body)
             spans.update(
                 {
-                    span.name: {a.key: a.value for a in span.attributes}
+                    span.name: span
                     for resource in request.resource_spans
                     for scope in resource.scope_spans
                     for span in scope.spans
                 }
             )
-    call = spans["summary"]
+    return spans
+
+
+def attributes_of(span: Any) -> dict[str, Any]:  # noqa: ANN401
+    return {a.key: a.value for a in span.attributes}
+
+
+def traced_to_otlp(
+    monkeypatch: pytest.MonkeyPatch, model: FunctionModel, *, content: str | None
+) -> None:
+    endpoint = os.environ["OPIK_URL_OVERRIDE"].removesuffix("/api") + "/v1/traces"
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", endpoint)
+    if content is not None:
+        monkeypatch.setenv("OL_LLM_TRACE_OTLP_CONTENT", content)
+    tracing.reset()
+    configure_tracing(TracingConfig(destinations=("otlp",)))
+    with contextlib.suppress(LLMRateLimited):
+        run_sync(agent_for(model), "the learner's question", attribution=ATTRIBUTION)
+    assert tracing.flush(10_000)
+
+
+def test_the_otlp_destination_sends_no_content_or_user_id_by_default(
+    recording_opik: list[tuple[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    traced_to_otlp(monkeypatch, replying("the answer"), content=None)
+
+    spans = otlp_spans(recording_opik)
+    call = attributes_of(spans["summary"])
     assert call["ol.use_case"].string_value == "summary"
+    assert call["ol.run_id"].string_value == "run-1"
     assert call["gen_ai.conversation.id"].string_value == "thread-1"
-    assert not [name for span in spans.values() for name in span if "opik" in name]
+    assert not {"ol.input", "ol.output", "ol.user_id"} & call.keys()
+    names = {name for span in spans.values() for name in attributes_of(span)}
+    assert "gen_ai.operation.name" in names
+    assert not {"gen_ai.input.messages", "gen_ai.output.messages"} & names
+    assert not [name for name in names if "opik" in name]
+    assert not [name for name in names if not name.startswith(("ol.", "gen_ai."))]
+    assert "the learner's question" not in repr(spans)
+    assert "the answer" not in repr(spans)
+    assert "user-1" not in repr(spans)
+
+
+def test_the_otlp_destination_keeps_only_an_errors_type_by_default(
+    recording_opik: list[tuple[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    traced_to_otlp(monkeypatch, failing(429), content=None)
+
+    call = otlp_spans(recording_opik)["summary"]
+    assert not call.status.message
+    [event] = call.events
+    assert event.name == "exception"
+    assert {a.key for a in event.attributes} <= {"exception.type", "exception.escaped"}
+    assert "LLMRateLimited" in str(event.attributes)
+    assert "provider said no" not in repr(otlp_spans(recording_opik))
+
+
+def test_the_otlp_destination_sends_content_when_opted_in(
+    recording_opik: list[tuple[str, bytes]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    traced_to_otlp(monkeypatch, replying("the answer"), content="true")
+
+    spans = otlp_spans(recording_opik)
+    call = attributes_of(spans["summary"])
+    assert json.loads(call["ol.input"].string_value) == {
+        "user_prompt": "the learner's question"
+    }
+    assert json.loads(call["ol.output"].string_value) == "the answer"
+    assert call["ol.user_id"].string_value == "user-1"
+
+
+def test_the_otlp_content_setting_must_be_a_boolean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OL_LLM_TRACE_OTLP_CONTENT", "sometimes")
+    tracing.reset()
+
+    with pytest.raises(ValueError, match="OL_LLM_TRACE_OTLP_CONTENT"):
+        configure_tracing(TracingConfig(destinations=("otlp",)))
