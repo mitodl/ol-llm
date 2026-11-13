@@ -16,7 +16,14 @@ import pytest
 from conftest import PromptLibrary, preferring
 from ol_llm import fetch_prompt, tracing
 from ol_llm.errors import LLMError, LLMRejected
-from ol_llm.evaluation import PAIRWISE_METRIC, Threshold, ValidatorMetric, main
+from ol_llm.evaluation import (
+    PAIRWISE_METRIC,
+    Threshold,
+    ValidatorMetric,
+    evaluate,
+    main,
+)
+from ol_llm.experiments import DatasetVersionNotFoundError
 from ol_llm.gate import (
     BASELINE_TAG,
     GATE_ERROR_STATUS,
@@ -556,6 +563,26 @@ def test_a_missing_dataset_version_fails(
     with pytest.raises(GateConfigurationError, match="no version v4; its latest is v1"):
         run_gate(declaration(dataset=pin), suite=suite, change="pr-12")
     assert not runs
+
+
+def test_evaluating_a_missing_dataset_version_raises_the_libraries_error(
+    client: FakeClient, prompt_library: PromptLibrary
+) -> None:
+    seeded(client)
+    prompt_library.add(USE_CASE, "Summarize {{text}}.", project_name=APP)
+    prompt = fetch_prompt(USE_CASE, app=APP, version="v1")
+    assert prompt is not None
+
+    with pytest.raises(DatasetVersionNotFoundError) as caught:
+        evaluate(
+            lambda item: item,
+            dataset=DATASET,
+            app=APP,
+            metrics=[],
+            prompts=[prompt],
+            dataset_version="v9",
+        )
+    assert caught.value.latest == "v1"
 
 
 @pytest.mark.usefixtures("client", "prompts")

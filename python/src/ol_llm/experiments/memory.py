@@ -23,6 +23,7 @@ from ol_llm.experiments.interface import (
     ExperimentRun,
     ExperimentSummary,
     Metric,
+    MissingMetricInputError,
     Score,
     TraceScore,
 )
@@ -126,8 +127,11 @@ class MemoryExperimentBackend(ExperimentBackend):
         for key, row in rows.items():
             output = run.task(dict(row))
             inputs = {**row, **output}
+            # As Opik does, a mapping whose field is missing is skipped, so a
+            # metric that needs the input reports it missing.
             for target, source in run.scoring_key_mapping.items():
-                inputs[target] = inputs[source]
+                if source in inputs:
+                    inputs[target] = inputs[source]
             items.append(
                 ExperimentItem(
                     dataset_item_id=key,
@@ -245,11 +249,17 @@ class MemoryExperimentBackend(ExperimentBackend):
 def _scored(metric: Metric, inputs: Mapping[str, Any]) -> list[Score]:
     try:
         result = metric.score(**inputs)
+        scores = [result] if isinstance(result, Score) else list(result)
+        if not all(isinstance(score, Score) for score in scores):
+            msg = f"{metric.name} returned {result!r}, not scores"
+            raise TypeError(msg)  # noqa: TRY301 - a failed score, as on Opik
+    except MissingMetricInputError:
+        raise
     except Exception as exc:  # noqa: BLE001 - a metric's error is its failed score
         return [
             Score(name=metric.name, value=0.0, reason=type(exc).__name__, failed=True)
         ]
-    return [result] if isinstance(result, Score) else list(result)
+    return scores
 
 
 def _means(result: ExperimentResult) -> dict[str, float]:

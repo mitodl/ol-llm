@@ -1,11 +1,12 @@
 """The experiment backend interface, its in-memory backend, and the gate on it."""
 
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Iterator, Mapping, Sequence
 from typing import Any
 
 import pytest
 from conftest import PromptLibrary, preferring
 from ol_llm import TextTemplate, get_prompt
+from ol_llm.errors import LLMContentFiltered
 from ol_llm.evaluation import (
     PAIRWISE_METRIC,
     Score,
@@ -13,6 +14,7 @@ from ol_llm.evaluation import (
     ValidatorMetric,
     check_experiment,
     evaluate,
+    hallucination,
     judge_model,
     judge_pairwise,
     seed_dataset,
@@ -22,8 +24,10 @@ from ol_llm.experiments import (
     DatasetVersionNotFoundError,
     ExperimentBackend,
     ExperimentRun,
+    ExperimentSummary,
     MemoryExperimentBackend,
     Metric,
+    MissingMetricInputError,
     OpikExperimentBackend,
     TraceScore,
     configure_experiment_backend,
@@ -262,6 +266,85 @@ def test_only_a_registry_version_links() -> None:
 # The evaluation API on the memory backend
 
 
+def kept(candidate: str) -> bool:
+    return bool(candidate)
+
+
+@pytest.mark.usefixtures("prompts")
+def test_a_mapping_whose_field_is_missing_is_skipped(
+    memory: MemoryExperimentBackend,
+) -> None:
+    memory.seed_dataset(DATASET, GOLDEN, app=APP)
+
+    def filtered(_item: dict[str, Any]) -> dict[str, Any]:
+        msg = "filtered"
+        raise LLMContentFiltered(msg, use_case=USE_CASE, model="openai:x")
+
+    result = evaluate(
+        filtered,
+        dataset=DATASET,
+        app=APP,
+        metrics=[ValidatorMetric("kept", kept)],
+        prompts=[production()],
+        scoring_key_mapping={"candidate": "summary"},
+    )
+
+    assert [(s.value, s.reason) for i in result.items for s in i.scores] == [
+        (0.0, "the task raised LLMContentFiltered"),
+    ] * len(GOLDEN)
+
+
+@pytest.mark.usefixtures("prompts")
+@pytest.mark.parametrize("judged", [False, True])
+def test_a_missing_metric_input_aborts_the_run(
+    memory: MemoryExperimentBackend,
+    judged: bool,  # noqa: FBT001
+) -> None:
+    memory.seed_dataset(DATASET, GOLDEN, app=APP)
+    metric = (
+        hallucination(judge_model(APP, "openai:gpt-4o-mini"))
+        if judged
+        else ValidatorMetric("placeholders", lambda source, output: source == output)
+    )
+
+    with pytest.raises(MissingMetricInputError) as caught:
+        evaluate(
+            lambda _item: {"output": "x"},
+            dataset=DATASET,
+            app=APP,
+            metrics=[metric],
+            prompts=[production()],
+        )
+    assert caught.value.metric == metric.name
+
+
+class NotScores(Metric):
+    def __init__(self) -> None:
+        super().__init__("not_scores", track=False)
+
+    def score(self, **_: object) -> Score:  # type: ignore[override]
+        return 1.0  # type: ignore[return-value]
+
+
+@pytest.mark.usefixtures("prompts")
+def test_a_metric_that_returns_no_score_fails_its_score(
+    memory: MemoryExperimentBackend,
+) -> None:
+    memory.seed_dataset(DATASET, GOLDEN, app=APP)
+
+    result = evaluate(
+        lambda _item: {"output": "x"},
+        dataset=DATASET,
+        app=APP,
+        metrics=[NotScores()],
+        prompts=[production()],
+    )
+
+    assert {(s.failed, s.reason) for i in result.items for s in i.scores} == {
+        (True, "TypeError")
+    }
+
+
 @pytest.mark.usefixtures("prompts")
 def test_evaluate_and_check_run_on_the_configured_backend(
     memory: MemoryExperimentBackend,
@@ -335,6 +418,28 @@ def test_a_gate_records_and_then_measures_from_its_baseline(
     [brevity] = checked.report.outcomes
     # "v1: {great}" and "v1: {lectures}" score 1.0 and 0.0, and so does v2.
     assert (brevity.mean, brevity.baseline, brevity.status) == (0.5, 0.5, "pass")
+
+
+class IgnoresTags(MemoryExperimentBackend):
+    """A backend whose search does not filter on tags."""
+
+    def find_experiments(
+        self, *, app: str, dataset: str, tags: Sequence[str]
+    ) -> Iterator[ExperimentSummary]:
+        del tags
+        return super().find_experiments(app=app, dataset=dataset, tags=[])
+
+
+@pytest.mark.usefixtures("prompts")
+def test_a_pull_request_run_is_never_the_baseline() -> None:
+    backend = IgnoresTags()
+    configure_experiment_backend(backend)
+    backend.seed_dataset(DATASET, GOLDEN, app=APP)
+    run_gate(declaration(prompts={USE_CASE: "v1"}), suite=suite, change="pr-1")
+
+    outcome = run_gate(declaration(), suite=suite, change="pr-2")
+
+    assert outcome.baseline is None
 
 
 @pytest.mark.usefixtures("prompts")

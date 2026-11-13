@@ -26,6 +26,7 @@ import httpx
 import opik
 import pydantic
 from opik import context_storage, url_helpers
+from opik.api_objects.dataset.dataset import DatasetVersion
 from opik.api_objects.dataset.dataset_item import DatasetItem
 from opik.evaluation.evaluation_result import EvaluationResult
 from opik.evaluation.metrics import (
@@ -40,7 +41,7 @@ from opik.evaluation.metrics import (
 from opik.evaluation.metrics.arguments_validator import validate_score_arguments
 from opik.evaluation.models import OpikBaseModel
 from opik.evaluation.models.base_model import ConversationDict
-from opik.exceptions import DatasetVersionNotFound
+from opik.exceptions import DatasetVersionNotFound, ScoreMethodMissingArguments
 from opik.rest_api.core import ApiError
 from opik.types import BatchFeedbackScoreDict
 
@@ -55,6 +56,7 @@ from ol_llm.experiments.interface import (
     ExperimentRun,
     ExperimentSummary,
     Metric,
+    MissingMetricInputError,
     Score,
     Task,
     TraceScore,
@@ -142,14 +144,7 @@ class OpikExperimentBackend(ExperimentBackend):
         version: str,
     ) -> int:
         """Count the items the version lacks, by the SDK's content hash."""
-        dataset = _dataset(name, app)
-        try:
-            pinned = dataset.get_version_view(version)
-        except DatasetVersionNotFound as exc:
-            msg = f"Dataset {name!r} has no version {version}"
-            raise DatasetVersionNotFoundError(
-                msg, latest=dataset.get_current_version_name()
-            ) from exc
+        pinned = _version(_dataset(name, app), version)
         if not items:
             return 0
         held = {DatasetItem(**item).content_hash() for item in pinned.get_items()}
@@ -165,7 +160,7 @@ class OpikExperimentBackend(ExperimentBackend):
         result = opik.evaluate(
             dataset=source
             if run.dataset_version is None
-            else source.get_version_view(run.dataset_version),
+            else _version(source, run.dataset_version),
             task=_in_environment(run.task),
             scoring_metrics=[_OpikMetric(metric) for metric in run.metrics],
             experiment_name=run.name,
@@ -269,9 +264,7 @@ class OpikExperimentBackend(ExperimentBackend):
                 or []
             )
             for experiment in content:
-                # Checked here too, so a backend that ignored the filter cannot
-                # hand back a pull request's run as a baseline.
-                if experiment.id is None or not set(tags) <= set(experiment.tags or []):
+                if experiment.id is None:
                     continue
                 summary = experiment.dataset_version_summary
                 yield ExperimentSummary(
@@ -300,6 +293,16 @@ def _dataset(name: str, app: str) -> opik.Dataset:
             msg = f"App {app!r} has no dataset {name!r}"
             raise DatasetNotFoundError(msg) from exc
         raise
+
+
+def _version(dataset: opik.Dataset, version: str) -> DatasetVersion:
+    try:
+        return dataset.get_version_view(version)
+    except DatasetVersionNotFound as exc:
+        msg = f"Dataset {dataset.name!r} has no version {version}"
+        raise DatasetVersionNotFoundError(
+            msg, latest=dataset.get_current_version_name()
+        ) from exc
 
 
 def _experiment_url(dataset_id: str, experiment_id: str) -> str | None:
@@ -357,10 +360,19 @@ class _OpikMetric(BaseMetric):
         self,
         **inputs: Any,  # noqa: ANN401
     ) -> score_result.ScoreResult | list[score_result.ScoreResult]:
-        """Score the item with the ol-llm metric."""
+        """Score the item with the ol-llm metric.
+
+        :raises ScoreMethodMissingArguments: for a missing input, which
+            ``opik.evaluate`` aborts the run on.
+        """
         _carry_environment()
         inputs.pop(_TRACE_TOOL_CONTEXT, None)
-        found = self.metric.score(**inputs)
+        try:
+            found = self.metric.score(**inputs)
+        except MissingMetricInputError as exc:
+            raise ScoreMethodMissingArguments(
+                exc.metric, exc.missing, exc.available
+            ) from exc
         if isinstance(found, Score):
             return _to_opik(found)
         return [_to_opik(score) for score in found]
@@ -473,9 +485,7 @@ class _OpikJudge(OpikBaseModel):
 class OpikJudgeMetric(Metric):
     """One of Opik's judge metrics as an ol-llm metric.
 
-    Opik's metric runs in this process with the judge as its model. A missing
-    input raises Opik's ``ScoreMethodMissingArguments``, which aborts an Opik
-    experiment rather than failing each item's score.
+    Opik's metric runs in this process with the judge as its model.
 
     :param metric: the Opik metric, built untracked: the backend that runs the
         experiment traces the ol-llm metric instead.
@@ -490,9 +500,14 @@ class OpikJudgeMetric(Metric):
     def score(self, **inputs: Any) -> Score | list[Score]:  # noqa: ANN401
         """Score the item with the Opik metric.
 
-        :raises ScoreMethodMissingArguments: if an input it needs is missing.
+        :raises MissingMetricInputError: if an input it needs is missing.
         """
-        validate_score_arguments(self.metric, inputs, None)
+        try:
+            validate_score_arguments(self.metric, inputs, None)
+        except ScoreMethodMissingArguments as exc:
+            raise MissingMetricInputError(
+                self.name, exc.missing_required_arguments, inputs
+            ) from exc
         positional, keyword = arguments_helpers.select_score_arguments(
             self.metric.score, inputs, self.name
         )

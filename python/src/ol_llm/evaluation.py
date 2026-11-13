@@ -56,6 +56,7 @@ from ol_llm.experiments import (
     ExperimentResult,
     ExperimentRun,
     Metric,
+    MissingMetricInputError,
     Score,
     Task,
     TraceScore,
@@ -84,6 +85,7 @@ __all__ = [
     "JudgeModel",
     "Metric",
     "MetricOutcome",
+    "MissingMetricInputError",
     "OutcomeStatus",
     "PairVerdict",
     "PairwiseComparison",
@@ -137,7 +139,8 @@ class ValidatorMetric(Metric):
     ``lambda source, output: placeholders(source) == placeholders(output)``.
 
     An exception raised by the check is a failed score, which
-    ``check_thresholds`` counts against the metric. An item whose task raised an
+    ``check_thresholds`` counts against the metric. A missing input aborts the
+    run instead, since it is missing on every item. An item whose task raised an
     ``LLMError`` in ``evaluate`` scores 0.0 without running the check.
 
     :param name: the score's name.
@@ -170,18 +173,15 @@ class ValidatorMetric(Metric):
         :param inputs: the item's fields and the task's output.
         :returns: 1.0 when the check passed, 0.0 with the problems when not.
         :rtype: Score
-        :raises ValueError: if an input the check needs is missing.
+        :raises MissingMetricInputError: if an input the check needs is missing,
+            which aborts the run.
         :raises TypeError: if the check returns a string, which reads as neither a
             pass nor a list of problems.
         """
         if (error := inputs.get(LLM_ERROR_FIELD)) is not None:
             return Score(name=self.name, value=0.0, reason=f"the task raised {error}")
         if missing := sorted(self._required - inputs.keys()):
-            msg = (
-                f"{self.name} needs {missing}; the item and output have "
-                f"{sorted(inputs)}. Map them with scoring_key_mapping."
-            )
-            raise ValueError(msg)
+            raise MissingMetricInputError(self.name, missing, inputs)
         arguments = (
             inputs
             if self._takes_any
@@ -373,7 +373,16 @@ def evaluate(  # noqa: PLR0913
     :rtype: ExperimentResult
     :raises ValueError: if ``prompts`` is empty or holds an embedded default or
         a version the experiment backend cannot link.
+    :raises TypeError: if a metric is not an ol-llm ``Metric``, e.g. one of
+        Opik's metric classes.
     """
+    if foreign := [type(m).__name__ for m in metrics if not isinstance(m, Metric)]:
+        msg = (
+            f"Metrics {foreign} are not ol_llm.evaluation.Metric. Use the judge "
+            "metrics in ol_llm.evaluation (e.g. hallucination(judge) for Opik's "
+            "Hallucination(model=judge)), ValidatorMetric, or a Metric subclass."
+        )
+        raise TypeError(msg)
     if not prompts:
         msg = "Pass every managed prompt the task uses, so the experiment links them"
         raise ValueError(msg)

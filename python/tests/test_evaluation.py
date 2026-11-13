@@ -48,6 +48,7 @@ from opik.api_objects.dataset.dataset_item import DatasetItem
 from opik.api_objects.experiment.experiment_item import ExperimentItemContent
 from opik.evaluation import test_case, test_result
 from opik.evaluation.evaluation_result import EvaluationResult
+from opik.evaluation.metrics import Hallucination
 from opik.evaluation.metrics.score_result import ScoreResult
 from opik.exceptions import ScoreMethodMissingArguments
 from opik.message_processing.emulation.models import SpanModel
@@ -642,6 +643,37 @@ def test_a_missing_metric_input_still_aborts_the_run(
         pytest.raises(ScoreMethodMissingArguments),
     ):
         run_rag(production_prompt, task=lambda _item: {"output": "x"}, mapping={})
+
+
+@ON_OPIKS_ENGINE
+def test_a_validators_missing_input_aborts_the_run_too(
+    production_prompt: ManagedPrompt[TextTemplate],
+) -> None:
+    seed_dataset("rag-golden", RAG, app=APP)
+
+    with pytest.raises(ScoreMethodMissingArguments, match="placeholders"):
+        evaluate(
+            lambda _item: {"output": "x"},
+            dataset="rag-golden",
+            app=APP,
+            metrics=[ValidatorMetric("placeholders", same_placeholders)],
+            prompts=[production_prompt],
+            task_threads=1,
+        )
+
+
+@pytest.mark.usefixtures("client")
+def test_evaluate_refuses_an_opik_metric(
+    production_prompt: ManagedPrompt[TextTemplate],
+) -> None:
+    with pytest.raises(TypeError, match=r"hallucination\(judge\)"):
+        evaluate(
+            lambda item: item,
+            dataset="summary-golden",
+            app=APP,
+            metrics=[Hallucination(model="gpt-4o-mini", track=False)],  # type: ignore[list-item]
+            prompts=[production_prompt],
+        )
 
 
 # Metrics

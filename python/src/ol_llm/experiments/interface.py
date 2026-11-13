@@ -11,7 +11,7 @@ metric type.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -35,6 +35,31 @@ class DatasetVersionNotFoundError(LookupError):
         """Keep the latest version beside the message."""
         super().__init__(message)
         self.latest = latest
+
+
+class MissingMetricInputError(ValueError):
+    """A metric needs an input that neither the item nor the output has.
+
+    Every backend aborts the run on it rather than failing the item's score, as
+    Opik does: a missing input is a mistake in the suite or its
+    ``scoring_key_mapping``, the same on every item.
+
+    :param metric: the metric's name.
+    :param missing: the inputs it needs and did not get.
+    :param available: the inputs it got.
+    """
+
+    def __init__(
+        self, metric: str, missing: Sequence[str], available: Iterable[str]
+    ) -> None:
+        """Name what is missing and what there is to map from."""
+        self.metric = metric
+        self.missing = list(missing)
+        self.available = sorted(available)
+        super().__init__(
+            f"{metric} needs {self.missing}; the item and output have "
+            f"{self.available}. Map them with scoring_key_mapping."
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -79,6 +104,7 @@ class Metric(ABC):
         :returns: one score, or several for a metric that scores more than one
             thing.
         :rtype: Score | Sequence[Score]
+        :raises MissingMetricInputError: if an input it needs is missing.
         """
 
 
@@ -272,13 +298,18 @@ class ExperimentBackend(ABC):
     def run_experiment(self, run: ExperimentRun) -> ExperimentResult:
         """Run the task on each item of a dataset version and score it.
 
-        A metric that raises is a failed score for that item. An exception from
-        the task aborts the run.
+        A metric that raises is a failed score for that item, except for
+        ``MissingMetricInputError``, which aborts the run. A
+        ``scoring_key_mapping`` entry whose field the item and output lack is
+        skipped. An exception from the task aborts the run.
 
         :param run: what to run.
         :returns: the experiment.
         :rtype: ExperimentResult
         :raises DatasetNotFoundError: if there is no such dataset.
+        :raises DatasetVersionNotFoundError: if it has no such version.
+        :raises MissingMetricInputError: if a metric needs an input an item
+            lacks.
         """
 
     @abstractmethod

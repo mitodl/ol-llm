@@ -766,13 +766,15 @@ def find_baseline(
     versions = _versions(
         {name: prompt.version or "" for name, prompt in production.items()}
     )
+    tags = [_gate_tag(declaration), BASELINE_TAG]
     for experiment in backend.find_experiments(
-        app=declaration.app,
-        dataset=declaration.dataset.name,
-        tags=[_gate_tag(declaration), BASELINE_TAG],
+        app=declaration.app, dataset=declaration.dataset.name, tags=tags
     ):
+        # Checked here too, so a backend that ignored the tags cannot hand back
+        # a pull request's run as the baseline.
         if (
-            experiment.experiment_id != exclude
+            set(tags) <= experiment.tags
+            and experiment.experiment_id != exclude
             and wanted <= experiment.prompt_versions
             and experiment.dataset_version == declaration.dataset.version
         ):
