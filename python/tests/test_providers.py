@@ -40,6 +40,7 @@ from pydantic_ai.providers import mistral
 from pydantic_ai.providers.together import TogetherProvider
 
 HANG_SECONDS = 1.5
+RECORD_WAIT_SECONDS = 1.0
 TEST_TIMEOUT_SECONDS = "0.3"
 
 
@@ -305,8 +306,14 @@ def assert_requests_sent(
     # connecting fails an attempt that never reaches the server. Any other gap,
     # or any extra request, is a retry layer too few or too many.
     assert len(failures) == attempts
-    unsent = sum(map(timed_out_connecting, failures))
-    assert len(mock.requests) == attempts - unsent
+    sent = attempts - sum(map(timed_out_connecting, failures))
+    # A handler thread records its request after reading it, so after a stall the
+    # client can give up on the last request before the server records it. Every
+    # request was sent before the call raised, so waiting cannot hide an extra one.
+    deadline = time.monotonic() + RECORD_WAIT_SECONDS
+    while len(mock.requests) < sent and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(mock.requests) == sent
 
 
 def point_at(
