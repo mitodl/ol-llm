@@ -52,6 +52,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 from pydantic_ai.models import ModelRequestParameters
+from pydantic_ai.models._continuation import cancel_abandoned_job
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from pydantic_ai.output import NativeOutput, OutputSpec
@@ -577,6 +578,48 @@ def test_a_failed_continuation_raises_the_primary_error(stream: bool) -> None:  
     assert [e.model for e in group.exceptions] == [FALLBACK, PRIMARY, FALLBACK]  # type: ignore[attr-defined]
 
 
+class Cancelling(TestModel):
+    """Records each suspended response it is asked to cancel."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancelled: list[ModelResponse] = []
+
+    async def cancel_suspended_response(self, response: ModelResponse) -> None:
+        self.cancelled.append(response)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_failed_continuation_is_not_cancelled_again(stream: bool) -> None:  # noqa: FBT001
+    primary = Scripted(*always(lambda: http_error(503)))
+    fallback = Scripted(*always(lambda: http_error(429)))
+    with override_models(fallback_models(primary, fallback)):
+        model = build_model(SUMMARY_WITH_FALLBACK)
+    assert isinstance(model, PolicyFallbackModel)
+    messages = continuing_on(model, 1)
+    suspended = messages[-1]
+    assert isinstance(suspended, ModelResponse)
+    agent_model = Cancelling()
+
+    async def request() -> None:
+        try:
+            if not stream:
+                await model.request(messages, None, ModelRequestParameters())
+                return
+            async with model.request_stream(messages, None, ModelRequestParameters()):
+                pass  # pragma: no cover
+        except LLMError as error:
+            # What the agent's continuation loop does with the error it gets.
+            await cancel_abandoned_job(agent_model, suspended, error)
+            raise
+
+    with pytest.raises(LLMUnavailable):
+        asyncio.run(request())
+
+    # FallbackModel cancelled the job before trying the chain.
+    assert agent_model.cancelled == []
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_a_retrys_span_names_the_model_that_answered(
     exported: InMemorySpanExporter,
@@ -666,6 +709,90 @@ def test_a_rejected_token_count_is_classified() -> None:
 
     assert caught.value.status_code == 401
     assert len(counting.counted) == 1
+
+
+def test_a_fallback_chain_counts_on_the_fallback_when_the_primary_is_down() -> None:
+    primary = Counting(*always(lambda: http_error(503)))
+    fallback = Counting()
+    with override_models({PRIMARY: primary, FALLBACK: fallback}):
+        build_agent(SUMMARY_WITH_FALLBACK).run_sync("hi", usage_limits=COUNT_FIRST)
+
+    assert len(primary.counted) == 3
+    assert len(fallback.counted) == 1
+
+
+def test_a_fallback_chain_whose_counts_all_fail_raises_the_primary_error() -> None:
+    primary = Counting(*always(lambda: http_error(503)))
+    fallback = Counting(*always(lambda: http_error(429)))
+    with (
+        override_models({PRIMARY: primary, FALLBACK: fallback}),
+        pytest.raises(LLMUnavailable) as caught,
+    ):
+        build_agent(SUMMARY_WITH_FALLBACK).run_sync("hi", usage_limits=COUNT_FIRST)
+
+    assert caught.value.model == PRIMARY
+    group = caught.value.__cause__
+    assert isinstance(group, FallbackExceptionGroup)
+    assert [type(e) for e in group.exceptions] == [LLMUnavailable, LLMRateLimited]
+    assert isinstance(group.exceptions[0].__cause__, ModelHTTPError)
+
+
+def test_a_rejected_count_does_not_fall_back() -> None:
+    primary = Counting(http_error(401))
+    fallback = Counting()
+    with (
+        override_models({PRIMARY: primary, FALLBACK: fallback}),
+        pytest.raises(LLMRejected),
+    ):
+        build_agent(SUMMARY_WITH_FALLBACK).run_sync("hi", usage_limits=COUNT_FIRST)
+
+    assert fallback.counted == []
+
+
+def test_a_fallback_that_cannot_count_raises_the_primary_error() -> None:
+    primary = Counting(*always(lambda: http_error(503)))
+    with (
+        override_models({PRIMARY: primary, FALLBACK: TestModel()}),
+        pytest.raises(LLMUnavailable) as caught,
+    ):
+        build_agent(SUMMARY_WITH_FALLBACK).run_sync("hi", usage_limits=COUNT_FIRST)
+
+    assert caught.value.model == PRIMARY
+
+
+class CountingFunction(FunctionModel):
+    """A scripted FunctionModel that also counts tokens."""
+
+    def __init__(self, script: Scripted, model_name: str | None = None) -> None:
+        super().__init__(script, stream_function=script.stream, model_name=model_name)
+        self.counts = 0
+
+    async def count_tokens(
+        self,
+        messages: list[ModelMessage],  # noqa: ARG002
+        model_settings: ModelSettings | None,  # noqa: ARG002
+        model_request_parameters: ModelRequestParameters,  # noqa: ARG002
+    ) -> RequestUsage:
+        self.counts += 1
+        return RequestUsage(input_tokens=1)
+
+
+def test_a_retrys_count_starts_at_the_model_that_gave_the_response() -> None:
+    primary = CountingFunction(
+        Scripted(*always(lambda: http_error(503), 3), answer="from primary")
+    )
+    fallback = CountingFunction(
+        Scripted("first", answer="from fallback"), model_name="fallback"
+    )
+    with override_models({PRIMARY: primary, FALLBACK: fallback}):
+        agent = build_agent(SUMMARY_WITH_FALLBACK)
+        history = agent.run_sync("hi").all_messages()
+        with pytest.warns(PydanticAIDeprecationWarning, match="RetryPromptPart"):
+            retry = RetryPromptPart(content="Say it again.")
+        history.append(ModelRequest(parts=[retry]))
+        agent.run_sync(message_history=history, usage_limits=COUNT_FIRST)
+
+    assert (primary.counts, fallback.counts) == (0, 1)
 
 
 # Agents

@@ -33,7 +33,9 @@ scenes. The worst case for one call that is not streamed, by the caller or behin
 is `(MAX_RETRIES + 1) × TIMEOUT_SECONDS` plus backoff, and that again for each fallback model,
 so worker time limits (Celery, arq, Dagster) have to sit above it. A run that counts tokens
 before each request (`UsageLimits(count_tokens_before_request=True)`) makes the count under the
-same policy with its own retries, which doubles that. A streamed call has no such bound.
+same policy with its own retries, and falls back on the same errors as the request, which
+doubles that. An embedder's `count_tokens` is retried the same way. A streamed call has no such
+bound.
 
 ## One retry layer
 
