@@ -1,32 +1,27 @@
 from collections.abc import Callable, Iterator
-from typing import TYPE_CHECKING
 
 import httpx
 import opik
 import pytest
 import requests
-from ol_llm import tracing
+from ol_llm import keycloak, tracing
 from ol_llm.testing import tracing_disabled
+from ol_llm.trace_destinations import opik_destination
+from ol_llm.trace_destinations.opik_destination import PROJECT_NAME
 from ol_llm.tracing import (
-    PROJECT_ATTRIBUTE,
     HttpxBearerAuth,
     KeycloakClient,
     KeycloakTokens,
-    ProjectExporter,
     RequestsBearerAuth,
     TracingConfig,
     configure_tracing,
     tracer_provider,
 )
-from opentelemetry.sdk.trace.export import SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
 from opik.hooks import HttpxClientHook
 from requests.adapters import BaseAdapter
-
-if TYPE_CHECKING:
-    from opentelemetry.sdk.trace import ReadableSpan
 
 KEYCLOAK = KeycloakClient(
     token_url="https://sso.example/token",
@@ -87,13 +82,14 @@ def test_from_env_rejects_a_partial_keycloak_client() -> None:
         TracingConfig.from_env(env)
 
 
-def test_from_env_rejects_keycloak_with_an_api_key(
+def test_keycloak_with_an_api_key_is_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPIK_API_KEY", "static")
+    tracing.reset()
 
     with pytest.raises(ValueError, match="OPIK_API_KEY"):
-        TracingConfig.from_env(KEYCLOAK_ENV)
+        configure_tracing(TracingConfig.from_env(KEYCLOAK_ENV))
 
 
 @pytest.mark.parametrize(("value", "expected"), [("false", False), ("1", True)])
@@ -112,7 +108,7 @@ def test_tokens_are_cached_until_they_near_expiry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     now = [1000.0]
-    monkeypatch.setattr(tracing.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(keycloak.time, "monotonic", lambda: now[0])
     http, seen = token_server([300, 300])
     tokens = KeycloakTokens(KEYCLOAK, http=http)
 
@@ -241,8 +237,8 @@ OTHER_KEYCLOAK = KeycloakClient(
 def hooks(monkeypatch: pytest.MonkeyPatch) -> list[HttpxClientHook]:
     """Record SDK hooks in place of registering them on the real SDK."""
     registered: list[HttpxClientHook] = []
-    monkeypatch.setattr(tracing, "add_httpx_client_hook", registered.append)
-    monkeypatch.setattr(tracing, "_sdk_auth", None)
+    monkeypatch.setattr(opik_destination, "add_httpx_client_hook", registered.append)
+    monkeypatch.setattr(opik_destination, "_sdk_auth", None)
     tracing.reset()
     return registered
 
@@ -379,37 +375,14 @@ def test_spans_record_the_project_of_their_trace(
     tracing.flush()
 
     projects = {
-        span.name: (span.attributes or {}).get(PROJECT_ATTRIBUTE)
+        span.name: (span.attributes or {}).get(PROJECT_NAME)
         for span in exported.get_finished_spans()
     }
+    # One export carries every project; a span outside any trace goes to the app's.
     assert projects == {
         "agent": "ol-data-platform",
         "llm": "ol-data-platform",
-        "untraced": None,
-    }
-
-
-def test_spans_are_exported_per_project() -> None:
-    by_project: dict[str, InMemorySpanExporter] = {}
-
-    def make(project: str) -> InMemorySpanExporter:
-        return by_project.setdefault(project, InMemorySpanExporter())
-
-    exporter = ProjectExporter("mit-learn", make)
-    provider = tracer_provider("mit-learn")
-    assert provider is not None
-    tracer = provider.get_tracer("test")
-    spans: list[ReadableSpan] = []
-    for project in ("ol-data-platform", None):
-        with tracer.start_as_current_span("s") as span:
-            if project:
-                span.set_attribute(PROJECT_ATTRIBUTE, project)
-        spans.append(span)  # type: ignore[arg-type]
-
-    assert exporter.export(spans) == SpanExportResult.SUCCESS
-    assert {p: len(e.get_finished_spans()) for p, e in by_project.items()} == {
-        "ol-data-platform": 1,
-        "mit-learn": 1,
+        "untraced": "mit-learn",
     }
 
 

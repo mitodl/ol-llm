@@ -15,6 +15,7 @@ from typing import Literal
 
 from opentelemetry.trace import Span
 
+from ol_llm import trace_attributes as attrs
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution
 from ol_llm.loops import run_coroutine
 from ol_llm.memory.errors import MemoryUnsupported
@@ -71,19 +72,21 @@ class _Call:
             return
         with_content = include_content()
         recorded: dict[str, _AttributeValue] = {
-            "app": self.backend.app,
-            "use_case": self.use_case,
-            "environment": get_settings().environment,
-            "memory.operation": operation,
-            "memory.scope": self.scope,
-            "memory.backend": self.backend.name,
+            attrs.attribution("app"): self.backend.app,
+            attrs.attribution("use_case"): self.use_case,
+            attrs.attribution("environment"): get_settings().environment,
+            attrs.MEMORY_OPERATION: operation,
+            attrs.MEMORY_SCOPE: self.scope,
+            attrs.MEMORY_BACKEND: self.backend.name,
             **(attributes or {}),
         }
         if self.general_name is not None:
-            recorded["memory.general_name"] = self.general_name
-        for name in ("user_id", "thread_id", "run_id"):
+            recorded[attrs.MEMORY_GENERAL_NAME] = self.general_name
+        for name in ("user_id", "run_id"):
             if (value := getattr(self.attribution, name)) is not None:
-                recorded[name] = value
+                recorded[attrs.attribution(name)] = value
+        if self.attribution.thread_id is not None:
+            recorded[attrs.CONVERSATION_ID] = self.attribution.thread_id
         if with_content:
             recorded.update(content or {})
         with provider.get_tracer("ol_llm").start_as_current_span(
@@ -104,13 +107,13 @@ def _record_notes(span: Span | None, notes: Sequence[Note]) -> None:
         return
     span.set_attributes(
         {
-            "memory.results_count": len(notes),
-            "memory.result_keys": [f"{note.app}.{note.key}" for note in notes],
+            attrs.MEMORY_RESULTS_COUNT: len(notes),
+            attrs.MEMORY_RESULT_KEYS: [f"{note.app}.{note.key}" for note in notes],
         }
     )
     if include_content():
         span.set_attribute(
-            "memory.results",
+            attrs.MEMORY_RESULTS,
             json.dumps(
                 [
                     {
@@ -151,10 +154,10 @@ class _Notes:
         :raises MemoryForbidden: if this credential may not write here.
         """
         check_key(key)
-        content = {"memory.text": text}
+        content = {attrs.MEMORY_TEXT: text}
         if metadata:
-            content["memory.metadata"] = json.dumps(dict(metadata))
-        with self._call.span("put", {"memory.key": key}, content):
+            content[attrs.MEMORY_METADATA] = json.dumps(dict(metadata))
+        with self._call.span("put", {attrs.MEMORY_KEY: key}, content):
             await self._store.put(key, text, metadata=metadata)
 
     async def get(self, key: str, *, app: str | None = None) -> Note:
@@ -169,7 +172,7 @@ class _Notes:
         check_key(key)
         writer = app or self.app
         with self._call.span(
-            "get", {"memory.key": key, "memory.writer": writer}
+            "get", {attrs.MEMORY_KEY: key, attrs.MEMORY_WRITER: writer}
         ) as span:
             note = await self._store.get(key, app=writer)
             _record_notes(span, [note])
@@ -192,7 +195,7 @@ class _Notes:
             raise ValueError(msg)
         self._call.require("search", "search")
         with self._call.span(
-            "search", {"memory.limit": limit}, {"memory.query": query}
+            "search", {attrs.MEMORY_LIMIT: limit}, {attrs.MEMORY_QUERY: query}
         ) as span:
             notes = await self._store.search(query, limit=limit)
             _record_notes(span, notes)
@@ -205,7 +208,7 @@ class _Notes:
         :raises MemoryForbidden: if this credential may not write here.
         """
         check_key(key)
-        with self._call.span("delete", {"memory.key": key}):
+        with self._call.span("delete", {attrs.MEMORY_KEY: key}):
             await self._store.delete(key)
 
     async def list(self) -> builtins.list[Note]:
@@ -285,10 +288,12 @@ class AdminMemory:
         :returns: how many stored items were removed.
         :rtype: int
         """
-        with self._call.span("forget", {"user_id": learner_id}) as span:
+        with self._call.span(
+            "forget", {attrs.attribution("user_id"): learner_id}
+        ) as span:
             removed = await self._store.forget(learner_id)
             if span is not None and span.is_recording():
-                span.set_attribute("memory.removed_count", removed)
+                span.set_attribute(attrs.MEMORY_REMOVED_COUNT, removed)
         return removed
 
 

@@ -10,7 +10,8 @@ import pytest
 from ol_llm import Attribution, UseCase, embed_sync, traced_embedding, traces, tracing
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.testing import override_embedding_models, tracing_disabled
-from ol_llm.tracing import PROJECT_ATTRIBUTE, TracingConfig, configure_tracing
+from ol_llm.trace_destinations.opik_destination import PROJECT_NAME
+from ol_llm.tracing import TracingConfig, configure_tracing
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
@@ -77,14 +78,16 @@ def test_the_span_lands_in_the_root_trace_with_the_reported_usage(
     attributes = span.attributes or {}
     assert span.name == "embeddings text-embedding-3-small"
     assert attributes["opik.trace_id"] == trace.id
-    assert attributes[PROJECT_ATTRIBUTE] == "mit-learn"
+    assert attributes[PROJECT_NAME] == "mit-learn"
     assert attributes["gen_ai.operation.name"] == "embeddings"
     assert attributes["gen_ai.provider.name"] == "openai"
     assert attributes["gen_ai.request.model"] == "text-embedding-3-small"
     assert attributes["gen_ai.response.model"] == "text-embedding-3-small"
     assert attributes["gen_ai.usage.input_tokens"] == 7
-    assert attributes["gen_ai.embeddings.dimension.count"] == 3
+    assert attributes["opik.metadata.embedding_dimensions"] == 3
+    assert attributes["opik.metadata.inputs_count"] == 2
     assert attributes["inputs"] == '["a", "b"]'
+    assert not {"gen_ai.embeddings.dimension.count", "inputs_count"} & attributes.keys()
     assert "embeddings" not in attributes
 
 
@@ -171,7 +174,7 @@ def test_a_request_inside_a_tracked_function_is_a_span_of_its_trace(
     assert "use_case:search-query" in (trace.tags or [])
     assert [span.name for span in root.spans] == ["search-query"]
     [span] = exported.get_finished_spans()
-    assert (span.attributes or {})[PROJECT_ATTRIBUTE] == "mit-learn-search"
+    assert (span.attributes or {})[PROJECT_NAME] == "mit-learn-search"
 
 
 def test_it_works_around_an_awaited_call(exported: InMemorySpanExporter) -> None:
@@ -289,10 +292,10 @@ def test_the_root_trace_and_span_match_embeds(exported: InMemorySpanExporter) ->
         "gen_ai.request.model",
         "gen_ai.response.model",
         "gen_ai.usage.input_tokens",
-        "gen_ai.embeddings.dimension.count",
-        "inputs_count",
+        "opik.metadata.embedding_dimensions",
+        "opik.metadata.inputs_count",
         "inputs",
-        PROJECT_ATTRIBUTE,
+        PROJECT_NAME,
     )
     assert traced_span.name == embed_span.name
     embed_attributes = embed_span.attributes or {}

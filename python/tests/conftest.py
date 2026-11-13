@@ -19,8 +19,10 @@ import pytest
 from ol_llm import GatewayRoute, UseCase, loops, models, prompts, tracing
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.experiments import configure_experiment_backend
+from ol_llm.models import build_agent, override_models
 from ol_llm.prompt_registry import configure_prompt_registry
 from ol_llm.settings import Settings, configure
+from ol_llm.trace_destinations import opik_destination
 from ol_llm.tracing import KeycloakClient, TracingConfig, configure_tracing
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter
@@ -28,11 +30,15 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
 from opik import context_storage
+from opik.api_objects.opik_client import reset_global_client
 from opik.message_processing.emulation.models import TraceModel
+from pydantic_ai import Agent
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
     ModelResponse,
+    TextPart,
     ToolCallPart,
     UserPromptPart,
 )
@@ -429,17 +435,18 @@ def provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def exported(monkeypatch: pytest.MonkeyPatch) -> Generator[InMemorySpanExporter]:
-    """Keep model spans in memory in place of sending them to Opik.
+    """Keep the spans the Opik destination exports in memory, mapped as Opik gets
+    them, in place of sending them.
 
     Call ``tracing.flush`` before reading: the batch processor sends in the
     background.
     """
     exporter = InMemorySpanExporter()
 
-    def in_memory(_app: str, _state: object) -> SpanExporter:
+    def in_memory(_destination: object, _app: str) -> SpanExporter:
         return exporter
 
-    monkeypatch.setattr(tracing, "_exporter", in_memory)
+    monkeypatch.setattr(opik_destination, "_exporter", in_memory)
     tracing.reset()
     configure_tracing(TRACING)
     yield exporter
@@ -611,3 +618,85 @@ def preferring(word: str, seen: list[str] | None = None) -> FunctionModel:
         )
 
     return FunctionModel(reply)
+
+
+def replying(text: str) -> FunctionModel:
+    """A model that answers every request with ``text``."""
+
+    def reply(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(text)])
+
+    return FunctionModel(reply)
+
+
+def failing(status: int, body: str = "provider said no") -> FunctionModel:
+    """A model whose provider answers every request with HTTP ``status``."""
+
+    def fail(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
+        raise ModelHTTPError(status, "gpt-4o-mini", body=body)
+
+    return FunctionModel(fail)
+
+
+def agent_for(use_case: UseCase, model: object, **kwargs: object) -> Agent[None, str]:
+    with override_models(model):  # type: ignore[arg-type]
+        return build_agent(use_case, **kwargs)  # type: ignore[call-overload,no-any-return]
+
+
+class RecordingOpik(BaseHTTPRequestHandler):
+    """Records every request body by path, and answers Keycloak token requests."""
+
+    protocol_version = "HTTP/1.1"
+    received: list[tuple[str, bytes]]
+
+    def _answer(self) -> None:
+        body = self.rfile.read(int(self.headers.get("content-length", 0)))
+        if self.headers.get("content-encoding") == "gzip":
+            body = gzip.decompress(body)
+        self.received.append((self.path, body))
+        reply = (
+            json.dumps({"access_token": "token", "expires_in": 300}).encode()
+            if self.path.endswith("/token")
+            else b"{}"
+        )
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(reply)))
+        self.end_headers()
+        self.wfile.write(reply)
+
+    do_GET = do_POST = do_PATCH = do_PUT = _answer  # noqa: N815
+
+    def log_message(self, *_args: object) -> None:
+        pass
+
+
+_REAL_EXPORTER = opik_destination._exporter  # noqa: SLF001
+
+
+@pytest.fixture
+def recording_opik(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Generator[list[tuple[str, bytes]]]:
+    """Send Opik's traffic to a server that records it, and return what it got.
+
+    The server's base URL is ``OPIK_URL_OVERRIDE`` without its ``/api``.
+    """
+    received: list[tuple[str, bytes]] = []
+    handler = type("Handler", (RecordingOpik,), {"received": received})
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(opik_destination, "_exporter", _REAL_EXPORTER)
+    # Set and restored here rather than by monkeypatch, which restores after the
+    # autouse ``exported`` fixture's flush has built the SDK's next client.
+    previous = os.environ["OPIK_URL_OVERRIDE"]
+    os.environ["OPIK_URL_OVERRIDE"] = f"http://127.0.0.1:{server.server_address[1]}/api"
+    # The SDK's client reads its URL when it is built.
+    reset_global_client()
+    yield received
+    os.environ["OPIK_URL_OVERRIDE"] = previous
+    tracing.reset()
+    reset_global_client()
+    server.shutdown()
+    server.server_close()

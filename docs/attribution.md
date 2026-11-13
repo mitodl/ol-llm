@@ -5,18 +5,22 @@ gateway logs, and metrics. Decided 2026-10-01; the reasoning is in
 [`shared-llm-library-spec.md`](https://github.com/mitodl/ol-infrastructure/blob/main/docs/plans/shared-llm-library-spec.md)
 §4. The library applies the fields; call sites supply the values.
 
-| Field | When | Source | On the Opik trace | Elsewhere |
-| --- | --- | --- | --- | --- |
-| `app` | always | the use case | project name, tag `app:<app>`, metadata | gateway consumer |
-| `use_case` | always | the use case | tag `use_case:<name>`, metadata | `X-OL-LLM-Use-Case` header on gateway requests |
-| `environment` | always | deployment configuration | native environment field, tag `env:<environment>`, metadata | |
-| `model`, `provider` | always | the model that answered | `gen_ai.request.model`, `gen_ai.provider.name` on spans | |
-| `prompt_name`, `prompt_version` | a managed prompt is used | the prompt helper | the native prompt link, plus metadata | |
-| `user_id` | request-time with a user | the call | metadata | OpenAI `user`, Anthropic `metadata.user_id` |
-| `thread_id` | conversations | the call | native thread field | |
-| `run_id` | batch | the call | metadata | |
-| `model_status` | a model in the use case's chain is deprecated or not in the catalog | the model catalog | tag `model_status:deprecated` or `model_status:uncataloged` | |
-| `degraded` | when true | the library, or the call site for partial output | `degraded`, `degraded_reason` metadata | |
+| Field | When | Source | On the call span | On the Opik trace | Elsewhere |
+| --- | --- | --- | --- | --- | --- |
+| `app` | always | the use case | `ol.app`, tag `app:<app>` in `ol.tags` | project name, tag `app:<app>`, metadata | gateway consumer |
+| `use_case` | always | the use case | `ol.use_case`, the span's name | tag `use_case:<name>`, metadata | `X-OL-LLM-Use-Case` header on gateway requests |
+| `environment` | always | deployment configuration | `ol.environment` | native environment field, tag `env:<environment>`, metadata | |
+| `model`, `provider` | always | the model that answered | `gen_ai.request.model`, `gen_ai.provider.name` on the model spans | the same, on spans | |
+| `prompt_name`, `prompt_version` | a managed prompt is used | the prompt helper | `ol.prompt_name`, `ol.prompt_version` | the native prompt link, plus metadata | |
+| `user_id` | request-time with a user | the call | `ol.user_id` | metadata | OpenAI `user`, Anthropic `metadata.user_id` |
+| `thread_id` | conversations | the call | `gen_ai.conversation.id` | native thread field | |
+| `run_id` | batch | the call | `ol.run_id` | metadata | |
+| `model_status` | a model in the use case's chain is deprecated or not in the catalog | the model catalog | tag in `ol.tags` | tag `model_status:deprecated` or `model_status:uncataloged` | |
+| `degraded` | when true | the library, or the call site for partial output | `ol.degraded`, `ol.degraded_reason` | `degraded`, `degraded_reason` metadata | |
+
+The call span's attributes are what every trace destination gets
+(`ol_llm.trace_attributes` names them); the Opik column is what the Opik destination makes
+of them.
 
 Tags carry only `app`, `use_case`, `environment`, and `model_status`. User, thread, and run
 identifiers go in metadata and never in tags or metric labels.

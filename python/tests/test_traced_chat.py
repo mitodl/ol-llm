@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Any
 
 import ol_llm.catalog as catalog_module
-import ol_llm.langchain as langchain_module
+import ol_llm.trace_destinations.opik_langchain as langchain_module
 import opik
 import pytest
 from conftest import opik_context_is_empty
@@ -32,9 +32,12 @@ from ol_llm import (
     tracing,
 )
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
-from ol_llm.langchain import CUT_OFF_METADATA_KEY, GRAPH_METADATA_KEY
 from ol_llm.models import build_agent, override_models
 from ol_llm.testing import tracing_disabled
+from ol_llm.trace_destinations.opik_langchain import (
+    CUT_OFF_METADATA_KEY,
+    GRAPH_METADATA_KEY,
+)
 from ol_llm.tracing import TracingConfig, configure_tracing
 from opik.message_processing.emulation.models import SpanModel, TraceModel
 from pydantic_ai.models.test import TestModel

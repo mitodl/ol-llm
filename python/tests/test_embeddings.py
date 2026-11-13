@@ -40,7 +40,8 @@ from ol_llm.catalog import (
 from ol_llm.embeddings import PolicyEmbeddingModel, build_embedder, shared_embedder
 from ol_llm.settings import GatewayRoute
 from ol_llm.testing import override_embedding_models, tracing_disabled
-from ol_llm.tracing import PROJECT_ATTRIBUTE, TracingConfig, configure_tracing
+from ol_llm.trace_destinations.opik_destination import PROJECT_NAME
+from ol_llm.tracing import TracingConfig, configure_tracing
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -345,7 +346,7 @@ def test_the_embedding_span_lands_in_the_root_trace_with_its_usage(
     attributes = span.attributes or {}
     assert span.name == "embeddings text-embedding-3-small"
     assert attributes["opik.trace_id"] == trace.id
-    assert attributes[PROJECT_ATTRIBUTE] == "mit-learn"
+    assert attributes[PROJECT_NAME] == "mit-learn"
     assert attributes["gen_ai.usage.input_tokens"] == result.usage.input_tokens
 
 
@@ -366,7 +367,7 @@ def test_an_embedding_inside_a_tracked_function_is_a_span_of_its_trace(
     assert "use_case:search-query" in (trace.tags or [])
     assert [span.name for span in root.spans] == ["search-query"]
     [span] = exported.get_finished_spans()
-    assert (span.attributes or {})[PROJECT_ATTRIBUTE] == "ol-data-platform"
+    assert (span.attributes or {})[PROJECT_NAME] == "ol-data-platform"
 
 
 def test_with_tracing_off_nothing_is_recorded(exported: InMemorySpanExporter) -> None:
