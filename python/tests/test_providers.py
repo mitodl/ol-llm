@@ -17,11 +17,20 @@ from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+import httpx
+import httpx2
 import ol_llm.catalog as catalog_module
 import pytest
-from botocore.exceptions import EventStreamError
+from botocore.exceptions import ConnectTimeoutError, EventStreamError
 from conftest import released, runner_loop
-from ol_llm import LLMRateLimited, LLMRejected, LLMUnavailable, UseCase, run_sync
+from ol_llm import (
+    LLMRateLimited,
+    LLMRejected,
+    LLMUnavailable,
+    UseCase,
+    models,
+    run_sync,
+)
 from ol_llm.attribution import USE_CASE_HEADER
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.embeddings import PolicyEmbeddingModel, build_embedder
@@ -261,6 +270,45 @@ def mock_provider() -> Generator[MockProvider]:
     server.server_close()
 
 
+@pytest.fixture
+def attempt_failures(monkeypatch: pytest.MonkeyPatch) -> list[Exception]:
+    """Record the failure of each attempt the retry layer makes."""
+    failures: list[Exception] = []
+    retry_delay = models._retry_delay  # noqa: SLF001
+
+    def record(exc: Exception, *args: Any, **kwargs: Any) -> float:  # noqa: ANN401
+        failures.append(exc)
+        return retry_delay(exc, *args, **kwargs)
+
+    monkeypatch.setattr(models, "_retry_delay", record)
+    return failures
+
+
+CONNECT_TIMEOUTS = (httpx.ConnectTimeout, httpx2.ConnectTimeout, ConnectTimeoutError)
+
+
+def timed_out_connecting(exc: BaseException | None) -> bool:
+    """Whether an attempt failed before its request was sent."""
+    if exc is None:
+        return False
+    if isinstance(exc, BaseExceptionGroup):
+        return any(timed_out_connecting(member) for member in exc.exceptions)
+    return isinstance(exc, CONNECT_TIMEOUTS) or timed_out_connecting(
+        exc.__cause__ or exc.__context__
+    )
+
+
+def assert_requests_sent(
+    mock: MockProvider, failures: list[Exception], attempts: int
+) -> None:
+    # The test timeout bounds connecting too, so a process stall that long while
+    # connecting fails an attempt that never reaches the server. Any other gap,
+    # or any extra request, is a retry layer too few or too many.
+    assert len(failures) == attempts
+    unsent = sum(map(timed_out_connecting, failures))
+    assert len(mock.requests) == attempts - unsent
+
+
 def point_at(
     mock: MockProvider, model_id: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -305,6 +353,7 @@ MOCKED_MODELS = [
 )
 def test_one_retry_layer_per_provider(  # noqa: PLR0913, PLR0917
     mock_provider: MockProvider,
+    attempt_failures: list[Exception],
     monkeypatch: pytest.MonkeyPatch,
     model_id: str,
     mode: str,
@@ -318,7 +367,7 @@ def test_one_retry_layer_per_provider(  # noqa: PLR0913, PLR0917
     with pytest.raises(error):
         build_agent(use_case(model_id)).run_sync("hi")
 
-    assert len(mock_provider.requests) == attempts
+    assert_requests_sent(mock_provider, attempt_failures, attempts)
 
 
 # Bedrock's timeout is the boto3 client's, so it gets no timeout setting; the hang
@@ -357,6 +406,7 @@ MOCKED_EMBEDDING_MODELS = [
 )
 def test_one_retry_layer_per_embedding_provider(  # noqa: PLR0913, PLR0917
     mock_provider: MockProvider,
+    attempt_failures: list[Exception],
     monkeypatch: pytest.MonkeyPatch,
     model_id: str,
     mode: str,
@@ -370,7 +420,7 @@ def test_one_retry_layer_per_embedding_provider(  # noqa: PLR0913, PLR0917
     with pytest.raises(error):
         build_embedder(use_case(model_id)).embed_sync(["hi"], input_type="query")
 
-    assert len(mock_provider.requests) == attempts
+    assert_requests_sent(mock_provider, attempt_failures, attempts)
 
 
 @pytest.mark.usefixtures("provider_env")
