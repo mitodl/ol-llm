@@ -841,15 +841,35 @@ users and forgets them, so point it only at a disposable stack such as ol-infras
 
 ### Tracing
 
-Tracing reads the variables the Opik SDK reads, so the SDK and the span exporter always send
-to the same instance:
+Every call is recorded as OpenTelemetry spans: a call span for each `run`, `complete`,
+`embed`, `traced_chat` and `traced_embedding` call, with the attribution fields as `ol.*`
+attributes (`docs/attribution.md`), and the model, embedding and memory spans under it. Each
+span goes to every trace destination `OL_LLM_TRACE_DESTINATIONS` names:
+
+- `opik` (the default): the call becomes the Opik trace, with Opik's native environment,
+  thread and tags, and every other span goes to Opik's OTLP endpoint, with the `ol.*`
+  attributes as `opik.metadata.*`. A run inside a caller's own `@opik.track` is a span of the
+  caller's trace, as before.
+- `otlp`: the spans as recorded, to the OTLP/HTTP endpoint the standard
+  `OTEL_EXPORTER_OTLP_*` variables name, e.g. a Tempo. LangChain runs from `traced_chat` are
+  not spans and do not reach it.
+- `memory`: kept in the process, for tests (`ol_llm.tracing.destinations()`).
+
+Another package adds a destination with an entry point in the `ol_llm.trace_destinations`
+group, or in code with `ol_llm.trace_destinations.register_trace_destination`. Attribute
+names live in `ol_llm.trace_attributes`, since the OpenTelemetry GenAI conventions are not
+yet stable.
+
+The Opik destination reads the variables the Opik SDK reads, so the SDK and the span exporter
+always send to the same instance:
 
 | Variable | Meaning |
 | --- | --- |
+| `OL_LLM_TRACE_DESTINATIONS` | comma-separated destinations, `opik` when unset |
 | `OPIK_URL_OVERRIDE` | the Opik API, e.g. `https://opik-qa.ol.mit.edu/api` |
 | `OPIK_WORKSPACE` | `default` on our instances |
 | `OPIK_KEYCLOAK_TOKEN_URL`, `OPIK_KEYCLOAK_CLIENT_ID`, `OPIK_KEYCLOAK_CLIENT_SECRET` | the Keycloak client the app authenticates to Opik with; `OPIK_KEYCLOAK_SCOPE` if it needs one. Leave `OPIK_API_KEY` unset |
-| `OPIK_TRACK_DISABLE` | `true` turns tracing off, for local development without an Opik. Runs open no root trace and export no spans; SDK calls the app makes itself (prompt sync, datasets, experiments) still send the Keycloak token |
+| `OPIK_TRACK_DISABLE` | `true` turns tracing off, for local development without an Opik. Runs open no call span and export no spans; SDK calls the app makes itself (prompt sync, datasets, experiments) still send the Keycloak token |
 | `OL_LLM_TRACE_CONTENT` | `false` keeps prompts, completions, tool arguments, and error messages out of traces. On by default until the data-handling policy decides |
 
 Without a call, tracing reads these the first time an agent or embedder is built or a run
