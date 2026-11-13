@@ -6,6 +6,51 @@ All notable changes to ol-llm are recorded here. The format follows
 
 <!-- scriv-insert-here -->
 
+<a id='changelog-0.0.14'></a>
+## [0.0.14] - 2026-11-13
+
+### Removed
+
+- `ol_llm.tracing.PROJECT_ATTRIBUTE`, `ProjectExporter`, `ProjectStampProcessor`, `OpikActiveSampler` (now `ActiveSampler`), `ol_llm.traces.error_info`, and `TracedCall.mark_trace` (the trace destinations mark the call). `OTLP_TRACES_PATH`, `PROJECT_HEADER` and `WORKSPACE_HEADER` moved from `ol_llm.tracing` to `ol_llm.trace_destinations.opik_destination`. `ChatTracer`, `GRAPH_METADATA_KEY` and `CUT_OFF_METADATA_KEY` moved from `ol_llm.langchain` to `ol_llm.trace_destinations.opik_langchain`.
+- Model spans no longer take their Opik trace from W3C baggage, or from `opik.trace_id` and `opik.span_id` attributes on a parent span that another tracer provider started, as the Opik SDK's `OpikSpanProcessor` did. They attach to the parent ol-llm span, else to the Opik SDK's current span (a caller's `@opik.track`, including one called with `opik_distributed_trace_headers`). No app used either path.
+
+### Added
+
+- `ol_llm.prompt_registry`: the prompt registry behind `get_prompt`, `fetch_prompt`, `create_prompt`, `promote_prompt` and `ol-llm-prompts`, chosen by name like memory backends. `OL_LLM_PROMPT_REGISTRY` is `opik` by default, or `file` with `OL_LLM_PROMPT_REGISTRY_PATH` set to an exports directory, which serves the committed exports at their versions for tests and local work without Opik. The file registry serves them under `production`, or under the labels in `OL_LLM_PROMPT_REGISTRY_LABELS` (e.g. `production,ci`). It is read-only, and `ol-llm-prompts promote` refuses to run against it. `configure_prompt_registry` sets one in code, and the `ol_llm.prompt_registries` entry-point group adds others.
+
+- `ol_llm.experiments`: the experiment backend behind `ol_llm.evaluation` and the evaluation gate, chosen by name like memory backends and prompt registries. `OL_LLM_EXPERIMENT_BACKEND` is `opik` by default, or `memory`, which keeps datasets and experiments in the process for tests. `configure_experiment_backend` sets one in code, and the `ol_llm.experiment_backends` entry-point group adds others.
+- `ol_llm.evaluation.hallucination`, `answer_relevance`, `context_precision` and `context_recall`: Opik's judge metrics as ol-llm metrics on a `judge_model`, with Opik's score names (`hallucination_metric` and so on), so a suite imports no Opik. Replace `Hallucination(model=judge)` with `hallucination(judge)`.
+- `ol_llm.evaluation.Metric` and `Score`: a metric is a name and a `score(**inputs)` returning a `Score` (`name`, `value`, `reason`, `failed`) or a list of them. Subclass `Metric` for an app's own scoring function.
+
+- Trace destinations, chosen by name like memory backends: `OL_LLM_TRACE_DESTINATIONS` (comma-separated) is `opik` by default, `otlp` sends the spans unmapped to the endpoint the standard `OTEL_EXPORTER_OTLP_*` variables name (e.g. a Tempo), and `memory` keeps them in the process for tests. `TracingConfig.destinations` sets them in code, `ol_llm.tracing.destinations()` returns them, and the `ol_llm.trace_destinations` entry-point group or `register_trace_destination` adds others.
+- `otlp` receives the `ol.*` and `gen_ai.*` attributes (and no others but the content ones), and none that carry learner content or identify a user (call input and output, model messages, embedding inputs, note text and queries, `ol.user_id`, error messages) unless `OL_LLM_TRACE_OTLP_CONTENT=true`.
+- Every entry-point call opens an OpenTelemetry call span carrying the attribution fields as `ol.*` attributes (`ol.app`, `ol.use_case`, `ol.environment`, `ol.user_id`, `ol.run_id`, `ol.prompt_name`, `ol.degraded_reason`, ...), `ol.tags`, and the thread as `gen_ai.conversation.id`. The names are in `ol_llm.trace_attributes`.
+
+### Changed
+
+- ol-llm renders prompt templates itself instead of through Opik's template classes. Text prompts render exactly as before. A mustache template given the wrong variables raises `ol_llm.PromptVariablesError` (a `ValueError`) instead of Opik's `PromptPlaceholdersDontMatchFormatArguments`. A chat template now keeps every key of a message and of a content part (e.g. a text part's `cache_control`), messages without a `role`, a `content` of `None`, content parts Opik's renderer did not know, and a media part whose value is not an object; an `audio_url` part stays a part where Opik flattened the message to text; and a jinja2 error in a chat message raises where Opik sent the raw template. A media part with no URL, or one that renders empty, is still left out.
+- `get_prompt` caches fetched versions itself for five minutes (`ol_llm.prompts.PROMPT_CACHE_TTL_SECONDS`, at most 128 of them). The first call after that fetches again and keeps the cached version if the fetch fails, finds nothing, or misses the two-second deadline. `OPIK_PROMPT_CACHE_TTL_SECONDS` no longer applies.
+- A default of the other structure (text where the registry holds chat, or the reverse) raises `TypeError` from `get_prompt` and `create_prompt`, instead of Opik's `PromptTemplateStructureMismatch`. `promote_prompt` raises `LookupError` for a missing prompt or version.
+- `fetch_prompt`, and so `ol-llm-prompts` and the evaluation gate, raise `ol_llm.prompt_registry.RegistryUnavailableError` when Opik cannot be reached or answers 5xx, chained to the transport error or `ApiError` they raised before.
+- `ManagedPrompt.registry_ref` is typed `object | None` instead of Opik's `BasePrompt | None`.
+- `promote_prompt` and `ol-llm-prompts promote` register a label Opik does not have as an environment before moving it, instead of failing.
+- jinja2 is a direct dependency (it was already installed through opik).
+
+- Metrics passed to `evaluate` and in a gate `Suite` are `ol_llm.evaluation.Metric`s, not Opik `BaseMetric`s, and `evaluate` raises `TypeError` for anything else. `ValidatorMetric` is a `Metric` and its `score` returns a `Score`. A metric that reads Opik's `task_span` is no longer supported.
+- A metric input missing from the item and the output raises `ol_llm.evaluation.MissingMetricInputError` (a `ValueError`) from `evaluate` and aborts the run, on every backend and for `ValidatorMetric` as for the judge metrics; the judge metrics used to raise Opik's `ScoreMethodMissingArguments`, and a `ValidatorMetric` recorded a failed score on every item. A gate whose metric is missing an input cannot run (`ol-llm-eval gate` exits 2 with the metric and the missing field names).
+- `MAX_EXPERIMENT_ITEMS` moved from `ol_llm.evaluation` to `ol_llm.experiments`.
+- `evaluate` returns `ol_llm.evaluation.ExperimentResult` (the experiment's id, name, URL, and each item with its output and scores) instead of Opik's `EvaluationResult`, and `check_thresholds`, `score_report` and `judge_pairwise` take one.
+- `JudgeModel` is ol-llm's own class instead of an Opik `OpikBaseModel`; pass it to the judge metrics above. Its `generate_provider_response` is now `respond` (and `arespond`).
+- `evaluate`, `seed_dataset` and `judge_pairwise` take `app=` instead of `project_name=`, and `ol-llm-eval seed` takes `--app` instead of `--project`.
+- `seed_dataset` returns the dataset's latest version name instead of the Opik dataset.
+- `ol_llm.gate.find_baseline` no longer takes `dataset_id`.
+
+- In Opik, span attributes ol-llm records that Opik has no rule for now show under the span's metadata instead of its input: the memory spans' app, use case, environment, user, run and `memory.*` keys and counts, and the embedding spans' input count, input type, settings and vector dimensions (`opik.metadata.inputs_count`, `opik.metadata.input_type`, `opik.metadata.embedding_settings`, `opik.metadata.embedding_dimensions`). Note text, queries and results still show as input. The `ol_llm.opik_project` span attribute is gone; each span names its project with Opik's own `opik.project_name`, so a span of a caller's trace no longer needs its own export request.
+- The memory spans' attributes are renamed: `app`, `use_case`, `environment`, `user_id` and `run_id` are `ol.app` and so on, `thread_id` is `gen_ai.conversation.id`, and the `memory.*` keys and counts are `ol.memory.*`. Content attributes (`memory.text`, `memory.query`, `memory.metadata`, `memory.results`) keep their names. The embedding span's `inputs_count` is `ol.inputs_count`.
+- `OPIK_TRACK_DISABLE` turns tracing off only when `opik` is a destination.
+- Configuring Keycloak alongside `OPIK_API_KEY` is refused when the Opik destination is built or `ol_llm.tracing.opik_client` is first called, not by `TracingConfig.from_env`.
+- The Keycloak auth classes moved to `ol_llm.keycloak`; `ol_llm.tracing` still exports them.
+
 <a id='changelog-0.0.13'></a>
 ## [0.0.13] - 2026-11-12
 
