@@ -61,7 +61,9 @@ from ol_llm.models import shared_model
 from ol_llm.policy import resolve_policy
 from ol_llm.settings import GatewayRoute, Settings, configure
 from ol_llm.testing import override_models
-from ol_llm.tracing import OTLP_TRACES_PATH, KeycloakTokens
+from ol_llm.trace_destinations import opik_destination
+from ol_llm.trace_destinations.opik_destination import OTLP_TRACES_PATH
+from ol_llm.tracing import KeycloakTokens
 from opik.api_objects.opik_client import reset_global_client
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models import Model
@@ -69,7 +71,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 FORK_TIMEOUT_SECONDS = 30
 # The autouse ``exported`` fixture swaps this for an in-memory exporter.
-REAL_EXPORTER = tracing._exporter  # noqa: SLF001
+REAL_EXPORTER = opik_destination._exporter  # noqa: SLF001
 
 CHAT = UseCase(app="mit-learn", name="summary", profile="request", model=PRIMARY)
 SEARCH = UseCase(
@@ -611,7 +613,7 @@ def recording_opik(
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{server.server_address[1]}"
-    monkeypatch.setattr(tracing, "_exporter", REAL_EXPORTER)
+    monkeypatch.setattr(opik_destination, "_exporter", REAL_EXPORTER)
     # Set and restored here rather than by monkeypatch, which restores after the
     # autouse ``exported`` fixture's flush has built the SDK's next client.
     previous = os.environ["OPIK_URL_OVERRIDE"]

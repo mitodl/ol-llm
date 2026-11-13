@@ -449,7 +449,6 @@ async def embed(
     results: list[EmbedResult] = []
 
     async def traced(texts: list[str]) -> Mapping[str, object]:
-        call.mark_trace()
         try:
             result = await embedder.embed(
                 texts, input_type=input_type, settings=_user_settings(call)

@@ -32,7 +32,8 @@ from ol_llm import (
 )
 from ol_llm.models import agent_over, build_agent, build_model, override_models
 from ol_llm.testing import tracing_disabled
-from ol_llm.tracing import PROJECT_ATTRIBUTE, TracingConfig, configure_tracing
+from ol_llm.trace_destinations.opik_destination import PROJECT_NAME
+from ol_llm.tracing import TracingConfig, configure_tracing
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -447,7 +448,7 @@ def test_a_run_inside_a_tracked_function_is_a_span_of_its_trace(
     assert [span.name for span in root.spans] == ["summary"]
     spans = exported.get_finished_spans()
     assert {(s.attributes or {}).get("opik.trace_id") for s in spans} == {trace.id}
-    assert {(s.attributes or {}).get(PROJECT_ATTRIBUTE) for s in spans} == {
+    assert {(s.attributes or {}).get(PROJECT_NAME) for s in spans} == {
         "ol-data-platform"
     }
 

@@ -21,6 +21,7 @@ from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.experiments import configure_experiment_backend
 from ol_llm.prompt_registry import configure_prompt_registry
 from ol_llm.settings import Settings, configure
+from ol_llm.trace_destinations import opik_destination
 from ol_llm.tracing import KeycloakClient, TracingConfig, configure_tracing
 from opentelemetry.sdk.trace import ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter
@@ -429,17 +430,18 @@ def provider_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def exported(monkeypatch: pytest.MonkeyPatch) -> Generator[InMemorySpanExporter]:
-    """Keep model spans in memory in place of sending them to Opik.
+    """Keep the spans the Opik destination exports in memory, mapped as Opik gets
+    them, in place of sending them.
 
     Call ``tracing.flush`` before reading: the batch processor sends in the
     background.
     """
     exporter = InMemorySpanExporter()
 
-    def in_memory(_app: str, _state: object) -> SpanExporter:
+    def in_memory(_destination: object) -> SpanExporter:
         return exporter
 
-    monkeypatch.setattr(tracing, "_exporter", in_memory)
+    monkeypatch.setattr(opik_destination, "_exporter", in_memory)
     tracing.reset()
     configure_tracing(TRACING)
     yield exporter
