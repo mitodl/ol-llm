@@ -1,15 +1,12 @@
 import contextlib
-import gzip
 import json
 import os
-import threading
-from collections.abc import Generator, Iterator, Mapping
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 import opik
 import pytest
-from conftest import opik_context_is_empty
+from conftest import agent_for, failing, opik_context_is_empty, replying
 from ol_llm import (
     Attribution,
     LLMRateLimited,
@@ -20,7 +17,6 @@ from ol_llm import (
     traced_embedding,
     tracing,
 )
-from ol_llm.models import build_agent, override_models
 from ol_llm.trace_destinations import (
     DestinationSettings,
     MemoryDestination,
@@ -43,11 +39,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
 from opentelemetry.trace import StatusCode
-from opik.api_objects.opik_client import reset_global_client
-from pydantic_ai import Agent
-from pydantic_ai.exceptions import ModelHTTPError
-from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
-from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.function import FunctionModel
 
 SUMMARY = UseCase(
     app="mit-learn", name="summary", profile="request", model="openai:gpt-4o-mini"
@@ -59,26 +51,6 @@ EMBEDDING = UseCase(
     model="openai:text-embedding-3-small",
 )
 ATTRIBUTION = Attribution(user_id="user-1", thread_id="thread-1", run_id="run-1")
-REAL_EXPORTER = opik_destination._exporter  # noqa: SLF001
-
-
-def replying(text: str) -> FunctionModel:
-    def reply(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
-        return ModelResponse(parts=[TextPart(text)])
-
-    return FunctionModel(reply)
-
-
-def failing(status: int) -> FunctionModel:
-    def fail(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
-        raise ModelHTTPError(status, "gpt-4o-mini", body="provider said no")
-
-    return FunctionModel(fail)
-
-
-def agent_for(model: FunctionModel) -> Agent[None, str]:
-    with override_models(model):
-        return build_agent(SUMMARY)
 
 
 def configured(**config: Any) -> MemoryDestination:  # noqa: ANN401
@@ -101,7 +73,9 @@ def by_name(spans: Iterator[ReadableSpan] | tuple[ReadableSpan, ...]) -> dict:
 def test_another_destination_gets_the_call_span_with_the_attribution(
     memory: MemoryDestination,
 ) -> None:
-    run_sync(agent_for(replying("a summary")), "summarize", attribution=ATTRIBUTION)
+    run_sync(
+        agent_for(SUMMARY, replying("a summary")), "summarize", attribution=ATTRIBUTION
+    )
 
     spans = memory.spans()
     call = by_name(spans)["summary"]
@@ -136,7 +110,7 @@ def test_opik_gets_the_call_as_its_trace_and_the_model_spans_inside_it(
     exported: InMemorySpanExporter,
 ) -> None:
     with opik.record_traces_locally() as storage:
-        run_sync(agent_for(replying("ok")), "hi", attribution=ATTRIBUTION)
+        run_sync(agent_for(SUMMARY, replying("ok")), "hi", attribution=ATTRIBUTION)
         [trace] = storage.trace_trees
         [root] = storage.span_trees
     tracing.flush()
@@ -168,7 +142,7 @@ def test_a_run_under_a_span_from_distributed_headers_attaches_to_it(
     def downstream() -> str:
         # The SDK opens a span under the headers' span, and no trace.
         assert opik.opik_context.get_current_trace_data() is None
-        return run_sync(agent_for(replying("ok")), "hi").output
+        return run_sync(agent_for(SUMMARY, replying("ok")), "hi").output
 
     with opik.record_traces_locally() as storage:
         headers = upstream()
@@ -203,7 +177,7 @@ def test_a_degraded_result_is_marked_on_the_call_span(
         return PostProcessed(output=output, degraded_reasons=("partial_output",))
 
     with opik.record_traces_locally() as storage:
-        run_sync(agent_for(replying("ok")), "hi", postprocess=partial)
+        run_sync(agent_for(SUMMARY, replying("ok")), "hi", postprocess=partial)
         [trace] = storage.trace_trees
 
     attributes = by_name(memory.spans())["summary"].attributes or {}
@@ -215,7 +189,7 @@ def test_a_degraded_result_is_marked_on_the_call_span(
 def test_without_content_the_call_span_has_no_input_or_output() -> None:
     memory = configured(include_content=False)
 
-    run_sync(agent_for(replying("secret answer")), "secret question")
+    run_sync(agent_for(SUMMARY, replying("secret answer")), "secret question")
 
     call = by_name(memory.spans())["summary"]
     assert not {"ol.input", "ol.output"} & (call.attributes or {}).keys()
@@ -226,7 +200,7 @@ def test_a_failed_call_records_its_error_on_the_call_span(
     memory: MemoryDestination,
 ) -> None:
     with pytest.raises(LLMRateLimited):
-        run_sync(agent_for(failing(429)), "hi")
+        run_sync(agent_for(SUMMARY, failing(429)), "hi")
 
     call = by_name(memory.spans())["summary"]
     assert call.status.status_code == StatusCode.ERROR
@@ -244,7 +218,7 @@ def test_tracing_only_to_memory_sends_nothing_to_opik(
     assert isinstance(memory, MemoryDestination)
 
     with opik.record_traces_locally() as storage:
-        run_sync(agent_for(replying("ok")), "hi")
+        run_sync(agent_for(SUMMARY, replying("ok")), "hi")
         traces = storage.trace_trees
     tracing.flush()
 
@@ -342,55 +316,11 @@ def test_a_registered_destination_is_built_with_the_keycloak_tokens() -> None:
             ),
         )
     )
-    run_sync(agent_for(replying("ok")), "hi")
+    run_sync(agent_for(SUMMARY, replying("ok")), "hi")
 
     [settings] = built
     assert settings.tokens is tracing._state().tokens  # noqa: SLF001
     assert "summary" in by_name(destination.spans())
-
-
-class RecordingOpik(BaseHTTPRequestHandler):
-    """Records every request body by path, as Opik would receive it."""
-
-    protocol_version = "HTTP/1.1"
-    received: list[tuple[str, bytes]]
-
-    def _answer(self) -> None:
-        body = self.rfile.read(int(self.headers.get("content-length", 0)))
-        if self.headers.get("content-encoding") == "gzip":
-            body = gzip.decompress(body)
-        self.received.append((self.path, body))
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", "2")
-        self.end_headers()
-        self.wfile.write(b"{}")
-
-    do_GET = do_POST = do_PATCH = do_PUT = _answer  # noqa: N815
-
-    def log_message(self, *_args: object) -> None:
-        pass
-
-
-@pytest.fixture
-def recording_opik(
-    monkeypatch: pytest.MonkeyPatch,
-) -> Generator[list[tuple[str, bytes]]]:
-    received: list[tuple[str, bytes]] = []
-    handler = type("Handler", (RecordingOpik,), {"received": received})
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    monkeypatch.setattr(opik_destination, "_exporter", REAL_EXPORTER)
-    previous = os.environ["OPIK_URL_OVERRIDE"]
-    os.environ["OPIK_URL_OVERRIDE"] = f"http://127.0.0.1:{server.server_address[1]}/api"
-    reset_global_client()
-    yield received
-    os.environ["OPIK_URL_OVERRIDE"] = previous
-    tracing.reset()
-    reset_global_client()
-    server.shutdown()
-    server.server_close()
 
 
 def objects_with(value: object, key: str) -> Iterator[dict[str, Any]]:
@@ -410,7 +340,7 @@ def test_opik_receives_the_trace_by_rest_and_the_spans_by_otlp(
 ) -> None:
     tracing.reset()
     configure_tracing(TracingConfig())
-    run_sync(agent_for(replying("ok")), "hi", attribution=ATTRIBUTION)
+    run_sync(agent_for(SUMMARY, replying("ok")), "hi", attribution=ATTRIBUTION)
     assert tracing.flush(10_000)
 
     traces = [
@@ -480,7 +410,9 @@ def traced_to_otlp(
     tracing.reset()
     configure_tracing(TracingConfig(destinations=("otlp",)))
     with contextlib.suppress(LLMRateLimited):
-        run_sync(agent_for(model), "the learner's question", attribution=ATTRIBUTION)
+        run_sync(
+            agent_for(SUMMARY, model), "the learner's question", attribution=ATTRIBUTION
+        )
     assert tracing.flush(10_000)
 
 
@@ -559,7 +491,7 @@ def test_without_opik_flush_leaves_the_sdk_alone_until_a_seam_uses_it(
     monkeypatch.setattr(opik_destination, "flush_sdk", lambda: flushed.append(None))
     tracing.reset()
     configure_tracing(TracingConfig(destinations=("memory",)))
-    run_sync(agent_for(replying("ok")), "hi")
+    run_sync(agent_for(SUMMARY, replying("ok")), "hi")
 
     assert tracing.flush()
     assert flushed == []

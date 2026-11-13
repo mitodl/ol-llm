@@ -11,8 +11,11 @@ import pytest
 from conftest import (
     GEMINI,
     PromptLibrary,
+    agent_for,
     assert_error_kept_without_content,
+    failing,
     opik_context_is_empty,
+    replying,
     runner_loop,
 )
 from ol_llm import (
@@ -30,7 +33,7 @@ from ol_llm import (
     run_sync,
     tracing,
 )
-from ol_llm.models import agent_over, build_agent, build_model, override_models
+from ol_llm.models import agent_over, build_agent, build_model
 from ol_llm.testing import tracing_disabled
 from ol_llm.trace_destinations.opik_destination import PROJECT_NAME
 from ol_llm.tracing import TracingConfig, configure_tracing
@@ -73,20 +76,6 @@ class Summary(BaseModel):
     text: str
 
 
-def replying(text: str) -> FunctionModel:
-    def reply(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
-        return ModelResponse(parts=[TextPart(text)])
-
-    return FunctionModel(reply)
-
-
-def failing(status: int, body: str = "provider said no") -> FunctionModel:
-    def fail(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
-        raise ModelHTTPError(status, "gpt-4o-mini", body=body)
-
-    return FunctionModel(fail)
-
-
 def stalling(entered: asyncio.Event) -> FunctionModel:
     async def stall(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
         entered.set()
@@ -102,11 +91,6 @@ def recording(seen: list[AgentInfo]) -> FunctionModel:
         return ModelResponse(parts=[TextPart("ok")])
 
     return FunctionModel(reply)
-
-
-def agent_for(use_case: UseCase, model: object, **kwargs: object) -> Agent[None, str]:
-    with override_models(model):  # type: ignore[arg-type]
-        return build_agent(use_case, **kwargs)  # type: ignore[call-overload,no-any-return]
 
 
 def test_run_returns_the_output_and_the_answering_model() -> None:

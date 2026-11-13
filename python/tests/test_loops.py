@@ -10,7 +10,6 @@ used it. A new loop-local client (a memory backend's, say) adds itself to
 import asyncio
 import base64
 import gc
-import gzip
 import inspect
 import json
 import os
@@ -21,17 +20,16 @@ import threading
 import time
 import traceback
 import warnings
-from collections.abc import Callable, Coroutine, Generator
+from collections.abc import Callable, Coroutine
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import ModuleType
 from typing import Any
 
 import pytest
 from asgiref.sync import async_to_sync
-from conftest import PRIMARY, runner_loop
+from conftest import PRIMARY, replying, runner_loop
 from ol_llm import (
     KeycloakClient,
     TracingConfig,
@@ -61,17 +59,12 @@ from ol_llm.models import shared_model
 from ol_llm.policy import resolve_policy
 from ol_llm.settings import GatewayRoute, Settings, configure
 from ol_llm.testing import override_models
-from ol_llm.trace_destinations import opik_destination
 from ol_llm.trace_destinations.opik_destination import OTLP_TRACES_PATH
 from ol_llm.tracing import KeycloakTokens
-from opik.api_objects.opik_client import reset_global_client
-from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models import Model
-from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 FORK_TIMEOUT_SECONDS = 30
 # The autouse ``exported`` fixture swaps this for an in-memory exporter.
-REAL_EXPORTER = opik_destination._exporter  # noqa: SLF001
 
 CHAT = UseCase(app="mit-learn", name="summary", profile="request", model=PRIMARY)
 SEARCH = UseCase(
@@ -575,70 +568,11 @@ def test_a_forked_child_builds_its_own_bedrock_client() -> None:
 # Tracing in a forked child.
 
 
-class RecordingOpik(BaseHTTPRequestHandler):
-    """Records every request body by path, and answers Keycloak token requests."""
-
-    protocol_version = "HTTP/1.1"
-    received: list[tuple[str, bytes]]
-
-    def _answer(self) -> None:
-        body = self.rfile.read(int(self.headers.get("content-length", 0)))
-        if self.headers.get("content-encoding") == "gzip":
-            body = gzip.decompress(body)
-        self.received.append((self.path, body))
-        reply = (
-            json.dumps({"access_token": "token", "expires_in": 300}).encode()
-            if self.path.endswith("/token")
-            else b"{}"
-        )
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(reply)))
-        self.end_headers()
-        self.wfile.write(reply)
-
-    do_GET = do_POST = do_PATCH = do_PUT = _answer  # noqa: N815
-
-    def log_message(self, *_args: object) -> None:
-        pass
-
-
-@pytest.fixture
-def recording_opik(
-    monkeypatch: pytest.MonkeyPatch,
-) -> Generator[tuple[str, list[tuple[str, bytes]]]]:
-    received: list[tuple[str, bytes]] = []
-    handler = type("Handler", (RecordingOpik,), {"received": received})
-    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    server.daemon_threads = True
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    url = f"http://127.0.0.1:{server.server_address[1]}"
-    monkeypatch.setattr(opik_destination, "_exporter", REAL_EXPORTER)
-    # Set and restored here rather than by monkeypatch, which restores after the
-    # autouse ``exported`` fixture's flush has built the SDK's next client.
-    previous = os.environ["OPIK_URL_OVERRIDE"]
-    os.environ["OPIK_URL_OVERRIDE"] = f"{url}/api"
-    # The SDK's client reads its URL when it is built.
-    reset_global_client()
-    yield url, received
-    os.environ["OPIK_URL_OVERRIDE"] = previous
-    tracing.reset()
-    reset_global_client()
-    server.shutdown()
-    server.server_close()
-
-
-def replying(text: str) -> FunctionModel:
-    def reply(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
-        return ModelResponse(parts=[TextPart(text)])
-
-    return FunctionModel(reply)
-
-
 def test_a_forked_child_sends_its_traces_and_spans(
-    recording_opik: tuple[str, list[tuple[str, bytes]]],
+    recording_opik: list[tuple[str, bytes]],
 ) -> None:
-    url, received = recording_opik
+    received = recording_opik
+    url = os.environ["OPIK_URL_OVERRIDE"].removesuffix("/api")
     tracing.reset()
     configure_tracing(
         TracingConfig(
