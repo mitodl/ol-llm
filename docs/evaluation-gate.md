@@ -24,7 +24,7 @@ The gate is a TOML file next to the prompt, owned by the app team. It names the 
 (relative to itself) and the prompts it tests, and its `app` must be the pointer file's `app`:
 
 ```toml
-app = "dagster-ml"                       # the app's Opik project
+app = "dagster-ml"                       # the app, which owns the prompts and dataset
 use_case = "feedback-summary"
 mode = "advisory"                        # every gate starts advisory
 suite = "feedback_summary_eval:suite"    # module:attribute
@@ -73,9 +73,8 @@ imported with the declaration's directory first on `sys.path`, so it can sit bes
 
 ```python
 from ol_llm import UseCase, complete_sync
-from ol_llm.evaluation import ValidatorMetric
+from ol_llm.evaluation import ValidatorMetric, answer_relevance
 from ol_llm.gate import GateContext, Suite
-from opik.evaluation.metrics import AnswerRelevance
 
 SUMMARY = UseCase(
     app="dagster-ml",
@@ -99,7 +98,7 @@ def suite(context: GateContext) -> Suite:
         task=task,
         metrics=[
             ValidatorMetric("placeholders", placeholders_kept),
-            AnswerRelevance(model=context.require_judge()),
+            answer_relevance(context.require_judge()),
         ],
         experiment_config={"model": SUMMARY.model},
     )
@@ -107,7 +106,12 @@ def suite(context: GateContext) -> Suite:
 
 `context.require_judge()` returns the declared judge, built with `judge_model`, so its calls
 are routed, traced, and costed under `eval-judge` like any other call. It should not be the
-model under test.
+model under test. The metrics are ol-llm's (`ol_llm.evaluation.Metric`): `ValidatorMetric`,
+the judge metrics `hallucination`, `answer_relevance`, `context_precision` and
+`context_recall`, or a `Metric` subclass of the app's own. A suite imports no Opik.
+
+The gate runs on the experiment backend `OL_LLM_EXPERIMENT_BACKEND` names, Opik by default
+(see `ol_llm.experiments`); the declaration and the suite do not change with it.
 
 ## Running it
 
@@ -234,7 +238,7 @@ jobs:
 The `paths` filter is what decides which changes require an evaluation (spec §5.1 item 1).
 The job installs the calling project with `uv sync --frozen`, so ol-llm, its provider extras,
 and the suite's code come from the caller's lockfile; opik must be installed whole there, not
-with the slimming overrides (see `ol_llm.evaluation`). Experiments are recorded with
+with the slimming overrides (see `ol_llm.experiments.opik_backend`). Experiments are recorded with
 `environment=ci`. Pull requests from forks get no secrets, so the job fails for them rather
 than passing unevaluated. A job that fails before the gate reports (a failed install, missing
 credentials) replaces the pull request comment with a link to its log, so an earlier run's
