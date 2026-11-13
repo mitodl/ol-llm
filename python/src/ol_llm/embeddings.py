@@ -16,12 +16,12 @@ another size, are not comparable, so changing either means re-embedding.
 
 import json
 import threading
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial
-from typing import cast
+from typing import TypeVar, cast
 
 from pydantic_ai.embeddings import (
     Embedder,
@@ -95,6 +95,8 @@ _MALFORMED: tuple[type[Exception], ...] = (
     json.JSONDecodeError,
 )
 
+_T = TypeVar("_T")
+
 # Providers whose embeddings API takes the end user's id, as its ``user`` field.
 _USER_FIELD_PROVIDERS = frozenset({"openai", "azure"})
 
@@ -166,8 +168,13 @@ class PolicyEmbeddingModel(WrapperEmbeddingModel):
         return await self._loop_model().max_input_tokens()
 
     async def count_tokens(self, text: str) -> int:
-        """Count tokens with the running loop's provider model."""
-        return await self._loop_model().count_tokens(text)
+        """Count tokens under the policy, as an embedding call is made.
+
+        Google counts with a provider request, which gets the client's policy
+        timeout, so it is retried and classified like one.
+        """
+        provider = self._loop_model()
+        return await self._retrying(lambda: provider.count_tokens(text))
 
     async def embed(
         self,
@@ -209,6 +216,9 @@ class PolicyEmbeddingModel(WrapperEmbeddingModel):
                 raise UnexpectedModelBehavior(msg)
             return result
 
+        return await self._retrying(attempt)
+
+    async def _retrying(self, attempt: Callable[[], Awaitable[_T]]) -> _T:
         return await retrying(
             attempt,
             policy=self.policy,

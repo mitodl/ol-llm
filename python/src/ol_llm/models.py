@@ -67,6 +67,7 @@ from pydantic_ai.models import (
     ModelRequestContext,
     ModelRequestParameters,
     StreamedResponse,
+    _continuation,
     infer_model,
 )
 from pydantic_ai.models.fallback import FallbackModel
@@ -783,6 +784,43 @@ class PolicyFallbackModel(FallbackModel):
             return self
         return _ChainTail(self, ids.index(answered_by))
 
+    async def count_tokens(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> RequestUsage:
+        """Count with each model in turn, starting where the request will.
+
+        ``FallbackModel`` has no ``count_tokens``, so without this a chain fails
+        every run whose usage limits set ``count_tokens_before_request``. The count
+        falls back on the same errors as a request, so a primary that is down does
+        not fail a run its fallback would answer, and when every model fails the
+        caller gets the first one's error, as for a request.
+
+        A fallback model that cannot count (Mistral, and OpenAI chat completions)
+        ends the chain there, so the caller still gets the first model's error
+        rather than ``NotImplementedError``. A first model that cannot count raises
+        ``NotImplementedError``: the use case cannot count at all.
+        """
+        chain = self._starting_at(messages)
+        errors: list[LLMError] = []
+        for model in chain.models:
+            try:
+                return await model.count_tokens(
+                    model.prepare_messages(messages, model_request_parameters),
+                    model_settings,
+                    model_request_parameters,
+                )
+            except FALLBACK_ON as exc:
+                errors.append(exc)
+            except NotImplementedError:
+                if not errors:
+                    raise
+                break
+        group = FallbackExceptionGroup("All models from FallbackModel failed", errors)
+        raise errors[0].copy() from group
+
     async def request(
         self,
         messages: list[ModelMessage],
@@ -876,6 +914,11 @@ def _primary_error(
     being retried. A request continuing a suspended response (OpenAI background
     mode) first tries the member that holds it, then the whole chain, so the group
     can open with that member's error; the first member's own comes later.
+
+    Such a request cancels the suspended job before it moves on, and marks the group
+    so the agent does not cancel it again. The copy carries that mark, since it is
+    what the agent sees in place of the group. PydanticAI has no public way to read
+    the mark, so this reads its attribute name from ``_continuation``.
     """
     first = cast("PolicyModel", chain.models[0]).catalog_id
     errors = [
@@ -883,7 +926,12 @@ def _primary_error(
         for exc in group.exceptions
         if isinstance(exc, LLMError) and exc.model == first
     ]
-    return errors[-1].copy() if errors else None
+    if not errors:
+        return None
+    primary = errors[-1].copy()
+    if getattr(group, _continuation._SUSPENDED_JOB_CANCELLED, False):  # noqa: SLF001
+        _continuation.mark_suspended_job_cancelled(primary)
+    return primary
 
 
 def _gateway_headers(route: GatewayRoute | None, use_case: UseCase) -> dict[str, str]:
