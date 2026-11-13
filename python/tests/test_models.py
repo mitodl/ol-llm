@@ -749,15 +749,35 @@ def test_a_rejected_count_does_not_fall_back() -> None:
     assert fallback.counted == []
 
 
-def test_a_fallback_that_cannot_count_raises_the_primary_error() -> None:
+def test_a_fallback_that_cannot_count_answers_uncounted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     primary = Counting(*always(lambda: http_error(503)))
-    with (
-        override_models({PRIMARY: primary, FALLBACK: TestModel()}),
-        pytest.raises(LLMUnavailable) as caught,
-    ):
-        build_agent(SUMMARY_WITH_FALLBACK).run_sync("hi", usage_limits=COUNT_FIRST)
+    with override_models({PRIMARY: primary, FALLBACK: TestModel()}):
+        result = build_agent(SUMMARY_WITH_FALLBACK).run_sync(
+            "hi", usage_limits=COUNT_FIRST
+        )
 
-    assert caught.value.model == PRIMARY
+    assert result.output
+    assert len(primary.counted) == 3
+    assert any("uncounted" in record.getMessage() for record in caplog.records)
+
+
+def test_a_count_skips_a_fallback_that_cannot_count() -> None:
+    primary = Counting(*always(lambda: http_error(503)))
+    second = Counting()
+    use_case = UseCase(
+        app="mit-learn",
+        name="summary",
+        profile="request",
+        model=PRIMARY,
+        fallback_models=(FALLBACK, SECOND_FALLBACK),
+    )
+    models = {PRIMARY: primary, FALLBACK: TestModel(), SECOND_FALLBACK: second}
+    with override_models(models):
+        build_agent(use_case).run_sync("hi", usage_limits=COUNT_FIRST)
+
+    assert len(second.counted) == 1
 
 
 class CountingFunction(FunctionModel):
