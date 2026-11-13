@@ -82,13 +82,14 @@ def test_from_env_rejects_a_partial_keycloak_client() -> None:
         TracingConfig.from_env(env)
 
 
-def test_from_env_rejects_keycloak_with_an_api_key(
+def test_keycloak_with_an_api_key_is_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPIK_API_KEY", "static")
+    tracing.reset()
 
     with pytest.raises(ValueError, match="OPIK_API_KEY"):
-        TracingConfig.from_env(KEYCLOAK_ENV)
+        configure_tracing(TracingConfig.from_env(KEYCLOAK_ENV))
 
 
 @pytest.mark.parametrize(("value", "expected"), [("false", False), ("1", True)])

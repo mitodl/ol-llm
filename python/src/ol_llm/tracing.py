@@ -53,6 +53,7 @@ from ol_llm.trace_destinations import (
     DestinationSettings,
     TraceDestination,
     build_destinations,
+    tracing_disabled,
 )
 from ol_llm.trace_destinations.interface import parse_bool
 
@@ -108,29 +109,27 @@ class TracingConfig:
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> "TracingConfig":
-        """Read the configuration from the environment and the Opik SDK's settings.
+        """Read the configuration from the environment.
+
+        Tracing is off when a named destination's backend turns it off, e.g.
+        ``OPIK_TRACK_DISABLE`` for ``opik``.
 
         :param environ: the environment to read; ``os.environ`` when omitted. The
             SDK's own settings always come from the process environment and the
             SDK's config file, since that is where the SDK reads them.
         :returns: the configuration.
         :rtype: TracingConfig
-        :raises ValueError: if the Keycloak variables are partly set, if they are
-            set alongside ``OPIK_API_KEY``, if ``OL_LLM_TRACE_CONTENT`` is not a
-            boolean, or if ``OL_LLM_TRACE_DESTINATIONS`` names none.
+        :raises ValueError: if the Keycloak variables are partly set, if
+            ``OL_LLM_TRACE_CONTENT`` is not a boolean, or if
+            ``OL_LLM_TRACE_DESTINATIONS`` names none or one not registered.
         """
         env = os.environ if environ is None else environ
-        keycloak = _keycloak_from_env(env)
-        if keycloak is not None and _opik.api_key_set():
-            # The SDK would send the key as a static Authorization header in place
-            # of the refreshed token.
-            msg = f"Set either OPIK_API_KEY or the {_ENV_PREFIX}_* variables, not both"
-            raise ValueError(msg)
+        destinations = _parse_names(env.get(_DESTINATIONS_ENV))
         return cls(
-            enabled=not _opik.track_disabled(),
-            keycloak=keycloak,
+            enabled=not tracing_disabled(destinations, env),
+            keycloak=_keycloak_from_env(env),
             include_content=parse_bool(env.get(_CONTENT_ENV, "true"), _CONTENT_ENV),
-            destinations=_parse_names(env.get(_DESTINATIONS_ENV)),
+            destinations=destinations,
         )
 
 
@@ -195,12 +194,15 @@ class _Tracing:
     destinations: tuple[TraceDestination, ...]
     providers: dict[str, TracerProvider] = field(default_factory=dict)
     used: bool = False
+    sdk_client_used: bool = False
 
     def close(self) -> None:
         for provider in self.providers.values():
             provider.shutdown()
         for destination in self.destinations:
             destination.shutdown()
+        if self.sdk_client_used:
+            _opik.release_sdk_auth(self.tokens)
         if self.tokens is not None:
             self.tokens.close()
 
@@ -246,7 +248,6 @@ def _start(config: TracingConfig) -> _Tracing:
     destinations = build_destinations(
         config.destinations, DestinationSettings(environ=os.environ, tokens=tokens)
     )
-    _opik.install_sdk_auth(tokens)
     return _Tracing(config=config, tokens=tokens, destinations=destinations)
 
 
@@ -281,8 +282,13 @@ def opik_client() -> _opik.OpikClient:
 
     :returns: the client.
     :rtype: opik.Opik
+    :raises ValueError: if Keycloak is configured alongside ``OPIK_API_KEY``.
     """
-    get_tracing_config()
+    with _lock:
+        state = _state()
+        if not state.sdk_client_used:
+            _opik.install_sdk_auth(state.tokens)
+            state.sdk_client_used = True
     return _opik.global_client()
 
 
@@ -356,16 +362,24 @@ def flush(timeout_millis: int = 30_000) -> bool:
 
     For short-lived processes (a Celery task, a CLI) that may exit before the
     background senders run. Long-running processes need not call it. Also sends
-    what the Opik SDK buffered for the other seams (scores, experiments).
+    what each destination buffers itself, and what the Opik SDK buffered for the
+    other seams (scores, experiments) once they used it through ``opik_client``.
 
     :param timeout_millis: how long to wait for the span exporters.
     :returns: whether every exporter finished within the timeout.
     :rtype: bool
     """
-    _opik.flush_sdk()
     with _lock:
-        providers = list(_tracing.providers.values()) if _tracing else []
-    return all(provider.force_flush(timeout_millis) for provider in providers)
+        state = _tracing
+    if state is None:
+        return True
+    flushed = [d.flush(timeout_millis) for d in state.destinations]
+    if state.sdk_client_used:
+        _opik.flush_sdk()
+    with _lock:
+        providers = list(state.providers.values())
+    flushed.extend(provider.force_flush(timeout_millis) for provider in providers)
+    return all(flushed)
 
 
 def reset() -> None:
@@ -374,7 +388,6 @@ def reset() -> None:
     with _lock:
         if _tracing is not None:
             _tracing.close()
-        _opik.clear_sdk_auth()
         _tracing = None
 
 

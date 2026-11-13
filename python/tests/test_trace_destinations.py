@@ -542,3 +542,55 @@ def test_the_otlp_content_setting_must_be_a_boolean(
 
     with pytest.raises(ValueError, match="OL_LLM_TRACE_OTLP_CONTENT"):
         configure_tracing(TracingConfig(destinations=("otlp",)))
+
+
+def test_without_opik_flush_leaves_the_sdk_alone_until_a_seam_uses_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flushed: list[None] = []
+    monkeypatch.setattr(opik_destination, "flush_sdk", lambda: flushed.append(None))
+    tracing.reset()
+    configure_tracing(TracingConfig(destinations=("memory",)))
+    run_sync(agent_for(replying("ok")), "hi")
+
+    assert tracing.flush()
+    assert flushed == []
+
+    tracing.opik_client()
+    assert tracing.flush()
+    assert flushed == [None]
+
+
+def test_without_opik_the_sdk_is_authenticated_when_a_seam_uses_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registered: list[object] = []
+    monkeypatch.setattr(opik_destination, "add_httpx_client_hook", registered.append)
+    monkeypatch.setattr(opik_destination, "_sdk_auth", None)
+    tracing.reset()
+    configure_tracing(
+        TracingConfig(
+            destinations=("memory",),
+            keycloak=KeycloakClient(
+                token_url="https://sso.example/token", client_id="c", client_secret="s"
+            ),
+        )
+    )
+    assert registered == []
+
+    tracing.opik_client()
+
+    assert len(registered) == 1
+    assert opik_destination._sdk_auth is not None  # noqa: SLF001
+    assert opik_destination._sdk_auth.tokens is tracing._state().tokens  # noqa: SLF001
+    tracing.reset()
+    assert opik_destination._sdk_auth.tokens is None  # noqa: SLF001
+
+
+def test_opik_track_disable_turns_tracing_off_only_with_opik_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPIK_TRACK_DISABLE", "true")
+
+    assert not TracingConfig.from_env({}).enabled
+    assert TracingConfig.from_env({"OL_LLM_TRACE_DESTINATIONS": "memory"}).enabled

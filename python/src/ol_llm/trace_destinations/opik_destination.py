@@ -104,24 +104,6 @@ OpikClient = opik.Opik
 _TRACKER = OpikTrackDecorator()
 
 
-def track_disabled() -> bool:
-    """Return whether ``OPIK_TRACK_DISABLE`` (or the SDK's config file) turns it off.
-
-    :returns: the SDK's setting.
-    :rtype: bool
-    """
-    return OpikConfig().track_disable
-
-
-def api_key_set() -> bool:
-    """Return whether the SDK has a static ``OPIK_API_KEY``.
-
-    :returns: whether one is set.
-    :rtype: bool
-    """
-    return bool(OpikConfig().api_key)
-
-
 def global_client() -> opik.Opik:
     """Return the SDK's global client.
 
@@ -145,9 +127,16 @@ def install_sdk_auth(tokens: KeycloakTokens | None) -> None:
     """Send the SDK's requests to Opik with ``tokens``, or with no credentials.
 
     :param tokens: the token cache; ``None`` sends none.
+    :raises ValueError: if ``tokens`` is given and ``OPIK_API_KEY`` is set: the
+        SDK would send the key as a static Authorization header in place of the
+        refreshed token.
     """
     global _sdk_auth  # noqa: PLW0603
-    host = httpx.URL(OpikConfig().url_override).host
+    config = OpikConfig()
+    if tokens is not None and config.api_key:
+        msg = "Set either OPIK_API_KEY or the OPIK_KEYCLOAK_* variables, not both"
+        raise ValueError(msg)
+    host = httpx.URL(config.url_override).host
     if _sdk_auth is not None:
         _sdk_auth.tokens = tokens
         _sdk_auth.host = host
@@ -160,9 +149,12 @@ def install_sdk_auth(tokens: KeycloakTokens | None) -> None:
         )
 
 
-def clear_sdk_auth() -> None:
-    """Stop sending credentials with the SDK's requests. For tests."""
-    if _sdk_auth is not None:
+def release_sdk_auth(tokens: KeycloakTokens | None) -> None:
+    """Stop sending ``tokens`` with the SDK's requests, if they are what it sends.
+
+    :param tokens: the token cache being closed.
+    """
+    if _sdk_auth is not None and _sdk_auth.tokens is tokens:
         _sdk_auth.tokens = None
 
 
@@ -312,13 +304,34 @@ class OpikDestination(TraceDestination):
     :param settings: the Keycloak token cache for the exporter.
     """
 
+    @classmethod
+    def disabled(cls, environ: Mapping[str, str]) -> bool:  # noqa: ARG003
+        """Return whether ``OPIK_TRACK_DISABLE`` (or the SDK's config file) is set.
+
+        Read as the SDK reads it, from the process environment and config file.
+        """
+        return OpikConfig().track_disable
+
     def __init__(self, settings: DestinationSettings) -> None:
-        """Read the instance from the SDK's configuration."""
+        """Read the instance from the SDK's configuration, and authenticate the SDK.
+
+        :raises ValueError: if Keycloak is configured alongside ``OPIK_API_KEY``.
+        """
         config = OpikConfig()
         self.url = config.url_override
         self.workspace = config.workspace
         self.default_project = config.project_name
         self.tokens = settings.tokens
+        install_sdk_auth(self.tokens)
+
+    def flush(self, timeout_millis: int) -> bool:  # noqa: ARG002
+        """Send the call traces the SDK buffers."""
+        flush_sdk()
+        return True
+
+    def shutdown(self) -> None:
+        """Stop the SDK sending this configuration's tokens."""
+        release_sdk_auth(self.tokens)
 
     def span_processor(self, app: str) -> SpanProcessor:
         """Batch the app's spans, mapped, to Opik's OTLP endpoint."""

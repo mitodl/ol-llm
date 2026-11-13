@@ -9,7 +9,7 @@ named. Another package adds a destination with an entry point in the
 ``register_trace_destination``.
 """
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from ol_llm.plugins import NamedFactories
 from ol_llm.trace_destinations.interface import (
@@ -35,6 +35,7 @@ __all__ = [
     "build_destinations",
     "error_frames",
     "register_trace_destination",
+    "tracing_disabled",
 ]
 
 ENTRY_POINT_GROUP = "ol_llm.trace_destinations"
@@ -61,6 +62,28 @@ def register_trace_destination(name: str, factory: DestinationFactory) -> None:
     :param factory: builds the destination.
     """
     _destinations.register(name, factory)
+
+
+def tracing_disabled(names: Sequence[str], environ: Mapping[str, str]) -> bool:
+    """Return whether a named destination's backend has tracing turned off.
+
+    E.g. ``OPIK_TRACK_DISABLE=true`` with ``opik`` named.
+
+    :param names: the destinations' names.
+    :param environ: the process environment.
+    :returns: whether any of them says tracing is off.
+    :rtype: bool
+    :raises ValueError: if a name names no destination.
+    """
+    for name in names:
+        factory = _destinations.get(name)
+        if (
+            isinstance(factory, type)
+            and issubclass(factory, TraceDestination)
+            and factory.disabled(environ)
+        ):
+            return True
+    return False
 
 
 def build_destinations(

@@ -878,7 +878,7 @@ always send to the same instance:
 | `OPIK_URL_OVERRIDE` | the Opik API, e.g. `https://opik-qa.ol.mit.edu/api` |
 | `OPIK_WORKSPACE` | `default` on our instances |
 | `OPIK_KEYCLOAK_TOKEN_URL`, `OPIK_KEYCLOAK_CLIENT_ID`, `OPIK_KEYCLOAK_CLIENT_SECRET` | the Keycloak client the app authenticates to Opik with; `OPIK_KEYCLOAK_SCOPE` if it needs one. Leave `OPIK_API_KEY` unset |
-| `OPIK_TRACK_DISABLE` | `true` turns tracing off, for local development without an Opik. Runs open no call span and export no spans; SDK calls the app makes itself (prompt sync, datasets, experiments) still send the Keycloak token |
+| `OPIK_TRACK_DISABLE` | `true` turns tracing off when `opik` is a destination, for local development without an Opik. Runs open no call span and export no spans; SDK calls the app makes itself (prompt sync, datasets, experiments) still send the Keycloak token |
 | `OL_LLM_TRACE_CONTENT` | `false` keeps prompts, completions, tool arguments, and error messages out of traces. On by default until the data-handling policy decides |
 
 Without a call, tracing reads these the first time an agent or embedder is built or a run

@@ -141,6 +141,19 @@ class DestinationSettings:
 class TraceDestination(ABC):
     """Where ol-llm's spans go, and how they map to that backend."""
 
+    @classmethod
+    def disabled(cls, environ: Mapping[str, str]) -> bool:  # noqa: ARG003
+        """Return whether the environment turns tracing off for this backend.
+
+        Checked before the destination is built, as the backend's SDK reads its
+        setting; any destination named that says so turns tracing off.
+
+        :param environ: the process environment.
+        :returns: whether tracing is off.
+        :rtype: bool
+        """
+        return False
+
     @abstractmethod
     def span_processor(self, app: str) -> SpanProcessor:
         """Return the processor that sends one app's spans to this destination.
@@ -191,6 +204,15 @@ class TraceDestination(ABC):
         :param graph: the LangGraph graph, for a backend that shows it.
         """
         yield ()
+
+    def flush(self, timeout_millis: int) -> bool:  # noqa: ARG002
+        """Send what the destination buffers outside its span processors.
+
+        :param timeout_millis: how long to wait.
+        :returns: whether it finished in time.
+        :rtype: bool
+        """
+        return True
 
     def shutdown(self) -> None:  # noqa: B027 - optional, a no-op by default
         """Release what the destination holds outside its span processors."""
