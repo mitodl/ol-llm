@@ -2,11 +2,11 @@
 
 ``otlp`` sends ol-llm's spans, unmapped, to the endpoint the standard
 ``OTEL_EXPORTER_OTLP_*`` variables name, e.g. a Tempo or an OpenTelemetry
-collector. It keeps only the ``ol.*`` and ``gen_ai.*`` attributes, and without
-``OL_LLM_TRACE_OTLP_CONTENT=true`` it also drops what carries learner content or
-identifies a user: inputs, outputs, messages, note text and queries, user ids, and
-error messages (``trace_attributes.CONTENT``). The data-handling policy for learner
-content is not decided, so a second destination gets none by default.
+collector. It keeps the ``ol.*`` and ``gen_ai.*`` attributes and
+``trace_attributes.CONTENT``, and without ``OL_LLM_TRACE_OTLP_CONTENT=true`` it
+drops what carries learner content or identifies a user: inputs, outputs, messages,
+note text and queries, user ids, and error messages. The data-handling policy for
+learner content is not decided, so a second destination gets none by default.
 """
 
 import threading
@@ -80,14 +80,12 @@ class ForkSafeExporter(SpanExporter):
 
 
 def _kept(name: str, *, content: bool) -> bool:
+    if name in attrs.CONTENT:
+        return content
     if not name.startswith((attrs.OL_PREFIX, "gen_ai.")):
         return False
-    if content:
-        return True
-    return (
-        name not in attrs.CONTENT
-        and name != attrs.USER_ID
-        and not name.startswith(attrs.GEN_AI_CONTENT_PREFIXES)
+    return content or (
+        name != attrs.USER_ID and not name.startswith(attrs.GEN_AI_CONTENT_PREFIXES)
     )
 
 

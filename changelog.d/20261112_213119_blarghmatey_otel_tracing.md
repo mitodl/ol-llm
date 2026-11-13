@@ -1,7 +1,7 @@
 ### Added
 
 - Trace destinations, chosen by name like memory backends: `OL_LLM_TRACE_DESTINATIONS` (comma-separated) is `opik` by default, `otlp` sends the spans unmapped to the endpoint the standard `OTEL_EXPORTER_OTLP_*` variables name (e.g. a Tempo), and `memory` keeps them in the process for tests. `TracingConfig.destinations` sets them in code, `ol_llm.tracing.destinations()` returns them, and the `ol_llm.trace_destinations` entry-point group or `register_trace_destination` adds others.
-- `otlp` receives only `ol.*` and `gen_ai.*` attributes, and none that carry learner content or identify a user (call input and output, model messages, embedding inputs, note text and queries, `ol.user_id`, error messages) unless `OL_LLM_TRACE_OTLP_CONTENT=true`.
+- `otlp` receives the `ol.*` and `gen_ai.*` attributes (and no others but the content ones), and none that carry learner content or identify a user (call input and output, model messages, embedding inputs, note text and queries, `ol.user_id`, error messages) unless `OL_LLM_TRACE_OTLP_CONTENT=true`.
 - Every entry-point call opens an OpenTelemetry call span carrying the attribution fields as `ol.*` attributes (`ol.app`, `ol.use_case`, `ol.environment`, `ol.user_id`, `ol.run_id`, `ol.prompt_name`, `ol.degraded_reason`, ...), `ol.tags`, and the thread as `gen_ai.conversation.id`. The names are in `ol_llm.trace_attributes`.
 
 ### Changed

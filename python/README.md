@@ -853,10 +853,11 @@ span goes to every trace destination `OL_LLM_TRACE_DESTINATIONS` names:
   It receives everything the trace records, content included when `OL_LLM_TRACE_CONTENT` is
   on (the default).
 - `otlp`: the spans unmapped, to the OTLP/HTTP endpoint the standard `OTEL_EXPORTER_OTLP_*`
-  variables name, e.g. a Tempo. It receives only `ol.*` and `gen_ai.*` attributes, and by
-  default none that carry learner content or identify a user: no call input or output,
-  model messages, embedding inputs, note text or queries, `ol.user_id`, or error messages
-  (an error keeps its type). `OL_LLM_TRACE_OTLP_CONTENT=true` sends those too, as far as
+  variables name, e.g. a Tempo. It receives the `ol.*` and `gen_ai.*` attributes (and no
+  others but the content ones below), and by default none that carry learner content or
+  identify a user: no call input or output, model messages, embedding inputs, note text or
+  queries, `ol.user_id`, or error messages (an error keeps its type).
+  `OL_LLM_TRACE_OTLP_CONTENT=true` sends those too, as far as
   `OL_LLM_TRACE_CONTENT` lets the trace record them; leave it off until the data-handling
   policy approves the destination for learner content. LangChain runs from `traced_chat`
   are not spans and do not reach it.

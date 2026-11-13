@@ -16,6 +16,7 @@ from ol_llm import (
     PostProcessed,
     UseCase,
     run_sync,
+    trace_attributes,
     traced_embedding,
     tracing,
 )
@@ -24,6 +25,7 @@ from ol_llm.trace_destinations import (
     DestinationSettings,
     MemoryDestination,
     opik_destination,
+    otlp,
     register_trace_destination,
 )
 from ol_llm.trace_destinations.opik_destination import (
@@ -532,6 +534,12 @@ def test_the_otlp_destination_sends_content_when_opted_in(
     }
     assert json.loads(call["ol.output"].string_value) == "the answer"
     assert call["ol.user_id"].string_value == "user-1"
+
+
+@pytest.mark.parametrize("name", sorted(trace_attributes.CONTENT))
+def test_the_otlp_content_setting_decides_every_content_attribute(name: str) -> None:
+    assert otlp._kept(name, content=True)  # noqa: SLF001
+    assert not otlp._kept(name, content=False)  # noqa: SLF001
 
 
 def test_the_otlp_content_setting_must_be_a_boolean(
