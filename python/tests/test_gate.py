@@ -16,7 +16,14 @@ import pytest
 from conftest import PromptLibrary, preferring
 from ol_llm import fetch_prompt, tracing
 from ol_llm.errors import LLMError, LLMRejected
-from ol_llm.evaluation import PAIRWISE_METRIC, Threshold, ValidatorMetric, main
+from ol_llm.evaluation import (
+    PAIRWISE_METRIC,
+    Threshold,
+    ValidatorMetric,
+    evaluate,
+    main,
+)
+from ol_llm.experiments import DatasetVersionNotFoundError
 from ol_llm.gate import (
     BASELINE_TAG,
     GATE_ERROR_STATUS,
@@ -558,6 +565,26 @@ def test_a_missing_dataset_version_fails(
     assert not runs
 
 
+def test_evaluating_a_missing_dataset_version_raises_the_libraries_error(
+    client: FakeClient, prompt_library: PromptLibrary
+) -> None:
+    seeded(client)
+    prompt_library.add(USE_CASE, "Summarize {{text}}.", project_name=APP)
+    prompt = fetch_prompt(USE_CASE, app=APP, version="v1")
+    assert prompt is not None
+
+    with pytest.raises(DatasetVersionNotFoundError) as caught:
+        evaluate(
+            lambda item: item,
+            dataset=DATASET,
+            app=APP,
+            metrics=[],
+            prompts=[prompt],
+            dataset_version="v9",
+        )
+    assert caught.value.latest == "v1"
+
+
 @pytest.mark.usefixtures("client", "prompts")
 def test_a_declared_file_seeds_the_dataset(
     tmp_path: Path, runs: list[dict[str, Any]]
@@ -1086,6 +1113,44 @@ def test_the_gate_command_fails_a_gate_that_cannot_run(
     text = report.read_text()
     assert "could not run" in text
     assert f"has no dataset '{DATASET}'" in text
+
+
+def misnamed_suite(context: GateContext) -> Suite:
+    """A suite whose validator names an input nothing provides."""
+    built = suite(context)
+    return Suite(
+        task=built.task,
+        metrics=[
+            ValidatorMetric(
+                "placeholders",
+                lambda source, output: braces(source) == braces(output),
+                track=False,
+            )
+        ],
+    )
+
+
+@pytest.mark.usefixtures("runs")
+def test_a_metrics_missing_input_is_a_gate_that_cannot_run(
+    client: FakeClient, prompts: PromptLibrary, gate_file: Path
+) -> None:
+    del prompts
+    seeded(client)
+    module = re.search(r'suite = "(\w+):suite"', gate_file.read_text())
+    assert module is not None
+    (gate_file.parent / f"{module[1]}.py").write_text(
+        "from test_gate import misnamed_suite as suite\n", encoding="utf-8"
+    )
+    report = gate_file.with_name("report.md")
+
+    status = main(["gate", str(gate_file), "--report", str(report)])
+
+    assert status == GATE_ERROR_STATUS
+    text = report.read_text()
+    assert "could not run" in text
+    assert "The suite's metric 'placeholders' needs ['source']" in text
+    # Field names only, never an item's content.
+    assert "{great}" not in text
 
 
 def test_the_gate_command_fails_a_malformed_declaration(tmp_path: Path) -> None:

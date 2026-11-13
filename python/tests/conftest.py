@@ -18,6 +18,7 @@ import ol_llm.catalog as catalog_module
 import pytest
 from ol_llm import GatewayRoute, UseCase, loops, models, prompts, tracing
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
+from ol_llm.experiments import configure_experiment_backend
 from ol_llm.prompt_registry import configure_prompt_registry
 from ol_llm.settings import Settings, configure
 from ol_llm.tracing import KeycloakClient, TracingConfig, configure_tracing
@@ -366,6 +367,14 @@ def default_prompt_registry() -> Generator[None]:
     wait_for_fetches()
     configure_prompt_registry(None)
     prompts._cache.clear()  # noqa: SLF001
+
+
+@pytest.fixture(autouse=True)
+def default_experiment_backend() -> Generator[None]:
+    """Each test starts on the environment's experiment backend (Opik)."""
+    configure_experiment_backend(None)
+    yield
+    configure_experiment_backend(None)
 
 
 @pytest.fixture(autouse=True)

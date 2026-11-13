@@ -15,8 +15,9 @@ What it proves, in an environment shaped like a consumer's runtime image:
   a run inside the caller's own @opik.track, where Opik files that run's trace;
 - ol_llm.get_prompt fetches a prompt by label through the SDK, and the run links
   its version to the root trace;
-- an Opik LLM-judge metric scores through ol_llm.evaluation.judge_model, which
-  traces the judge call under the eval-judge use case, without litellm;
+- ol_llm.evaluation.hallucination, Opik's judge metric on the judge from
+  ol_llm.evaluation.judge_model, traces the judge call under the eval-judge use
+  case, without litellm;
 - ol_llm.evaluation.evaluate, on Opik's own evaluation engine, scores an item
   whose task raised an LLMError as a failure instead of aborting, and Opik's
   rate-limit check, which imports litellm and openai, stays off that path;
@@ -141,14 +142,19 @@ os.environ.update(
 import ol_llm  # noqa: E402
 import opik  # noqa: E402
 import sentry_sdk  # noqa: E402
-from ol_llm import evaluation, memory  # noqa: E402
-from ol_llm.evaluation import ValidatorMetric, judge_model  # noqa: E402
+from ol_llm import memory, tracing  # noqa: E402
+from ol_llm.evaluation import (  # noqa: E402
+    ValidatorMetric,
+    evaluate,
+    hallucination,
+    judge_model,
+)
 from ol_llm.models import override_models  # noqa: E402
 from ol_llm.testing import override_embedding_models  # noqa: E402
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (  # noqa: E402
     ExportTraceServiceRequest,
 )
-from opik.evaluation.metrics import Hallucination  # noqa: E402
+from opik.evaluation.evaluation_result import EvaluationResult  # noqa: E402
 from pydantic_ai.embeddings import TestEmbeddingModel  # noqa: E402
 from pydantic_ai.models.test import TestModel  # noqa: E402
 
@@ -197,9 +203,9 @@ def sdk_traces() -> list[dict[str, Any]]:
 
 
 def judge() -> list[str]:
-    """Score with an Opik judge metric whose model calls through ol-llm."""
+    """Score with a judge metric whose model calls through ol-llm."""
     verdict = {"score": 0.0, "reason": ["grounded"]}
-    metric = Hallucination(model=judge_model(APP, "openai:gpt-4o-mini"), track=False)
+    metric = hallucination(judge_model(APP, "openai:gpt-4o-mini"), track=False)
     with override_models(TestModel(custom_output_args=verdict)):
         judged = metric.score(input="ping", output="pong", context=["pong"])
     if (judged.value, judged.reason) != (0.0, "grounded"):
@@ -222,12 +228,20 @@ def failed_task() -> list[str]:
         environment="production",
     )
 
-    def on_items(**kwargs: Any) -> Any:  # noqa: ANN401
-        return opik.evaluate_on_dict_items(
+    def on_items(**kwargs: Any) -> EvaluationResult:  # noqa: ANN401
+        result = opik.evaluate_on_dict_items(
             kwargs["dataset"],
             kwargs["task"],
             scoring_metrics=kwargs["scoring_metrics"],
             scoring_threads=1,
+        )
+        return EvaluationResult(
+            experiment_id="smoke",
+            dataset_id="smoke-golden",
+            experiment_name="smoke",
+            test_results=result.test_results,
+            experiment_url=None,
+            trial_count=1,
         )
 
     class Client:
@@ -242,19 +256,19 @@ def failed_task() -> list[str]:
         return bool(output)
 
     opik.evaluate = on_items  # type: ignore[assignment]
-    evaluation.tracing.opik_client = Client  # type: ignore[assignment]
-    result = evaluation.evaluate(
+    tracing.opik_client = Client  # type: ignore[assignment]
+    result = evaluate(
         task,
         dataset="smoke-golden",
-        project_name=APP,
+        app=APP,
         metrics=[
             ValidatorMetric("nonempty", nonempty, track=False),
-            Hallucination(model=judge_model(APP, "openai:gpt-4o-mini"), track=False),
+            hallucination(judge_model(APP, "openai:gpt-4o-mini"), track=False),
         ],
         prompts=[prompt],
     )
-    [scored] = result.test_results
-    scores = {s.name: (s.value, s.scoring_failed) for s in scored.score_results}
+    [scored] = result.items
+    scores = {s.name: (s.value, s.failed) for s in scored.scores}
     if scores != {"nonempty": (0.0, False), "hallucination_metric": (0.0, True)}:
         return [f"the failed task's item scored {scores}"]
     return []

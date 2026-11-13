@@ -3,7 +3,7 @@
 A use case declares its gate in its repository, next to its prompt, as a TOML file
 the owning team reviews like code (spec §5.1 item 3)::
 
-    app = "dagster-ml"                  # the Opik project
+    app = "dagster-ml"                  # the app, which owns the prompts and dataset
     use_case = "feedback-summary"
     mode = "advisory"                   # until the owner trusts the thresholds
     suite = "feedback_summary_eval:suite"
@@ -38,7 +38,7 @@ with the declaration's directory first on ``sys.path``, so it can sit beside the
 declaration or be part of the app's installed package.
 
 The versions under test come from the app's pointer file (``ol_llm.pointers``),
-which must name the same Opik project as ``app``. A pull request that promotes a
+which must name the same app as ``app``. A pull request that promotes a
 prompt changes its pointer, so its gate runs the new version, and merging it moves
 the ``production`` label to the version the gate ran.
 
@@ -59,33 +59,25 @@ production version" would otherwise include runs from pull requests that never
 merged. With no baseline, only the fixed bounds apply, the pairwise win rate is not
 compared, and the next default-branch run records one.
 
-Needs the ``pydantic-ai`` extra, the provider extras for the task's and judge's
-models, and opik installed whole (see ``ol_llm.evaluation``).
+The experiments run on the backend ``ol_llm.experiments`` configures, Opik by
+default. Needs the ``pydantic-ai`` extra, the provider extras for the task's and
+judge's models, and for Opik, opik installed whole (see
+``ol_llm.experiments.opik_backend``).
 """
 
 import dataclasses
-import json
 import logging
 import pkgutil
 import sys
 import tomllib
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import Annotated, Any
 
-import httpx
-import opik
 import pydantic
-from opik import url_helpers
-from opik.api_objects.dataset.dataset_item import DatasetItem
-from opik.evaluation.metrics import BaseMetric
-from opik.exceptions import DatasetVersionNotFound
-from opik.rest_api.core import ApiError
-from opik.rest_api.types import ExperimentPublic
 
-from ol_llm import tracing
 from ol_llm.evaluation import (
     LLM_ERROR_FIELD,
     PAIRWISE_METRIC,
@@ -102,12 +94,16 @@ from ol_llm.evaluation import (
     score_report,
     seed_dataset,
 )
+from ol_llm.experiments import (
+    DatasetNotFoundError,
+    DatasetVersionNotFoundError,
+    ExperimentResult,
+    Metric,
+    MissingMetricInputError,
+    experiment_backend,
+)
 from ol_llm.pointers import PointerError, PromptName, PromptPointers, VersionName
-from ol_llm.prompt_registry.opik_registry import opik_version_id
 from ol_llm.prompts import ManagedPrompt, fetch_prompt
-
-if TYPE_CHECKING:
-    from opik.evaluation.evaluation_result import EvaluationResult
 
 log = logging.getLogger(__name__)
 
@@ -120,8 +116,6 @@ PRODUCTION_LABEL = "production"
 GATE_ERROR_STATUS = 2
 """What ``ol-llm-eval gate`` exits with when the gate cannot run."""
 
-_PAGE_SIZE = 100
-
 
 class GateConfigurationError(Exception):
     """The gate cannot run as declared; the message says what to change."""
@@ -130,7 +124,7 @@ class GateConfigurationError(Exception):
 class DatasetPin(pydantic.BaseModel):
     """The golden dataset a gate runs on (spec §5.1 item 6).
 
-    :param name: the dataset, in the app's Opik project.
+    :param name: the dataset, in the app's namespace.
     :param version: the pinned version; changing it is a reviewed change.
     :param file: golden items to seed before each run, relative to the
         declaration. Seeding is idempotent, so this adds only new items.
@@ -164,7 +158,7 @@ class PairwiseDeclaration(pydantic.BaseModel):
 class GateDeclaration(pydantic.BaseModel):
     """One use case's evaluation gate, as its repository declares it.
 
-    :param app: the app's Opik project, which holds its prompts and datasets.
+    :param app: the app, whose namespace holds its prompts and datasets.
     :param use_case: the use case the gate covers.
     :param mode: ``advisory`` reports a miss; ``blocking`` fails the check.
     :param suite: ``module:attribute`` of the callable that builds the ``Suite``.
@@ -282,7 +276,7 @@ class GateDeclaration(pydantic.BaseModel):
 class GateContext:
     """What a suite builder gets: the prompts under test and the judge.
 
-    :param app: the app's Opik project.
+    :param app: the app.
     :param use_case: the use case under test.
     :param prompts: each declared prompt at the version under test.
     :param judge: the declared judge, built through ``judge_model``.
@@ -313,15 +307,15 @@ class Suite:
     """The task under test and how its output is scored; see ``evaluate``.
 
     :param task: called with each dataset item's fields; returns the output.
-    :param metrics: the metrics, e.g. ``ValidatorMetric`` and judge metrics on
-        ``GateContext.require_judge()``.
+    :param metrics: the metrics, e.g. ``ValidatorMetric`` and judge metrics such
+        as ``hallucination(context.require_judge())``.
     :param scoring_key_mapping: metric input name to item or output field.
     :param experiment_config: what describes the run, e.g. the model under test.
     :param task_threads: items run at once.
     """
 
     task: Callable[[dict[str, Any]], dict[str, Any]]
-    metrics: Sequence[BaseMetric]
+    metrics: Sequence[Metric]
     scoring_key_mapping: Mapping[str, str] | None = None
     experiment_config: Mapping[str, Any] | None = None
     task_threads: int = 16
@@ -333,9 +327,9 @@ class Baseline:
 
     :param experiment_id: the experiment.
     :param name: its name.
-    :param url: the experiment in Opik.
+    :param url: the experiment in the backend's UI.
     :param prompt_versions: prompt name to the production version it ran.
-    :param means: each metric's mean, as Opik averaged it.
+    :param means: each metric's mean, as the backend averaged it.
     """
 
     experiment_id: str
@@ -535,16 +529,15 @@ def run_gate(
     :returns: the outcome. A blocking miss does not raise; see
         ``GateOutcome.failed``.
     :rtype: GateOutcome
-    :raises GateConfigurationError: if tracing is off, the dataset, its pinned
-        version, or a pinned prompt version does not exist, or the pairwise
-        comparison cannot pair the baseline's answers with this run's.
+    :raises GateConfigurationError: if the experiment backend cannot run (with
+        Opik, tracing is off), the dataset, its pinned version, or a pinned
+        prompt version does not exist, a metric needs an input the items and
+        output lack, or the pairwise comparison cannot pair the baseline's
+        answers with this run's.
     """
-    if not tracing.enabled():
-        msg = (
-            "Tracing is off (OPIK_TRACK_DISABLE), so there is no Opik to run the "
-            "gate against"
-        )
-        raise GateConfigurationError(msg)
+    backend = experiment_backend()
+    if (reason := backend.disabled_reason()) is not None:
+        raise GateConfigurationError(reason)
     _check_dataset(declaration)
     prompts = {
         name: _pinned_prompt(declaration, name, version)
@@ -571,22 +564,29 @@ def run_gate(
         "change": change,
         "judge_model": declaration.judge_model,
     }
-    result = evaluate(
-        built.task,
-        dataset=declaration.dataset.name,
-        project_name=declaration.app,
-        metrics=built.metrics,
-        prompts=list(prompts.values()),
-        dataset_version=declaration.dataset.version,
-        experiment_name=f"{declaration.use_case} {change}",
-        experiment_config=config,
-        scoring_key_mapping=built.scoring_key_mapping,
-        task_threads=built.task_threads,
-        experiment_tags=[_gate_tag(declaration), f"change:{change}"],
-    )
-    baseline, note = find_baseline(
-        declaration, dataset_id=result.dataset_id, exclude=result.experiment_id
-    )
+    try:
+        result = evaluate(
+            built.task,
+            dataset=declaration.dataset.name,
+            app=declaration.app,
+            metrics=built.metrics,
+            prompts=list(prompts.values()),
+            dataset_version=declaration.dataset.version,
+            experiment_name=f"{declaration.use_case} {change}",
+            experiment_config=config,
+            scoring_key_mapping=built.scoring_key_mapping,
+            task_threads=built.task_threads,
+            experiment_tags=[_gate_tag(declaration), f"change:{change}"],
+        )
+    except MissingMetricInputError as exc:
+        # Field names only: the report is posted on the pull request.
+        msg = (
+            f"The suite's metric {exc.metric!r} needs {exc.missing}, which the "
+            f"dataset item and the task output do not have (they have "
+            f"{exc.available}). Map them with the Suite's scoring_key_mapping."
+        )
+        raise GateConfigurationError(msg) from exc
+    baseline, note = find_baseline(declaration, exclude=result.experiment_id)
     pairwise = None
     if declaration.pairwise is not None and baseline is not None and judge is not None:
         try:
@@ -595,7 +595,7 @@ def run_gate(
                 baseline.experiment_id,
                 judge=judge,
                 criteria=declaration.pairwise.criteria,
-                project_name=declaration.app,
+                app=declaration.app,
                 answer_fields=declaration.pairwise.answer_fields,
                 threads=built.task_threads,
             )
@@ -610,9 +610,7 @@ def run_gate(
     )
     recorded = record_baseline and not_run is None
     if recorded:
-        tracing.opik_client().rest_client.experiments.update_experiment(
-            result.experiment_id, tags_to_add=[BASELINE_TAG]
-        )
+        backend.tag_experiment(result.experiment_id, BASELINE_TAG)
     report = _with_pairwise(
         score_report(
             result,
@@ -661,18 +659,18 @@ def _with_pairwise(
 
 
 def _not_run(
-    result: "EvaluationResult",
+    result: ExperimentResult,
     report: GateReport,
     pairwise: PairwiseComparison | None,
 ) -> str | None:
     """Say why an experiment evaluated nothing, or return ``None`` if it did."""
-    items = result.test_results
+    items = result.items
     if not items:
         return "the dataset version has no items."
     errors = Counter(
-        str(output[LLM_ERROR_FIELD])
+        str(item.output[LLM_ERROR_FIELD])
         for item in items
-        if LLM_ERROR_FIELD in (output := item.test_case.task_output or {})
+        if LLM_ERROR_FIELD in item.output
     )
     if errors.total() == len(items):
         # As in a batch, every row failing the same way is a configuration
@@ -700,54 +698,42 @@ def _gate_tag(declaration: GateDeclaration) -> str:
 def _check_dataset(declaration: GateDeclaration) -> None:
     """Seed the declared file, then check the pinned version holds its items."""
     pin, app = declaration.dataset, declaration.app
-    items = None
-    if pin.file is None:
-        existing = _get_dataset(pin.name, app)
-    else:
+    backend = experiment_backend()
+    items: list[dict[str, Any]] = []
+    if pin.file is not None:
         try:
             items = load_items(pin.file, group=pin.group)
-            existing = seed_dataset(pin.name, items, project_name=app)
+            seed_dataset(pin.name, items, app=app)
         except (OSError, ValueError) as exc:
             msg = f"Could not seed dataset {pin.name!r} from {pin.file}: {exc}"
             raise GateConfigurationError(msg) from exc
-    if existing is None:
+    try:
+        latest = backend.latest_dataset_version(pin.name, app=app)
+        # Checked on every run, not only when seeding adds a version: a retry
+        # seeds nothing new, and would otherwise evaluate a stale pin without the
+        # new items.
+        missing = backend.missing_items(pin.name, items, app=app, version=pin.version)
+    except DatasetNotFoundError as exc:
         msg = (
-            f"Opik project {app!r} has no dataset {pin.name!r}. Create it with "
-            f"`ol-llm-eval seed <golden.json> --dataset {pin.name} --project {app}`, "
+            f"App {app!r} has no dataset {pin.name!r}. Create it with "
+            f"`ol-llm-eval seed <golden.json> --dataset {pin.name} --app {app}`, "
             "or set dataset.file in the gate to seed it on every run, then pin the "
             "version it reports."
         )
-        raise GateConfigurationError(msg)
-    latest = existing.get_current_version_name()
-    try:
-        pinned = existing.get_version_view(pin.version)
-    except DatasetVersionNotFound as exc:
+        raise GateConfigurationError(msg) from exc
+    except DatasetVersionNotFoundError as exc:
         msg = (
             f"Dataset {pin.name!r} has no version {pin.version}; its latest is "
-            f"{latest}. Pin a version that exists."
+            f"{exc.latest}. Pin a version that exists."
         )
         raise GateConfigurationError(msg) from exc
-    if items is None:
-        return
-    # Checked on every run, not only when seeding adds a version: a retry seeds
-    # nothing new, and would otherwise evaluate a stale pin without the new items.
-    held = {DatasetItem(**item).content_hash() for item in pinned.get_items()}
-    if missing := {DatasetItem(**item).content_hash() for item in items} - held:
+    if missing:
         msg = (
-            f"Dataset {pin.name!r} {pin.version} lacks {len(missing)} of the items in "
+            f"Dataset {pin.name!r} {pin.version} lacks {missing} of the items in "
             f"{pin.file}, and seeding put them in {latest}. Set dataset.version = "
             f'"{latest}" in the gate to evaluate them.'
         )
         raise GateConfigurationError(msg)
-
-
-def _get_dataset(name: str, project_name: str) -> opik.Dataset | None:
-    try:
-        return tracing.opik_client().get_dataset(name, project_name=project_name)
-    except ApiError as exc:
-        if exc.status_code == httpx.codes.NOT_FOUND:
-            return None
-        raise
 
 
 def _pinned_prompt(
@@ -756,15 +742,16 @@ def _pinned_prompt(
     prompt = fetch_prompt(name, app=declaration.app, version=version)
     if prompt is None:
         msg = (
-            f"Opik project {declaration.app!r} has no prompt {name!r} at {version}. "
-            "Create the version in Opik, or point the gate at one that exists."
+            f"App {declaration.app!r} has no prompt {name!r} at {version}. "
+            "Create the version in the prompt registry, or point the gate at one "
+            "that exists."
         )
         raise GateConfigurationError(msg)
     return prompt
 
 
 def find_baseline(
-    declaration: GateDeclaration, *, dataset_id: str, exclude: str | None = None
+    declaration: GateDeclaration, *, exclude: str | None = None
 ) -> tuple[Baseline | None, str | None]:
     """Find the experiment a gate's tolerances are measured from.
 
@@ -773,40 +760,42 @@ def find_baseline(
     version.
 
     :param declaration: the gate.
-    :param dataset_id: the dataset's id.
     :param exclude: an experiment to pass over, e.g. the one just run.
     :returns: the baseline and ``None``, or ``None`` and why there is none.
     :rtype: tuple[Baseline | None, str | None]
     """
+    backend = experiment_backend()
     production: dict[str, ManagedPrompt[Any]] = {}
     wanted: set[str] = set()
     for name in declaration.prompts:
         prompt = fetch_prompt(name, app=declaration.app, environment=PRODUCTION_LABEL)
-        version_id = None if prompt is None else opik_version_id(prompt.registry_ref)
-        if prompt is None or version_id is None:
+        linked = None if prompt is None else backend.linked_version(prompt)
+        if prompt is None or linked is None:
             return None, f"no version of `{name}` carries the production label."
         production[name] = prompt
-        wanted.add(version_id)
+        wanted.add(linked)
     versions = _versions(
         {name: prompt.version or "" for name, prompt in production.items()}
     )
-    for experiment in _baseline_experiments(dataset_id, declaration):
+    tags = [_gate_tag(declaration), BASELINE_TAG]
+    for experiment in backend.find_experiments(
+        app=declaration.app, dataset=declaration.dataset.name, tags=tags
+    ):
+        # Checked here too, so a backend that ignored the tags cannot hand back
+        # a pull request's run as the baseline.
         if (
-            experiment.id is not None
-            and experiment.id != exclude
-            and wanted
-            <= {v.prompt_version_id for v in experiment.prompt_versions or []}
-            and experiment.dataset_version_summary is not None
-            and experiment.dataset_version_summary.version_name
-            == declaration.dataset.version
+            set(tags) <= experiment.tags
+            and experiment.experiment_id != exclude
+            and wanted <= experiment.prompt_versions
+            and experiment.dataset_version == declaration.dataset.version
         ):
             return (
                 Baseline(
-                    experiment_id=experiment.id,
+                    experiment_id=experiment.experiment_id,
                     name=experiment.name,
-                    url=_experiment_url(dataset_id, experiment.id),
+                    url=experiment.url,
                     prompt_versions={n: p.version or "" for n, p in production.items()},
-                    means={s.name: s.value for s in experiment.feedback_scores or []},
+                    means=experiment.means,
                 ),
                 None,
             )
@@ -814,52 +803,6 @@ def find_baseline(
         f"no default-branch run of this gate on dataset "
         f"{declaration.dataset.version} with production {versions} yet. The "
         "next one records it."
-    )
-
-
-def _baseline_experiments(
-    dataset_id: str, declaration: GateDeclaration
-) -> Iterator[ExperimentPublic]:
-    """Yield the gate's baseline experiments on a dataset, newest first.
-
-    Opik filters on both tags (``=`` on a list is membership) and returns
-    experiments by id, descending, when no sorting is given; ids are UUIDv7, so
-    that is newest first. Checked against the Opik backend at 2.2.81 and 2.2.103
-    (``ExperimentDAO.FIND``, ``FilterQueryBuilder``).
-    """
-    tags = [_gate_tag(declaration), BASELINE_TAG]
-    filters = json.dumps(
-        [{"field": "tags", "operator": "=", "value": tag} for tag in tags]
-    )
-    rest = tracing.opik_client().rest_client
-    page = 1
-    while True:
-        content = (
-            rest.experiments.find_experiments(
-                page=page, size=_PAGE_SIZE, dataset_id=dataset_id, filters=filters
-            ).content
-            or []
-        )
-        for experiment in content:
-            # Checked here too, so a backend that ignored the filter cannot hand
-            # back a pull request's run as the baseline.
-            if set(tags) <= set(experiment.tags or []):
-                yield experiment
-        if len(content) < _PAGE_SIZE:
-            return
-        page += 1
-
-
-def _experiment_url(dataset_id: str, experiment_id: str) -> str | None:
-    client = tracing.opik_client()
-    base_url = client.config.url_override
-    if not base_url:
-        return None
-    return url_helpers.get_experiment_url_by_id(
-        dataset_id=dataset_id,
-        experiment_id=experiment_id,
-        base_url=base_url,
-        workspace=client.config.workspace,
     )
 
 
@@ -896,7 +839,7 @@ def gate_command(
     except GateConfigurationError as exc:
         return _cannot_run(path, exc, report)
     except Exception as exc:
-        # Only the class: a provider's or Opik's message can quote the request,
+        # Only the class: a provider's or a backend's message can quote the request,
         # and the report is posted on the pull request. The log has the rest.
         _write(
             report,
