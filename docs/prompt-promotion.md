@@ -104,8 +104,9 @@ someone moved in the UI.
 `promote` fetches every pointed version before it moves any label, so a pointer to a missing
 version moves nothing. It leaves a label that is already in place and keeps each version's
 other labels. If it stops partway (Opik going away, say), running it again finishes the rest.
-It exits 2 when the label is not a registered environment in the workspace; Opik seeds only
-`development`, `staging`, and `production`.
+A label Opik does not have yet is registered as an environment in the workspace first (Opik
+seeds only `development`, `staging`, and `production`). Against the read-only `file` registry
+it exits 2.
 
 ## The workflow
 

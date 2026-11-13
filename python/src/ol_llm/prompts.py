@@ -1,167 +1,90 @@
-"""Managed prompts (lifecycle spec §2 and §3): Opik is the system of record.
+"""Managed prompts (lifecycle spec §2 and §3), from the prompt registry.
 
-Deployed code fetches a prompt by its environment label with ``get_prompt``. The
-Opik SDK keeps each fetched prompt in a process-wide cache, serves it from there,
-and refreshes it in a background thread every ``OPIK_PROMPT_CACHE_TTL_SECONDS``
-(300 by default), keeping the cached value when a refresh fails. So a label move
-reaches every process within one TTL, and only a fetch with nothing cached can
-fail.
+Deployed code fetches a prompt by its label with ``get_prompt``. The registry is
+whichever ``ol_llm.prompt_registry`` is configured (Opik by default); the runtime
+policy here applies to every one. Each fetched version is kept in a process-wide
+cache for ``PROMPT_CACHE_TTL_SECONDS``. The first call after that fetches it again,
+waiting up to ``COLD_FETCH_DEADLINE_SECONDS``, and gets the cached version if the
+fetch fails, finds nothing, or is slow; a failed refresh is tried again after
+another TTL. So a label move reaches every process within one TTL, and only a fetch
+with nothing cached can fail.
 
-A cold fetch with Opik unreachable raises, after as long as the SDK's own retries
-take. ``get_prompt`` waits ``COLD_FETCH_DEADLINE_SECONDS`` for it and then returns
-the embedded default the caller passed, the text of the pointed production
-version committed beside the pointer file (``ol_llm.pointers``), marked degraded with
-``embedded_prompt``. The fetch carries on in the background and fills the cache,
-so the next call gets the managed version.
+A cold fetch waits ``COLD_FETCH_DEADLINE_SECONDS`` and then, if the registry has
+not answered or could not be reached, returns the embedded default the caller
+passed, the text of the pointed production version committed beside the pointer
+file (``ol_llm.pointers``), marked degraded with ``embedded_prompt``. A fetch that
+missed the deadline carries on in the background and fills the cache, so the next
+call gets the managed version.
 
-With tracing off (``OPIK_TRACK_DISABLE=true``) ``get_prompt`` does not fetch and
-returns the embedded default unmarked: that is local development. ``fetch_prompt``,
-``create_prompt`` and ``promote_prompt`` still call Opik, with the Keycloak token
-when a client is configured.
+With the registry disabled (for Opik, tracing off: ``OPIK_TRACK_DISABLE=true``)
+``get_prompt`` does not fetch and returns the embedded default unmarked: that is
+local development. ``fetch_prompt``, ``create_prompt`` and ``promote_prompt`` still
+call the registry.
 
 ``create_prompt`` and ``promote_prompt`` are for the CI jobs that sync prompts
 and move the ``production`` label from the pointer file (spec §2.3).
 """
 
 import contextvars
-import hashlib
-import json
 import logging
 import threading
-from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+import time
+from collections import OrderedDict
+from collections.abc import Hashable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Any, Generic, Literal, TypeVar, cast, overload
+from typing import Any, Generic, Literal, cast, overload
 
-import httpx
-import opik
-from opik import context_storage, opik_context
-from opik.api_objects.prompt import (
-    BasePrompt,
-    ChatPromptTemplate,
-    PromptTemplate,
-    PromptType,
-    mask_context,
-)
-from opik.api_objects.prompt.types import SupportedModalities
-from opik.rest_api.core import ApiError
-from opik.rest_api.types import PromptVersionDetail
-
-from ol_llm import tracing
 from ol_llm.attribution import DegradedReason
 from ol_llm.loops import register_at_fork
+from ol_llm.prompt_registry import (
+    PromptRegistry,
+    RegistryUnavailableError,
+    RegistryVersion,
+    prompt_registry,
+)
 from ol_llm.settings import get_settings
+from ol_llm.templates import (
+    ChatTemplate,
+    PromptVariablesError,
+    TemplateT,
+    TemplateType,
+    TextTemplate,
+)
+
+__all__ = [
+    "COLD_FETCH_DEADLINE_SECONDS",
+    "PROMPT_CACHE_MAX_ENTRIES",
+    "PROMPT_CACHE_TTL_SECONDS",
+    "ChatTemplate",
+    "ManagedPrompt",
+    "PromptSource",
+    "PromptVariablesError",
+    "TemplateT",
+    "TemplateType",
+    "TextTemplate",
+    "attach_prompt",
+    "create_prompt",
+    "fetch_prompt",
+    "get_prompt",
+    "promote_prompt",
+]
 
 logger = logging.getLogger(__name__)
 
 COLD_FETCH_DEADLINE_SECONDS = 2.0
-"""How long ``get_prompt`` waits for Opik before using the embedded default. The
-SDK took 11 s to give up on an unreachable Opik (spec §3 item 4)."""
+"""How long ``get_prompt`` waits for the registry before using the embedded
+default. The Opik SDK took 11 s to give up on an unreachable Opik (spec §3 item 4)."""
 
-SUPPORTED_MODALITIES: SupportedModalities = {"vision": True, "video": True}
-"""Keep image and video parts as media when a chat template is rendered."""
+PROMPT_CACHE_TTL_SECONDS = 300.0
+"""How long a fetched version is served before it is fetched again (spec §3)."""
 
-TemplateType = Literal["mustache", "jinja2"]
-"""Mustache unless the prompt needs conditionals or loops (spec §3 item 9)."""
+PROMPT_CACHE_MAX_ENTRIES = 128
+"""How many fetched versions the cache keeps, least recently used out first, as the
+Opik SDK's cache did."""
 
 PromptSource = Literal["registry", "embedded"]
 """Where a prompt came from: the prompt registry, or the embedded default."""
-
-
-@dataclass(frozen=True, kw_only=True)
-class _Template(ABC):
-    type: TemplateType = "mustache"
-    version: str | None = None
-
-    @abstractmethod
-    def _content(self) -> str | list[dict[str, Any]]: ...
-
-    @property
-    def template_hash(self) -> str:
-        """The SHA-256 of the template and its type, as hex.
-
-        What batch idempotency keys are built on, not the version (spec §3 item
-        5): a run that fell back to the embedded default gets the same hash as
-        one that fetched the same text, so an Opik outage does not cause
-        reprocessing.
-
-        :returns: the digest, the same for a fetched version and the embedded
-            default exported from it.
-        :rtype: str
-        """
-        canonical = json.dumps(
-            {"type": self.type, "template": self._content()},
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        )
-        return hashlib.sha256(canonical.encode()).hexdigest()
-
-
-@dataclass(frozen=True, kw_only=True)
-class TextTemplate(_Template):
-    """A text prompt: a system or instructions string.
-
-    :param template: the template text.
-    :param type: how placeholders are written.
-    :param version: the Opik version this text is, e.g. ``v7``, when known. For an
-        embedded default it is the pointed version that was exported.
-    """
-
-    template: str
-
-    def _content(self) -> str:
-        return self.template
-
-    def format(self, **variables: Any) -> str:  # noqa: ANN401
-        """Render the template.
-
-        :param variables: a value for every placeholder.
-        :returns: the rendered text.
-        :rtype: str
-        :raises opik.exceptions.PromptPlaceholdersDontMatchFormatArguments: for a
-            mustache template, if the variables are not exactly its placeholders.
-        """
-        return PromptTemplate(self.template, type=PromptType(self.type)).format(
-            **variables
-        )
-
-
-@dataclass(frozen=True, kw_only=True)
-class ChatTemplate(_Template):
-    """A chat prompt: a list of messages with ``role`` and ``content``.
-
-    :param messages: the template messages, in OpenAI's chat format.
-    :param type: how placeholders are written.
-    :param version: the Opik version these messages are, when known.
-    """
-
-    messages: Sequence[Mapping[str, Any]]
-
-    def _content(self) -> list[dict[str, Any]]:
-        return [dict(message) for message in self.messages]
-
-    def format(self, **variables: Any) -> list[dict[str, Any]]:  # noqa: ANN401
-        """Render every message.
-
-        :param variables: a value for every placeholder.
-        :returns: the rendered messages.
-        :rtype: list[dict[str, Any]]
-        :raises opik.exceptions.PromptPlaceholdersDontMatchFormatArguments: for a
-            mustache template, if the variables are not exactly its placeholders.
-        """
-        # ChatPromptTemplate.format turns media into text placeholders unless
-        # told the model takes it; ChatPrompt.format passes these same flags.
-        rendered = ChatPromptTemplate(
-            self._content(),
-            template_type=PromptType(self.type),
-            validate_placeholders=True,
-        ).format(variables, supported_modalities=SUPPORTED_MODALITIES)
-        return cast("list[dict[str, Any]]", rendered)
-
-
-TemplateT = TypeVar("TemplateT", TextTemplate, ChatTemplate)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -177,14 +100,15 @@ class ManagedPrompt(Generic[TemplateT]):
     :param degraded_reasons: ``embedded_prompt`` when the registry could not be
         reached.
     :param registry_ref: the registry's own object for this version, for the trace
-        link; ``None`` for the embedded default. Opaque to callers.
+        link; ``None`` for the embedded default or a registry with no such link.
+        Opaque to callers.
     """
 
     name: str
     template: TemplateT
     source: PromptSource
     degraded_reasons: tuple[DegradedReason, ...] = ()
-    registry_ref: BasePrompt | None = field(default=None, repr=False, compare=False)
+    registry_ref: object | None = field(default=None, repr=False, compare=False)
 
     @property
     def version(self) -> str | None:
@@ -226,52 +150,50 @@ def get_prompt(
     environment: str | None = None,
     version: str | None = None,
 ) -> ManagedPrompt[TemplateT]:
-    """Fetch a prompt by environment label, or a pinned version, from Opik.
+    """Fetch a prompt by label, or a pinned version, from the prompt registry.
 
-    Fetch per run rather than once at startup: the SDK cache makes a repeat fetch
+    Fetch per run rather than once at startup: the cache makes a repeat fetch
     free, and a label move then reaches the next run. A batch run fetches once at
-    the start and uses that version throughout (spec §3 item 2). Called inside an
-    Opik trace, it links the version to the trace as the SDK does.
+    the start and uses that version throughout (spec §3 item 2). Called inside a
+    trace, it links the version to the trace where the registry can.
 
     :param name: the prompt's name.
-    :param app: the app, whose namespace in the registry holds its prompts (its
-        Opik project).
-    :param default: the embedded default: what to use when Opik is unreachable or
-        tracing is off. Its class says whether the prompt is text or chat.
+    :param app: the app, whose namespace in the registry holds its prompts.
+    :param default: the embedded default: what to use when the registry is
+        unreachable or disabled. Its class says whether the prompt is text or chat.
     :param environment: the label to resolve; the deployment environment
         (``Settings.environment``) when neither this nor ``version`` is given.
     :param version: a pinned version, e.g. ``v7``, for batch runs and
-        evaluations. The SDK refreshes a pinned version on the same TTL as a
-        label.
+        evaluations. Cached on the same TTL as a label.
     :returns: the prompt.
     :rtype: ManagedPrompt
     :raises ValueError: if both ``environment`` and ``version`` are given.
-    :raises LookupError: if Opik has no such prompt, label, or version.
-    :raises opik.exceptions.PromptTemplateStructureMismatch: if Opik holds the
-        prompt as chat and the default is text, or the reverse.
+    :raises LookupError: if the registry has no such prompt, label, or version.
+    :raises TypeError: if the registry holds the prompt as chat and the default
+        is text, or the reverse.
     """
     if environment is not None and version is not None:
         msg = "Pass environment or version, not both"
         raise ValueError(msg)
-    if not tracing.enabled():
+    registry = prompt_registry()
+    if not registry.enabled:
         return ManagedPrompt(name=name, template=default, source="embedded")
     if version is None and environment is None:
         environment = get_settings().environment
     lookup = _Lookup(
+        registry=registry,
         name=name,
         app=app,
-        chat=isinstance(default, ChatTemplate),
-        environment=environment,
+        label=environment,
         version=version,
-        masks=frozenset((mask_context.get_active_prompt_masks() or {}).items()),
+        context=registry.context_key(),
     )
     try:
-        fetched = _fetch_within_deadline(lookup)
-    except Exception as exc:
-        if not _unreachable(exc):
-            raise
+        found = _cached_fetch(lookup)
+    except (RegistryUnavailableError, TimeoutError) as exc:
         logger.warning(
-            "Opik did not return prompt %r (%s); using the embedded default",
+            "The prompt registry did not return prompt %r (%s); using the "
+            "embedded default",
             name,
             type(exc).__name__,
             exc_info=exc,
@@ -282,15 +204,21 @@ def get_prompt(
             source="embedded",
             degraded_reasons=("embedded_prompt",),
         )
-    if fetched is None:
+    if found is None:
         selector = f"version {version}" if version else f"environment {environment}"
-        msg = f"Opik has no prompt {name!r} in {app!r} for {selector}"
+        msg = f"The prompt registry has no prompt {name!r} in {app!r} for {selector}"
         raise LookupError(msg)
+    if isinstance(found.template, ChatTemplate) != isinstance(default, ChatTemplate):
+        msg = (
+            f"Prompt {name!r} is a {_structure(found.template)} prompt in the "
+            f"registry, but the default is {type(default).__name__}"
+        )
+        raise TypeError(msg)
     prompt = ManagedPrompt(
         name=name,
-        template=cast("TemplateT", _template(fetched)),
+        template=cast("TemplateT", found.template),
         source="registry",
-        registry_ref=fetched,
+        registry_ref=found.ref,
     )
     attach_prompt(prompt)
     return prompt
@@ -299,13 +227,13 @@ def get_prompt(
 def attach_prompt(prompt: ManagedPrompt[Any]) -> None:
     """Link a fetched prompt's version to the current trace and span.
 
-    Does nothing for the embedded default, outside a trace, or with tracing off.
+    Does nothing for the embedded default, for a registry with no trace link, or
+    outside a trace.
 
     :param prompt: the prompt.
     """
     if prompt.registry_ref is not None:
-        opik_context.attach_prompt_to_current_trace(prompt.registry_ref)
-        opik_context.attach_prompt_to_current_span(prompt.registry_ref)
+        prompt_registry().link(prompt.registry_ref)
 
 
 def create_prompt(
@@ -318,8 +246,7 @@ def create_prompt(
     """Make ``template`` the latest version of a prompt, for a CI sync job.
 
     Idempotent: a new version is created only when the template text or type
-    differs from the latest version's. Metadata is not compared, so a version
-    created in the Opik UI with the same text is not duplicated.
+    differs from the latest version's.
 
     :param name: the prompt's name.
     :param template: the template; its class says whether the prompt is text or
@@ -328,75 +255,33 @@ def create_prompt(
     :param change_description: recorded on a new version.
     :returns: the latest version, new or existing.
     :rtype: ManagedPrompt
-    :raises opik.exceptions.PromptTemplateStructureMismatch: if the prompt exists
-        with the other structure.
+    :raises TypeError: if the prompt exists with the other structure.
     """
-    client = tracing.opik_client()
-    latest = client.get_prompts_client().get_prompt(
-        name=name,
-        project_name=app,
-        raise_if_not_template_structure=_structure(template),
+    created = prompt_registry().create_version(
+        name, template, app=app, change_description=change_description
     )
-    if latest is not None:
-        existing = _prompt_from_detail(name, latest, app)
-        if _template(existing).template_hash == template.template_hash:
-            return ManagedPrompt(
-                name=name,
-                template=cast("TemplateT", _template(existing)),
-                source="registry",
-                registry_ref=existing,
-            )
-    created: BasePrompt
-    if isinstance(template, TextTemplate):
-        created = client.create_prompt(
-            name=name,
-            prompt=template.template,
-            type=PromptType(template.type),
-            change_description=change_description,
-            project_name=app,
-        )
-    else:
-        created = client.create_chat_prompt(
-            name=name,
-            messages=template._content(),  # noqa: SLF001
-            type=PromptType(template.type),
-            change_description=change_description,
-            project_name=app,
-        )
-    return ManagedPrompt(
-        name=name,
-        template=cast("TemplateT", _template(created)),
-        source="registry",
-        registry_ref=created,
-    )
+    return _managed(name, created)
 
 
 def promote_prompt(name: str, *, version: str, environment: str, app: str) -> None:
-    """Move an environment label to a version, for the promotion CI job.
+    """Move a label to a version, for the promotion CI job.
 
-    The version keeps the labels it already has; the SDK's
-    ``set_prompt_environments`` replaces a version's whole set, so calling it with
-    only the new label would strip e.g. ``qa`` from a version being promoted to
-    ``production``. Clears this process's cached entries for the prompt.
+    The version keeps the labels it already has. Clears this process's cached
+    entries for the prompt.
 
     :param name: the prompt's name.
     :param version: the version to label, e.g. ``v7``.
     :param environment: the label to move, e.g. ``production``.
     :param app: the app, whose namespace in the registry holds the prompt.
-    :raises opik.exceptions.PromptNotFoundError: if there is no such prompt or
-        version.
-    :raises opik.exceptions.EnvironmentNotFoundError: if the environment is not
-        registered in the workspace (Opik seeds only ``development``, ``staging``,
-        and ``production``).
+    :raises LookupError: if there is no such prompt or version.
     """
-    client = tracing.opik_client()
-    detail = client.get_prompts_client().get_prompt(
-        name=name, version=version, project_name=app
-    )
-    current = (detail.environments or []) if detail is not None else []
-    client.set_prompt_environments(
-        name, [*current, environment], version=version, project_name=app
-    )
+    prompt_registry().move_label(name, app=app, version=version, label=environment)
+    with _inflight_lock:
+        for lookup in [k for k in _cache if (k.name, k.app) == (name, app)]:
+            del _cache[lookup]
+        # A fetch in flight may have read the label before the move.
+        for lookup in [k for k in _inflight if (k.name, k.app) == (name, app)]:
+            del _inflight[lookup]
 
 
 def fetch_prompt(
@@ -406,63 +291,71 @@ def fetch_prompt(
     version: str | None = None,
     environment: str | None = None,
 ) -> ManagedPrompt[Any] | None:
-    """Fetch one version of a prompt from Opik, text or chat, for a CI job.
+    """Fetch one version of a prompt from the registry, text or chat, for a CI job.
 
-    Unlike ``get_prompt`` it needs no embedded default, since it reads the
-    structure from Opik, and it neither caches nor falls back: a CI job that
-    cannot reach Opik should fail.
+    Unlike ``get_prompt`` it needs no embedded default, since it takes the
+    structure from the registry, and it neither caches nor falls back: a CI job
+    that cannot reach the registry should fail.
 
     :param name: the prompt's name.
     :param app: the app, whose namespace in the registry holds the prompt.
     :param version: the version, e.g. ``v7``.
     :param environment: the label to resolve, e.g. ``production``.
-    :returns: the prompt, or ``None`` when Opik has no such prompt, version, or
-        label.
+    :returns: the prompt, or ``None`` when the registry has no such prompt,
+        version, or label.
     :rtype: ManagedPrompt | None
     :raises ValueError: unless exactly one of ``version`` and ``environment`` is
         given.
+    :raises RegistryUnavailableError: if the registry could not be reached.
     """
     if (version is None) == (environment is None):
         msg = "Pass exactly one of version and environment"
         raise ValueError(msg)
-    detail = (
-        tracing.opik_client()
-        .get_prompts_client()
-        .get_prompt(
-            name=name,
-            version=version,
-            environment=environment,
-            project_name=app,
-        )
-    )
-    if detail is None:
-        return None
-    fetched = _prompt_from_detail(name, detail, app)
+    found = prompt_registry().fetch(name, app=app, version=version, label=environment)
+    return None if found is None else _managed(name, found)
+
+
+def _managed(name: str, found: RegistryVersion) -> ManagedPrompt[Any]:
     return ManagedPrompt(
-        name=name,
-        template=_template(fetched),
-        source="registry",
-        registry_ref=fetched,
+        name=name, template=found.template, source="registry", registry_ref=found.ref
     )
+
+
+def _structure(template: TextTemplate | ChatTemplate) -> str:
+    return "chat" if isinstance(template, ChatTemplate) else "text"
 
 
 @dataclass(frozen=True, kw_only=True)
 class _Lookup:
+    # Keyed on the registry's identity, not its value: a registry need not be
+    # hashable. The key holds the registry, so its id is not reused while cached.
+    registry: PromptRegistry = field(compare=False)
+    registry_id: int = field(init=False)
     name: str
     app: str
-    chat: bool
-    environment: str | None
+    label: str | None
     version: str | None
-    masks: frozenset[tuple[str, str]]
+    context: Hashable
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "registry_id", id(self.registry))
+
+
+@dataclass
+class _Entry:
+    found: RegistryVersion
+    checked_at: float
 
 
 _inflight_lock = threading.Lock()
-_inflight: dict[_Lookup, Future[BasePrompt | None]] = {}
+_inflight: dict[_Lookup, Future[RegistryVersion | None]] = {}
+_cache: OrderedDict[_Lookup, _Entry] = OrderedDict()
 
 
 def _after_fork_in_child() -> None:
     # The parent's fetch threads didn't survive the fork, so their futures would
-    # never resolve, and a parent thread may have held the lock.
+    # never resolve, and a parent thread may have held the lock. The cache is
+    # plain data and stays.
     global _inflight_lock, _inflight  # noqa: PLW0603
     _inflight_lock = threading.Lock()
     _inflight = {}
@@ -471,112 +364,99 @@ def _after_fork_in_child() -> None:
 register_at_fork(after_in_child=_after_fork_in_child)
 
 
-def _fetch(lookup: _Lookup) -> BasePrompt | None:
-    client = tracing.opik_client()
-    getter = client.get_chat_prompt if lookup.chat else client.get_prompt
-    return getter(
-        name=lookup.name,
-        project_name=lookup.app,
-        environment=lookup.environment,
-        version=lookup.version,
-    )
+def _cached_fetch(lookup: _Lookup) -> RegistryVersion | None:
+    """Return the version for ``lookup``, from the cache while it is fresh.
 
+    Otherwise fetch in a worker thread and wait at most the deadline. Concurrent
+    fetches of one lookup share a worker, which keeps going after the deadline so
+    its result reaches the cache. A stale entry is served when its refresh fails,
+    finds nothing, or misses the deadline, as the Opik SDK's cache did, and at once
+    to every caller but the one that started the refresh.
 
-def _fetch_within_deadline(lookup: _Lookup) -> BasePrompt | None:
-    """Fetch through the SDK cache in a worker thread, waiting at most the deadline.
-
-    A cached prompt comes back at once. Concurrent cold fetches of one prompt
-    under the same masks share a worker, which keeps going after the deadline so
-    its result reaches the cache. The worker has no trace, so the SDK links
-    nothing there; ``get_prompt`` links the result in the caller's context.
+    :raises TimeoutError: if a cold fetch missed the deadline.
     """
     with _inflight_lock:
-        if (future := _inflight.get(lookup)) is None:
-            future = _inflight[lookup] = Future()
-            try:
-                threading.Thread(
-                    target=contextvars.copy_context().run,
-                    args=(_resolve, lookup, future),
-                    name="ol-llm-prompt-fetch",
-                    daemon=True,
-                ).start()
-            except BaseException:
-                del _inflight[lookup]
-                raise
-    return future.result(timeout=COLD_FETCH_DEADLINE_SECONDS)
-
-
-def _resolve(lookup: _Lookup, future: Future[BasePrompt | None]) -> None:
-    # Runs in a copy of the caller's context for the SDK's prompt masks (Opik's
-    # local runner), minus the trace: a fetch that outlives the deadline must
-    # not link a version the caller did not use.
-    context_storage.clear_all()
-    # Retired before it resolves, so a caller arriving later starts a fresh fetch
-    # instead of getting this one's error.
+        entry = _cache.get(lookup)
+        if entry is not None:
+            _cache.move_to_end(lookup)
+            fresh = time.monotonic() - entry.checked_at < PROMPT_CACHE_TTL_SECONDS
+            # Only the caller that starts a refresh waits for it.
+            if fresh or lookup in _inflight:
+                return entry.found
+        future = _start(lookup)
     try:
-        result = _fetch(lookup)
-    except Exception as exc:  # noqa: BLE001 - handed to the waiting caller
-        _retire(lookup)
-        future.set_exception(exc)
-    else:
-        _retire(lookup)
-        future.set_result(result)
+        found = future.result(timeout=COLD_FETCH_DEADLINE_SECONDS)
+    except Exception:
+        if entry is None:
+            raise
+        return entry.found
+    return found if found is not None or entry is None else entry.found
 
 
-def _retire(lookup: _Lookup) -> None:
-    with _inflight_lock:
+def _start(lookup: _Lookup) -> Future[RegistryVersion | None]:
+    """Start a worker for ``lookup`` unless one is running; hold the lock."""
+    if (future := _inflight.get(lookup)) is not None:
+        return future
+    future = _inflight[lookup] = Future()
+    try:
+        # A copy of the caller's context, for registry state such as Opik's
+        # prompt masks that context_key reads.
+        threading.Thread(
+            target=contextvars.copy_context().run,
+            args=(_resolve, lookup, future),
+            name="ol-llm-prompt-fetch",
+            daemon=True,
+        ).start()
+    except BaseException:
         del _inflight[lookup]
+        raise
+    return future
 
 
-_TRANSPORT_FAILURES = (
-    TimeoutError,
-    httpx.TimeoutException,
-    httpx.NetworkError,
-    httpx.RemoteProtocolError,
-    httpx.ProxyError,
-)
+def _resolve(lookup: _Lookup, future: Future[RegistryVersion | None]) -> None:
+    # Retired before it resolves, so a caller arriving later starts a fresh fetch
+    # instead of getting this one's error. A worker that promote_prompt evicted
+    # writes nothing, so a version fetched before the move is not cached after it.
+    try:
+        found = lookup.registry.fetch(
+            lookup.name, app=lookup.app, version=lookup.version, label=lookup.label
+        )
+    except Exception as exc:  # noqa: BLE001 - handed to the waiting caller
+        _settle(lookup, future, None, exc)
+        future.set_exception(exc)
+        return
+    _settle(lookup, future, found, None)
+    future.set_result(found)
 
 
-def _unreachable(exc: Exception) -> bool:
-    """Whether ``exc`` means Opik could not be reached, not that it said no.
+def _settle(
+    lookup: _Lookup,
+    future: Future[RegistryVersion | None],
+    found: RegistryVersion | None,
+    exc: Exception | None,
+) -> None:
+    """Record a fetch's outcome in the cache, unless promote_prompt evicted it.
 
-    Only transport failures, timeouts, and 5xx responses count. A 4xx from Opik,
-    or from Keycloak on the token request (``invalid_client`` for a wrong secret),
-    and a bad URL are configuration errors: falling back on them would hide the
-    error in every process, and the degraded mark could not reach Opik either,
-    since span export uses the same token.
+    A failed or empty refresh keeps the cached version and is tried again after
+    another TTL, not on every call.
     """
-    if isinstance(exc, _TRANSPORT_FAILURES):
-        return True
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.is_server_error
-    if isinstance(exc, ApiError):
-        return (
-            exc.status_code is not None
-            and exc.status_code >= httpx.codes.INTERNAL_SERVER_ERROR
-        )
-    return False
-
-
-def _structure(template: TextTemplate | ChatTemplate) -> Literal["text", "chat"]:
-    return "chat" if isinstance(template, ChatTemplate) else "text"
-
-
-def _prompt_from_detail(
-    name: str, detail: PromptVersionDetail, project_name: str
-) -> BasePrompt:
-    cls = opik.ChatPrompt if detail.template_structure == "chat" else opik.Prompt
-    return cls.from_fern_prompt_version(name, detail, project_name=project_name)
-
-
-def _template(prompt: BasePrompt) -> TextTemplate | ChatTemplate:
-    template_type: TemplateType = PromptType(prompt.type).value
-    if isinstance(prompt, opik.ChatPrompt):
-        return ChatTemplate(
-            messages=prompt.template, type=template_type, version=prompt.version
-        )
-    return TextTemplate(
-        template=cast("opik.Prompt", prompt).prompt,
-        type=template_type,
-        version=prompt.version,
+    with _inflight_lock:
+        if _inflight.get(lookup) is not future:
+            return
+        del _inflight[lookup]
+        now = time.monotonic()
+        if found is not None:
+            _cache[lookup] = _Entry(found, now)
+            _cache.move_to_end(lookup)
+            while len(_cache) > PROMPT_CACHE_MAX_ENTRIES:
+                _cache.popitem(last=False)
+            return
+        if (entry := _cache.get(lookup)) is None:
+            return
+        entry.checked_at = now
+    logger.warning(
+        "Could not refresh prompt %r (%s); serving the cached version",
+        lookup.name,
+        "not found" if exc is None else type(exc).__name__,
+        exc_info=exc,
     )

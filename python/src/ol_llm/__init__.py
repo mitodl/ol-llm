@@ -67,6 +67,7 @@ from ol_llm.policy import (
 from ol_llm.prompts import (
     ChatTemplate,
     ManagedPrompt,
+    PromptVariablesError,
     TemplateType,
     TextTemplate,
     create_prompt,
@@ -158,6 +159,7 @@ __all__ = [
     "ManagedPrompt",
     "PostProcessed",
     "Profile",
+    "PromptVariablesError",
     "Provenance",
     "RowFailure",
     "Settings",

@@ -1,12 +1,17 @@
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import opik
 import pytest
-from conftest import OPIK_KEYCLOAK, TOKEN_REPLY, PromptLibrary
+from conftest import OPIK_KEYCLOAK, TOKEN_REPLY, PromptLibrary, wait_for_fetches
 from ol_llm import (
     ChatTemplate,
+    PromptVariablesError,
     TextTemplate,
     create_prompt,
     get_prompt,
@@ -14,20 +19,25 @@ from ol_llm import (
     prompts,
     tracing,
 )
+from ol_llm.pointers import render_export
+from ol_llm.prompt_registry import (
+    FilePromptRegistry,
+    OpikPromptRegistry,
+    PromptRegistry,
+    RegistryUnavailableError,
+    RegistryVersion,
+    configure_prompt_registry,
+    prompt_registry,
+    register_prompt_registry,
+)
 from ol_llm.tracing import (
     KeycloakClient,
     KeycloakTokens,
     TracingConfig,
     configure_tracing,
 )
-from opik import context_storage
 from opik.api_objects.opik_client import reset_global_client
-from opik.api_objects.prompt import mask_context
-from opik.exceptions import (
-    EnvironmentNotFoundError,
-    PromptPlaceholdersDontMatchFormatArguments,
-    PromptTemplateStructureMismatch,
-)
+from opik.api_objects.prompt import PromptTemplate, PromptType, mask_context
 from opik.rest_api.core import ApiError
 
 PROJECT = "mit-learn"
@@ -44,60 +54,80 @@ def fetch(
     return get_prompt(name, app=PROJECT, default=default, **kwargs)
 
 
-def unreachable(exc: Exception) -> object:
-    def fail(_lookup: object) -> None:
+def failing(exc: Exception) -> Callable[..., None]:
+    """A replacement for Opik's retrieval that fails with ``exc``."""
+
+    def fail(*_args: object, **_kwargs: object) -> None:
         raise exc
 
     return fail
 
 
-def test_fetches_the_version_the_label_points_at(
-    prompt_library: PromptLibrary,
-) -> None:
-    prompt_library.add("summary", "Summarize {{text}}.", environments=("production",))
-    prompt_library.add("summary", "Summarize {{text}} briefly.")
+# The reads every registry serves: the version production runs, by its label and
+# by its version. Each test runs against Opik and against committed exports.
+
+Publish = Callable[[str, "str | list[dict[str, Any]]", str], None]
+
+
+@pytest.fixture(params=["opik", "file"])
+def publish(
+    request: pytest.FixtureRequest, prompt_library: PromptLibrary, tmp_path: Path
+) -> Publish:
+    """Make a prompt's production version ``v1`` in the parametrized registry."""
+
+    def to_opik(name: str, template: str | list[dict[str, Any]], kind: str) -> None:
+        prompt_library.add(name, template, type=kind, environments=("production",))
+
+    def to_files(name: str, template: str | list[dict[str, Any]], kind: str) -> None:
+        exported = (
+            TextTemplate(template=template, type=kind, version="v1")  # type: ignore[arg-type]
+            if isinstance(template, str)
+            else ChatTemplate(messages=template, type=kind, version="v1")  # type: ignore[arg-type]
+        )
+        (tmp_path / f"{name}.prompt.yaml").write_text(
+            render_export(name, PROJECT, exported), encoding="utf-8"
+        )
+
+    if request.param == "file":
+        configure_prompt_registry(FilePromptRegistry(tmp_path))
+        return to_files
+    return to_opik
+
+
+def test_fetches_the_production_version(publish: Publish) -> None:
+    publish("summary", "Summarize {{text}}.", "mustache")
 
     prompt = fetch(environment="production")
 
-    assert prompt.source == "registry"
-    assert prompt.version == "v1"
+    assert (prompt.source, prompt.version) == ("registry", "v1")
     assert prompt.degraded_reasons == ()
     assert prompt.format(text="this") == "Summarize this."
 
 
-def test_the_label_defaults_to_the_deployment_environment(
-    prompt_library: PromptLibrary,
-) -> None:
-    prompt_library.environments.add("ci")
-    prompt_library.add("summary", "Summarize {{text}}.", environments=("production",))
-    prompt_library.add("summary", "Summarize {{text}} for CI.", environments=("ci",))
+def test_fetches_a_pinned_version(publish: Publish) -> None:
+    publish("summary", "Summarize {{text}}.", "mustache")
 
-    assert fetch().version == "v2"
+    assert fetch(version="v1").template.template == "Summarize {{text}}."
+    with pytest.raises(LookupError, match="version v2"):
+        fetch(version="v2")
 
 
-def test_a_pinned_version(prompt_library: PromptLibrary) -> None:
-    prompt_library.add("summary", "one {{text}}")
-    prompt_library.add("summary", "two {{text}}", environments=("production",))
+def test_a_label_on_no_version_raises(publish: Publish) -> None:
+    publish("summary", "Summarize {{text}}.", "mustache")
 
-    prompt = fetch(version="v1")
-
-    assert (prompt.version, prompt.template.template) == ("v1", "one {{text}}")
+    with pytest.raises(LookupError, match="environment qa"):
+        fetch(environment="qa")
 
 
-def test_environment_and_version_together_are_refused() -> None:
-    with pytest.raises(ValueError, match="not both"):
-        fetch(environment="production", version="v1")
+def test_another_apps_prompt_is_not_found(publish: Publish) -> None:
+    publish("summary", "Summarize {{text}}.", "mustache")
+
+    with pytest.raises(LookupError, match="'learn-ai'"):
+        get_prompt("summary", app="learn-ai", default=DEFAULT, environment="production")
 
 
-def test_a_missing_label_raises(prompt_library: PromptLibrary) -> None:
-    prompt_library.add("summary", "Summarize {{text}}.")
-
-    with pytest.raises(LookupError, match="environment production"):
-        fetch(environment="production")
-
-
-def test_a_chat_prompt_renders_every_message(prompt_library: PromptLibrary) -> None:
-    prompt_library.add("tutor", CHAT, environments=("production",))
+def test_a_chat_prompt_renders_every_message(publish: Publish) -> None:
+    publish("tutor", CHAT, "mustache")
 
     prompt = get_prompt(
         "tutor",
@@ -113,20 +143,18 @@ def test_a_chat_prompt_renders_every_message(prompt_library: PromptLibrary) -> N
     ]
 
 
-def test_a_default_of_the_other_structure_raises(
-    prompt_library: PromptLibrary,
-) -> None:
-    prompt_library.add("tutor", CHAT, environments=("production",))
+def test_a_default_of_the_other_structure_raises(publish: Publish) -> None:
+    publish("tutor", CHAT, "mustache")
 
-    with pytest.raises(PromptTemplateStructureMismatch):
+    with pytest.raises(TypeError, match="chat prompt"):
         fetch("tutor", environment="production")
 
 
 def test_a_jinja2_prompt_renders_the_same_fetched_or_embedded(
-    prompt_library: PromptLibrary,
+    publish: Publish,
 ) -> None:
     template = "{% for item in items %}- {{ item }}\n{% endfor %}"
-    prompt_library.add("summary", template, type="jinja2", environments=("production",))
+    publish("summary", template, "jinja2")
     embedded = TextTemplate(template=template, type="jinja2")
 
     fetched = fetch(default=embedded, environment="production")
@@ -136,24 +164,116 @@ def test_a_jinja2_prompt_renders_the_same_fetched_or_embedded(
     assert embedded.format(items=["a", "b"]) == "- a\n- b\n"
 
 
-def test_a_chat_template_keeps_its_media() -> None:
+def test_the_hash_matches_the_embedded_default(publish: Publish) -> None:
+    publish("summary", DEFAULT.template, "mustache")
+
+    assert fetch(environment="production").template_hash == DEFAULT.template_hash
+
+
+def test_the_label_defaults_to_the_deployment_environment(
+    prompt_library: PromptLibrary,
+) -> None:
+    prompt_library.environments.add("ci")
+    prompt_library.add("summary", "Summarize {{text}}.", environments=("production",))
+    prompt_library.add("summary", "Summarize {{text}} for CI.", environments=("ci",))
+
+    assert fetch().version == "v2"
+
+
+def test_a_pinned_version_among_several(prompt_library: PromptLibrary) -> None:
+    prompt_library.add("summary", "one {{text}}")
+    prompt_library.add("summary", "two {{text}}", environments=("production",))
+
+    prompt = fetch(version="v1")
+
+    assert (prompt.version, prompt.template.template) == ("v1", "one {{text}}")
+
+
+def test_environment_and_version_together_are_refused() -> None:
+    with pytest.raises(ValueError, match="not both"):
+        fetch(environment="production", version="v1")
+
+
+# Rendering. Mustache matches Opik's, so a version already in Opik renders as it
+# did when Opik rendered it.
+
+
+@pytest.mark.parametrize(
+    ("template", "variables"),
+    [
+        ("Hi {{name}}.", {"name": "Ada"}),
+        ("Hi {{ name }} and {{name}}.", {"name": "Ada"}),
+        ("Hi {{name}}.", {" name ": "Ada"}),
+        ('JSON: {"a": {{{value}}}}', {"value": "1"}),
+        ("{{a}}{{b}}", {"a": "{{b}}", "b": "x"}),
+        ("Nothing: [{{gone}}]", {"gone": None}),
+        ("Number {{n}}", {"n": 3}),
+        ("No placeholders {single} {{}}", {"": "empty"}),
+    ],
+)
+def test_mustache_renders_as_opik_does(
+    template: str, variables: dict[str, Any]
+) -> None:
+    ours = TextTemplate(template=template).format(**variables)
+
+    assert ours == PromptTemplate(template).format(**variables)
+
+
+def test_jinja2_renders_in_a_sandbox() -> None:
+    template = TextTemplate(template="{{ x.__class__ }}", type="jinja2")
+
+    assert template.format(x=1) == PromptTemplate(
+        "{{ x.__class__ }}", type=PromptType.JINJA2
+    ).format(x=1)
+
+
+def test_a_chat_template_keeps_its_media_and_other_keys() -> None:
     image = {
         "type": "image_url",
-        "image_url": {"url": "https://example.com/{{name}}.png"},
+        "image_url": {"url": "https://example.com/{{name}}.png", "detail": "high"},
     }
     video = {"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}
     template = ChatTemplate(
         messages=[
-            {"role": "user", "content": [{"type": "text", "text": "Hi"}, image, video]}
+            {
+                "role": "user",
+                "name": "learner",
+                "content": [{"type": "text", "text": "Hi {{name}}"}, image, video],
+            }
         ]
     )
 
     [message] = template.format(name="cat")
 
-    assert message["content"][1:] == [
-        {"type": "image_url", "image_url": {"url": "https://example.com/cat.png"}},
-        video,
-    ]
+    assert message == {
+        "role": "user",
+        "name": "learner",
+        "content": [
+            {"type": "text", "text": "Hi cat"},
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/cat.png", "detail": "high"},
+            },
+            video,
+        ],
+    }
+
+
+def test_a_media_part_whose_url_renders_empty_is_left_out() -> None:
+    image = {"type": "image_url", "image_url": {"url": "{{image}}"}}
+    no_url = {"type": "image_url", "image_url": {"detail": "high"}}
+    template = ChatTemplate(
+        messages=[
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "Hi"}, image, no_url],
+            }
+        ]
+    )
+
+    [message] = template.format(image="")
+
+    assert message["content"] == [{"type": "text", "text": "Hi"}]
 
 
 @pytest.mark.parametrize(
@@ -163,8 +283,25 @@ def test_a_chat_template_keeps_its_media() -> None:
 def test_mustache_variables_must_match_the_placeholders(
     template: TextTemplate | ChatTemplate,
 ) -> None:
-    with pytest.raises(PromptPlaceholdersDontMatchFormatArguments):
+    with pytest.raises(PromptVariablesError, match=r"unexpected \['nobody'\]"):
         template.format(nobody="here")
+
+
+def test_a_media_url_placeholder_must_be_passed() -> None:
+    template = ChatTemplate(
+        messages=[
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": "{{url}}"}}],
+            }
+        ]
+    )
+
+    with pytest.raises(PromptVariablesError, match=r"missing \['url'\]"):
+        template.format()
+
+
+# Outages and refusals, against Opik.
 
 
 @pytest.mark.parametrize(
@@ -177,7 +314,7 @@ def test_mustache_variables_must_match_the_placeholders(
 def test_a_cold_fetch_with_opik_unreachable_uses_the_embedded_default(
     monkeypatch: pytest.MonkeyPatch, exc: Exception
 ) -> None:
-    monkeypatch.setattr(prompts, "_fetch", unreachable(exc))
+    monkeypatch.setattr(OpikPromptRegistry, "_retrieve", failing(exc))
 
     prompt = fetch(environment="production")
 
@@ -189,15 +326,15 @@ def test_a_cold_fetch_with_opik_unreachable_uses_the_embedded_default(
 
 def test_a_refusal_from_opik_is_not_an_outage(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        prompts, "_fetch", unreachable(ApiError(status_code=401, body="no"))
+        OpikPromptRegistry, "_retrieve", failing(ApiError(status_code=401, body="no"))
     )
 
     with pytest.raises(ApiError):
         fetch(environment="production")
 
 
-def keycloak_answering(status: int) -> object:
-    """A fetch whose token request gets ``status`` from Keycloak."""
+def keycloak_answering(status: int) -> Callable[..., None]:
+    """A retrieval whose token request gets ``status`` from Keycloak."""
     tokens = KeycloakTokens(
         KeycloakClient(
             token_url="https://keycloak.example/token",
@@ -211,7 +348,7 @@ def keycloak_answering(status: int) -> object:
         ),
     )
 
-    def fetch_with_token(_lookup: object) -> None:
+    def fetch_with_token(*_args: object, **_kwargs: object) -> None:
         tokens.token()
 
     return fetch_with_token
@@ -220,7 +357,7 @@ def keycloak_answering(status: int) -> object:
 def test_a_keycloak_refusal_on_a_cold_fetch_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(prompts, "_fetch", keycloak_answering(401))
+    monkeypatch.setattr(OpikPromptRegistry, "_retrieve", keycloak_answering(401))
 
     with pytest.raises(httpx.HTTPStatusError, match="401"):
         fetch(environment="production")
@@ -229,18 +366,30 @@ def test_a_keycloak_refusal_on_a_cold_fetch_raises(
 def test_keycloak_down_on_a_cold_fetch_is_an_outage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(prompts, "_fetch", keycloak_answering(503))
+    monkeypatch.setattr(OpikPromptRegistry, "_retrieve", keycloak_answering(503))
 
     assert fetch(environment="production").degraded_reasons == ("embedded_prompt",)
 
 
 def test_a_bad_url_is_not_an_outage(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        prompts, "_fetch", unreachable(httpx.UnsupportedProtocol("opik://"))
+        OpikPromptRegistry, "_retrieve", failing(httpx.UnsupportedProtocol("opik://"))
     )
 
     with pytest.raises(httpx.UnsupportedProtocol):
         fetch(environment="production")
+
+
+def test_fetch_prompt_does_not_fall_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        OpikPromptRegistry, "_retrieve", failing(httpx.ConnectError("refused"))
+    )
+
+    with pytest.raises(RegistryUnavailableError):
+        prompts.fetch_prompt("summary", app=PROJECT, environment="production")
+
+
+# The cache, the deadline, and the background refresh.
 
 
 def test_a_worker_that_cannot_start_leaves_nothing_in_flight(
@@ -261,30 +410,39 @@ def test_a_worker_that_cannot_start_leaves_nothing_in_flight(
     assert fetch(environment="production").source == "registry"
 
 
-def test_the_worker_sees_the_callers_masks_but_not_its_trace(
-    monkeypatch: pytest.MonkeyPatch,
+def test_a_fetch_inside_a_mask_context_returns_the_masked_version(
+    prompt_library: PromptLibrary,
 ) -> None:
-    seen: list[object] = []
+    prompt_library.add("summary", "Summarize {{text}}.", environments=("production",))
+    masked = prompt_library.add("summary", "Masked {{text}}.")
+    [unmasked] = [
+        v for v in prompt_library.prompts[PROJECT, "summary"] if v["id"] != masked["id"]
+    ]
 
-    def record(_lookup: object) -> None:
-        seen.extend(
-            [mask_context.get_active_prompt_masks(), context_storage.get_trace_data()]
+    with mask_context.prompt_mask_context({unmasked["prompt_id"]: masked["id"]}):
+        inside = fetch(environment="production")
+    outside = fetch(environment="production")
+
+    assert inside.template.template == "Masked {{text}}."
+    assert outside.template.template == "Summarize {{text}}."
+
+
+def test_a_masked_chat_prompt_stays_chat(prompt_library: PromptLibrary) -> None:
+    prompt_library.add("tutor", CHAT, environments=("production",))
+    masked = prompt_library.add("tutor", [{"role": "system", "content": "Masked"}])
+    [unmasked] = [
+        v for v in prompt_library.prompts[PROJECT, "tutor"] if v["id"] != masked["id"]
+    ]
+
+    with mask_context.prompt_mask_context({unmasked["prompt_id"]: masked["id"]}):
+        prompt = get_prompt(
+            "tutor",
+            app=PROJECT,
+            default=ChatTemplate(messages=[]),
+            environment="production",
         )
 
-    monkeypatch.setattr(prompts, "_fetch", record)
-
-    @opik.track(project_name=PROJECT)
-    def handler() -> None:
-        with (
-            mask_context.prompt_mask_context({"prompt-id": "mask-id"}),
-            pytest.raises(LookupError),
-        ):
-            fetch(environment="production")
-
-    with opik.record_traces_locally():
-        handler()
-
-    assert seen == [{"prompt-id": "mask-id"}, None]
+    assert prompt.template.messages == [{"role": "system", "content": "Masked"}]
 
 
 def test_a_slow_cold_fetch_falls_back_and_then_fills_the_cache(
@@ -295,9 +453,7 @@ def test_a_slow_cold_fetch_falls_back_and_then_fills_the_cache(
     monkeypatch.setattr(prompts, "COLD_FETCH_DEADLINE_SECONDS", 0.05)
 
     first = fetch(environment="production")
-    deadline = time.monotonic() + 5
-    while prompts._inflight and time.monotonic() < deadline:  # noqa: SLF001
-        time.sleep(0.05)
+    wait_for_fetches()
     second = fetch(environment="production")
 
     assert first.degraded_reasons == ("embedded_prompt",)
@@ -305,19 +461,126 @@ def test_a_slow_cold_fetch_falls_back_and_then_fills_the_cache(
     assert prompt_library.retrievals == 1
 
 
-def test_a_cached_prompt_is_served_while_opik_is_down(
-    monkeypatch: pytest.MonkeyPatch, prompt_library: PromptLibrary
+def test_a_cached_prompt_is_served_without_a_fetch(
+    prompt_library: PromptLibrary,
 ) -> None:
     prompt_library.add("summary", "Summarize {{text}}.", environments=("production",))
     fetch(environment="production")
     prompt_library.reset()
-    monkeypatch.setattr(prompts, "COLD_FETCH_DEADLINE_SECONDS", 0.05)
-    prompt_library.delay_seconds = 1
 
     prompt = fetch(environment="production")
 
     assert (prompt.source, prompt.version) == ("registry", "v1")
     assert prompt_library.retrievals == 0
+
+
+def make_stale() -> None:
+    for entry in prompts._cache.values():  # noqa: SLF001
+        entry.checked_at -= prompts.PROMPT_CACHE_TTL_SECONDS + 1
+
+
+def test_a_stale_prompt_is_served_while_opik_is_down(
+    monkeypatch: pytest.MonkeyPatch, prompt_library: PromptLibrary
+) -> None:
+    prompt_library.add("summary", "Summarize {{text}}.", environments=("production",))
+    fetch(environment="production")
+    make_stale()
+    attempts: list[object] = []
+
+    def refused(*_args: object, **_kwargs: object) -> None:
+        attempts.append(None)
+        msg = "refused"
+        raise httpx.ConnectError(msg)
+
+    monkeypatch.setattr(OpikPromptRegistry, "_retrieve", refused)
+
+    served = [fetch(environment="production") for _ in range(3)]
+
+    for prompt in served:
+        assert (prompt.source, prompt.version, prompt.degraded_reasons) == (
+            "registry",
+            "v1",
+            (),
+        )
+    # Tried again after another TTL, not on every call.
+    assert len(attempts) == 1
+
+
+def test_a_stale_prompt_is_kept_when_its_label_is_gone(
+    prompt_library: PromptLibrary,
+) -> None:
+    prompt_library.add("summary", "Summarize {{text}}.", environments=("production",))
+    fetch(environment="production")
+    for version in prompt_library.prompts[PROJECT, "summary"]:
+        version["environments"] = []
+    make_stale()
+
+    assert fetch(environment="production").version == "v1"
+
+
+def test_a_stale_prompt_is_fetched_again_on_the_next_call(
+    prompt_library: PromptLibrary,
+) -> None:
+    prompt_library.add("summary", "one {{text}}", environments=("production",))
+    fetch(environment="production")
+    # Someone moves the label in the Opik UI.
+    prompt_library.add("summary", "two {{text}}", environments=("production",))
+    make_stale()
+
+    assert fetch(environment="production").version == "v2"
+
+
+def test_a_slow_refresh_serves_the_stale_prompt(
+    monkeypatch: pytest.MonkeyPatch, prompt_library: PromptLibrary
+) -> None:
+    prompt_library.add("summary", "one {{text}}", environments=("production",))
+    fetch(environment="production")
+    prompt_library.add("summary", "two {{text}}", environments=("production",))
+    make_stale()
+    prompt_library.delay_seconds = 0.3
+    monkeypatch.setattr(prompts, "COLD_FETCH_DEADLINE_SECONDS", 0.05)
+
+    stale = fetch(environment="production")
+    wait_for_fetches()
+    fresh = fetch(environment="production")
+
+    assert (stale.version, fresh.version) == ("v1", "v2")
+
+
+def test_only_the_caller_that_starts_a_refresh_waits_for_it(
+    monkeypatch: pytest.MonkeyPatch, prompt_library: PromptLibrary
+) -> None:
+    prompt_library.add("summary", "one {{text}}", environments=("production",))
+    fetch(environment="production")
+    make_stale()
+    prompt_library.delay_seconds = 1
+    monkeypatch.setattr(prompts, "COLD_FETCH_DEADLINE_SECONDS", 0.2)
+    fetch(environment="production")
+
+    started = time.monotonic()
+    prompt = fetch(environment="production")
+
+    assert prompt.version == "v1"
+    assert time.monotonic() - started < 0.1
+
+
+def test_the_cache_keeps_the_most_recently_used(
+    monkeypatch: pytest.MonkeyPatch, prompt_library: PromptLibrary
+) -> None:
+    monkeypatch.setattr(prompts, "PROMPT_CACHE_MAX_ENTRIES", 2)
+    for text in ("one", "two", "three"):
+        prompt_library.add("summary", f"{text} {{{{text}}}}")
+    fetch(version="v1")
+    fetch(version="v2")
+    fetch(version="v1")
+    fetch(version="v3")
+    prompt_library.retrievals = 0
+
+    fetch(version="v1")
+    fetch(version="v3")
+    fetch(version="v2")
+
+    assert prompt_library.retrievals == 1
 
 
 def test_with_tracing_off_the_embedded_default_is_used_unmarked(
@@ -333,7 +596,7 @@ def test_with_tracing_off_the_embedded_default_is_used_unmarked(
     assert prompt_library.retrievals == 0
 
 
-def test_with_tracing_off_an_sdk_fetch_still_sends_the_keycloak_token(
+def test_with_tracing_off_a_fetch_still_sends_the_keycloak_token(
     prompt_library: PromptLibrary,
 ) -> None:
     tracing.reset()
@@ -373,14 +636,18 @@ def test_the_hash_follows_the_text_not_where_it_came_from(
 ) -> None:
     prompt_library.add("summary", DEFAULT.template, environments=("production",))
     fetched = fetch(environment="production")
-    monkeypatch.setattr(prompts, "_fetch", unreachable(httpx.ConnectError("down")))
-    prompt_library.reset()
+    monkeypatch.setattr(
+        OpikPromptRegistry, "_retrieve", failing(httpx.ConnectError("down"))
+    )
     fallback = fetch("other", environment="production")
     edited = fetch(default=TextTemplate(template="Summarize {{text}}!"), version="v9")
 
     assert fetched.source != fallback.source
     assert fetched.template_hash == fallback.template_hash
     assert fetched.template_hash != edited.template_hash
+
+
+# Writing versions and moving labels.
 
 
 def test_create_prompt_adds_a_version_only_on_change(
@@ -431,6 +698,15 @@ def test_create_prompt_for_a_chat_prompt(prompt_library: PromptLibrary) -> None:
     assert prompt_library.versions("tutor") == ["v1"]
 
 
+def test_create_prompt_of_the_other_structure_raises(
+    prompt_library: PromptLibrary,
+) -> None:
+    prompt_library.add("tutor", CHAT)
+
+    with pytest.raises(TypeError):
+        create_prompt("tutor", TextTemplate(template="Hi"), app=PROJECT)
+
+
 def test_promote_keeps_the_versions_other_labels(
     prompt_library: PromptLibrary,
 ) -> None:
@@ -455,10 +731,142 @@ def test_promote_reaches_the_next_fetch_in_this_process(
     assert fetch(environment="production").version == "v2"
 
 
-def test_promote_to_an_unregistered_environment_raises(
+def test_promote_registers_an_unregistered_environment(
     prompt_library: PromptLibrary,
 ) -> None:
     prompt_library.add("summary", "one")
 
-    with pytest.raises(EnvironmentNotFoundError):
-        promote_prompt("summary", version="v1", environment="ci", app=PROJECT)
+    promote_prompt("summary", version="v1", environment="ci", app=PROJECT)
+
+    assert "ci" in prompt_library.environments
+    assert prompt_library.labels("summary") == {"v1": ["ci"]}
+
+
+def test_promote_to_a_missing_version_raises(prompt_library: PromptLibrary) -> None:
+    prompt_library.add("summary", "one")
+
+    with pytest.raises(LookupError):
+        promote_prompt("summary", version="v2", environment="production", app=PROJECT)
+
+
+# The file registry and choosing a registry by name.
+
+
+@dataclass
+class DataclassRegistry(PromptRegistry):
+    """A registry an app might write: a plain dataclass, so not hashable."""
+
+    inner: FilePromptRegistry
+
+    def fetch(self, name: str, **kwargs: Any) -> RegistryVersion | None:  # noqa: ANN401
+        return self.inner.fetch(name, **kwargs)
+
+    def move_label(self, name: str, *, app: str, version: str, label: str) -> None:
+        raise NotImplementedError
+
+    def create_version(
+        self,
+        name: str,
+        template: TextTemplate | ChatTemplate,
+        *,
+        app: str,
+        change_description: str | None = None,
+    ) -> RegistryVersion:
+        raise NotImplementedError
+
+
+def test_a_registry_need_not_be_hashable(tmp_path: Path) -> None:
+    (tmp_path / "summary.prompt.yaml").write_text(
+        render_export("summary", PROJECT, DEFAULT), encoding="utf-8"
+    )
+    registry = DataclassRegistry(FilePromptRegistry(tmp_path))
+    with pytest.raises(TypeError, match="unhashable"):
+        hash(registry)
+    configure_prompt_registry(registry)
+
+    first = fetch(environment="production")
+    again = fetch(environment="production")
+
+    assert (first.version, again.version) == ("v1", "v1")
+
+
+def test_the_file_registry_is_read_only(tmp_path: Path) -> None:
+    registry = FilePromptRegistry(tmp_path)
+
+    with pytest.raises(NotImplementedError):
+        registry.move_label("summary", app=PROJECT, version="v1", label="production")
+    with pytest.raises(NotImplementedError):
+        registry.create_version("summary", DEFAULT, app=PROJECT)
+
+
+def test_the_file_registry_serves_the_labels_it_is_given(tmp_path: Path) -> None:
+    (tmp_path / "summary.prompt.yaml").write_text(
+        render_export("summary", PROJECT, DEFAULT), encoding="utf-8"
+    )
+    registry = FilePromptRegistry(tmp_path, labels=("production", "development"))
+
+    assert registry.label_version("summary", app=PROJECT, label="development") == "v1"
+    assert registry.label_version("summary", app=PROJECT, label="qa") is None
+
+
+def test_the_registry_is_chosen_by_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OL_LLM_PROMPT_REGISTRY", "file")
+    monkeypatch.setenv("OL_LLM_PROMPT_REGISTRY_PATH", str(tmp_path))
+
+    registry = prompt_registry()
+
+    assert isinstance(registry, FilePromptRegistry)
+    assert registry.directory == tmp_path
+
+
+def test_the_file_registry_serves_the_configured_labels(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    (tmp_path / "summary.prompt.yaml").write_text(
+        render_export("summary", PROJECT, DEFAULT), encoding="utf-8"
+    )
+    monkeypatch.setenv("OL_LLM_PROMPT_REGISTRY", "file")
+    monkeypatch.setenv("OL_LLM_PROMPT_REGISTRY_PATH", str(tmp_path))
+    monkeypatch.setenv("OL_LLM_PROMPT_REGISTRY_LABELS", "production, ci")
+
+    # The label defaults to Settings.environment, ci in these tests.
+    prompt = fetch()
+
+    assert (prompt.source, prompt.version) == ("registry", "v1")
+
+
+def test_the_default_registry_is_opik() -> None:
+    assert isinstance(prompt_registry(), OpikPromptRegistry)
+
+
+def test_a_registered_registry_is_chosen_by_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    built = FilePromptRegistry(tmp_path)
+
+    def factory(_env: object) -> PromptRegistry:
+        return built
+
+    register_prompt_registry("custom", factory)
+    monkeypatch.setenv("OL_LLM_PROMPT_REGISTRY", "custom")
+
+    assert prompt_registry() is built
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        ({"OL_LLM_PROMPT_REGISTRY": "nowhere"}, "No prompt registry named 'nowhere'"),
+        ({"OL_LLM_PROMPT_REGISTRY": "file"}, "OL_LLM_PROMPT_REGISTRY_PATH"),
+    ],
+)
+def test_a_registry_that_cannot_be_built_raises(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, str], message: str
+) -> None:
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=message):
+        prompt_registry()

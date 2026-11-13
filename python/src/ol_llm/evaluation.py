@@ -75,6 +75,7 @@ from ol_llm import tracing
 from ol_llm.catalog import load_catalog
 from ol_llm.errors import LLMError
 from ol_llm.policy import UseCase
+from ol_llm.prompt_registry.opik_registry import opik_prompt
 from ol_llm.prompts import ManagedPrompt
 from ol_llm.runs import LLMResult, complete, complete_sync
 from ol_llm.settings import get_settings
@@ -621,16 +622,17 @@ def evaluate(  # noqa: PLR0913
     :param experiment_tags: tags beside the app and environment ones.
     :returns: Opik's result, with the experiment's id and URL.
     :rtype: EvaluationResult
-    :raises ValueError: if ``prompts`` is empty or holds an embedded default,
-        which has no Opik version to link.
+    :raises ValueError: if ``prompts`` is empty or holds an embedded default or
+        a version from another registry, which has no Opik version to link.
     """
     if not prompts:
         msg = "Pass every managed prompt the task uses, so the experiment links them"
         raise ValueError(msg)
-    if embedded := [p.name for p in prompts if p.registry_ref is None]:
+    linked = {p.name: opik_prompt(p.registry_ref) for p in prompts}
+    if unlinked := [name for name, prompt in linked.items() if prompt is None]:
         msg = (
-            f"Prompts {embedded} are embedded defaults, not Opik versions; an "
-            "evaluation needs Opik reachable to link what it ran"
+            f"Prompts {unlinked} are not Opik versions (embedded defaults, or from "
+            "another prompt registry); an evaluation links the Opik versions it ran"
         )
         raise ValueError(msg)
     environment = get_settings().environment
@@ -643,7 +645,7 @@ def evaluate(  # noqa: PLR0913
         scoring_metrics=[_guard_metric(metric) for metric in metrics],
         experiment_name=experiment_name,
         experiment_config={"environment": environment, **(experiment_config or {})},
-        prompts=[p.registry_ref for p in prompts if p.registry_ref is not None],
+        prompts=[prompt for prompt in linked.values() if prompt is not None],
         scoring_key_mapping=dict(scoring_key_mapping or {}),
         experiment_tags=[
             f"app:{project_name}",

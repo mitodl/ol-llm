@@ -16,8 +16,9 @@ from typing import Any
 
 import ol_llm.catalog as catalog_module
 import pytest
-from ol_llm import GatewayRoute, UseCase, loops, models, tracing
+from ol_llm import GatewayRoute, UseCase, loops, models, prompts, tracing
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
+from ol_llm.prompt_registry import configure_prompt_registry
 from ol_llm.settings import Settings, configure
 from ol_llm.tracing import KeycloakClient, TracingConfig, configure_tracing
 from opentelemetry.sdk.trace import ReadableSpan
@@ -26,7 +27,6 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
 from opik import context_storage
-from opik.api_objects.prompt import prompt_cache
 from opik.message_processing.emulation.models import TraceModel
 from pydantic_ai.messages import (
     ModelMessage,
@@ -39,6 +39,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 _PROMPTS = "/api/v1/private/prompts/versions"
 _ENVIRONMENTS = re.compile(rf"{_PROMPTS}/(?P<id>[^/]+)/environments")
+_WORKSPACE_ENVIRONMENTS = "/api/v1/private/environments"
 
 
 class PromptLibrary:
@@ -55,6 +56,7 @@ class PromptLibrary:
         with self._lock:
             self.prompts: dict[tuple[str | None, str], list[dict[str, Any]]] = {}
             self.environments = {"development", "staging", "production"}
+            self.environment_ids: dict[str, str] = {}
             self.retrievals = 0
             self.delay_seconds = 0.0
             self.authorizations: list[str | None] = []
@@ -95,15 +97,21 @@ class PromptLibrary:
                 for v in self.prompts[project_name, name]
             }
 
-    def handle(
+    def handle(  # noqa: PLR0911 - one branch per endpoint
         self, method: str, path: str, body: bytes, authorization: str | None
     ) -> tuple[int, Any] | None:
         """Answer a prompt request, or return ``None`` for any other path."""
+        if path.startswith(_WORKSPACE_ENVIRONMENTS):
+            return self._environment(method, path, body)
         if not path.startswith(_PROMPTS):
             return None
         with self._lock:
             self.authorizations.append(authorization)
-        request = json.loads(gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body)
+        request = (
+            json.loads(gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body)
+            if body
+            else {}
+        )
         if method == "POST" and path == f"{_PROMPTS}/retrieve":
             time.sleep(self.delay_seconds)
             with self._lock:
@@ -122,6 +130,8 @@ class PromptLibrary:
                 )
             if method == "PATCH" and (match := _ENVIRONMENTS.fullmatch(path)):
                 return self._label(match["id"], request["environments"])
+            if method == "GET":
+                return self._by_id(path.removeprefix(f"{_PROMPTS}/"))
         return 404, {"errors": [f"no fake for {method} {path}"]}
 
     def _create(  # noqa: PLR0913
@@ -153,6 +163,35 @@ class PromptLibrary:
         versions.append(detail)
         self._label(version_id, environments)
         return detail
+
+    def _environment(self, method: str, path: str, body: bytes) -> tuple[int, Any]:
+        """Register an environment, or read one back by id, as the SDK does."""
+        with self._lock:
+            if method == "POST" and path == _WORKSPACE_ENVIRONMENTS:
+                request = json.loads(body)
+                if request["name"] in self.environments:
+                    return 409, {"errors": ["environment exists"]}
+                self.environments.add(request["name"])
+                self.environment_ids[request["id"]] = request["name"]
+                return 201, None
+            environment_id = path.removeprefix(f"{_WORKSPACE_ENVIRONMENTS}/")
+            if method == "GET" and environment_id in self.environment_ids:
+                return 200, {
+                    "id": environment_id,
+                    "name": self.environment_ids[environment_id],
+                }
+        return 404, {"errors": [f"no fake for {method} {path}"]}
+
+    def _by_id(self, version_id: str) -> tuple[int, Any]:
+        # Without template_structure: the SDK treats it as the prompt's field,
+        # which a version read by id may not carry.
+        for versions in self.prompts.values():
+            for version in versions:
+                if version["id"] == version_id:
+                    return 200, {
+                        k: v for k, v in version.items() if k != "template_structure"
+                    }
+        return 404, {"errors": ["version not found"]}
 
     def _retrieve(self, request: dict[str, Any]) -> tuple[int, Any]:
         versions = self.prompts.get((request.get("project_name"), request["name"]), [])
@@ -305,6 +344,28 @@ def assert_error_kept_without_content(
     assert text not in repr(trace)
     assert spans
     assert not [span.name for span in spans if text in span.to_json()]
+
+
+def wait_for_fetches() -> None:
+    """Wait up to five seconds for every prompt fetch in flight to finish."""
+    deadline = time.monotonic() + 5
+    while prompts._inflight and time.monotonic() < deadline:  # noqa: SLF001
+        time.sleep(0.01)
+
+
+@pytest.fixture(autouse=True)
+def default_prompt_registry() -> Generator[None]:
+    """Each test starts on the environment's registry (Opik) with nothing cached.
+
+    A fetch that outlived its test's deadline is waited for, so it cannot reach
+    the next test's fake Opik.
+    """
+    configure_prompt_registry(None)
+    prompts._cache.clear()  # noqa: SLF001
+    yield
+    wait_for_fetches()
+    configure_prompt_registry(None)
+    prompts._cache.clear()  # noqa: SLF001
 
 
 @pytest.fixture(autouse=True)
@@ -513,11 +574,9 @@ def real_client(
 
 @pytest.fixture
 def prompt_library() -> Generator[PromptLibrary]:
-    """Opik's prompt library, empty, with the SDK's prompt cache cleared."""
+    """Opik's prompt library, empty."""
     PROMPTS.reset()
-    prompt_cache.get_global_cache().clear()
     yield PROMPTS
-    prompt_cache.get_global_cache().clear()
     PROMPTS.reset()
 
 

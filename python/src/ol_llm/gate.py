@@ -103,6 +103,7 @@ from ol_llm.evaluation import (
     seed_dataset,
 )
 from ol_llm.pointers import PointerError, PromptName, PromptPointers, VersionName
+from ol_llm.prompt_registry.opik_registry import opik_version_id
 from ol_llm.prompts import ManagedPrompt, fetch_prompt
 
 if TYPE_CHECKING:
@@ -778,16 +779,14 @@ def find_baseline(
     :rtype: tuple[Baseline | None, str | None]
     """
     production: dict[str, ManagedPrompt[Any]] = {}
+    wanted: set[str] = set()
     for name in declaration.prompts:
         prompt = fetch_prompt(name, app=declaration.app, environment=PRODUCTION_LABEL)
-        if prompt is None or prompt.registry_ref is None:
+        version_id = None if prompt is None else opik_version_id(prompt.registry_ref)
+        if prompt is None or version_id is None:
             return None, f"no version of `{name}` carries the production label."
         production[name] = prompt
-    wanted = {
-        p.registry_ref.__internal_api__version_id__
-        for p in production.values()
-        if p.registry_ref is not None
-    }
+        wanted.add(version_id)
     versions = _versions(
         {name: prompt.version or "" for name, prompt in production.items()}
     )
