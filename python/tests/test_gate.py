@@ -1115,6 +1115,44 @@ def test_the_gate_command_fails_a_gate_that_cannot_run(
     assert f"has no dataset '{DATASET}'" in text
 
 
+def misnamed_suite(context: GateContext) -> Suite:
+    """A suite whose validator names an input nothing provides."""
+    built = suite(context)
+    return Suite(
+        task=built.task,
+        metrics=[
+            ValidatorMetric(
+                "placeholders",
+                lambda source, output: braces(source) == braces(output),
+                track=False,
+            )
+        ],
+    )
+
+
+@pytest.mark.usefixtures("runs")
+def test_a_metrics_missing_input_is_a_gate_that_cannot_run(
+    client: FakeClient, prompts: PromptLibrary, gate_file: Path
+) -> None:
+    del prompts
+    seeded(client)
+    module = re.search(r'suite = "(\w+):suite"', gate_file.read_text())
+    assert module is not None
+    (gate_file.parent / f"{module[1]}.py").write_text(
+        "from test_gate import misnamed_suite as suite\n", encoding="utf-8"
+    )
+    report = gate_file.with_name("report.md")
+
+    status = main(["gate", str(gate_file), "--report", str(report)])
+
+    assert status == GATE_ERROR_STATUS
+    text = report.read_text()
+    assert "could not run" in text
+    assert "The suite's metric 'placeholders' needs ['source']" in text
+    # Field names only, never an item's content.
+    assert "{great}" not in text
+
+
 def test_the_gate_command_fails_a_malformed_declaration(tmp_path: Path) -> None:
     path = tmp_path / "gate.toml"
     path.write_text('app = "x"\n')

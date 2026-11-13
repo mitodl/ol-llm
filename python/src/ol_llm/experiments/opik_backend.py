@@ -155,9 +155,23 @@ class OpikExperimentBackend(ExperimentBackend):
         return opik_version_id(prompt.registry_ref)
 
     def run_experiment(self, run: ExperimentRun) -> ExperimentResult:
-        """Run ``opik.evaluate`` with the managed prompts' Opik versions linked."""
+        """Run ``opik.evaluate`` with the managed prompts' Opik versions linked.
+
+        :raises MissingMetricInputError: if a metric needs an input an item
+            lacks, as ``_OpikMetric`` reported it to Opik's engine.
+        """
         source = _dataset(run.dataset, run.app)
-        result = opik.evaluate(
+        try:
+            result = self._evaluate(source, run)
+        except ScoreMethodMissingArguments as exc:
+            if isinstance(exc.__cause__, MissingMetricInputError):
+                raise exc.__cause__ from None
+            raise
+        return _result(result)
+
+    @staticmethod
+    def _evaluate(source: opik.Dataset, run: ExperimentRun) -> EvaluationResult:
+        return opik.evaluate(
             dataset=source
             if run.dataset_version is None
             else _version(source, run.dataset_version),
@@ -174,7 +188,6 @@ class OpikExperimentBackend(ExperimentBackend):
             experiment_tags=list(run.tags),
             task_threads=run.threads,
         )
-        return _result(result)
 
     def read_experiment(self, experiment_id: str) -> ExperimentResult:
         """Read the experiment's items; Opik keeps only the scores that succeeded."""

@@ -99,6 +99,7 @@ from ol_llm.experiments import (
     DatasetVersionNotFoundError,
     ExperimentResult,
     Metric,
+    MissingMetricInputError,
     experiment_backend,
 )
 from ol_llm.pointers import PointerError, PromptName, PromptPointers, VersionName
@@ -530,8 +531,9 @@ def run_gate(
     :rtype: GateOutcome
     :raises GateConfigurationError: if the experiment backend cannot run (with
         Opik, tracing is off), the dataset, its pinned version, or a pinned
-        prompt version does not exist, or the pairwise comparison cannot pair the
-        baseline's answers with this run's.
+        prompt version does not exist, a metric needs an input the items and
+        output lack, or the pairwise comparison cannot pair the baseline's
+        answers with this run's.
     """
     backend = experiment_backend()
     if (reason := backend.disabled_reason()) is not None:
@@ -562,19 +564,28 @@ def run_gate(
         "change": change,
         "judge_model": declaration.judge_model,
     }
-    result = evaluate(
-        built.task,
-        dataset=declaration.dataset.name,
-        app=declaration.app,
-        metrics=built.metrics,
-        prompts=list(prompts.values()),
-        dataset_version=declaration.dataset.version,
-        experiment_name=f"{declaration.use_case} {change}",
-        experiment_config=config,
-        scoring_key_mapping=built.scoring_key_mapping,
-        task_threads=built.task_threads,
-        experiment_tags=[_gate_tag(declaration), f"change:{change}"],
-    )
+    try:
+        result = evaluate(
+            built.task,
+            dataset=declaration.dataset.name,
+            app=declaration.app,
+            metrics=built.metrics,
+            prompts=list(prompts.values()),
+            dataset_version=declaration.dataset.version,
+            experiment_name=f"{declaration.use_case} {change}",
+            experiment_config=config,
+            scoring_key_mapping=built.scoring_key_mapping,
+            task_threads=built.task_threads,
+            experiment_tags=[_gate_tag(declaration), f"change:{change}"],
+        )
+    except MissingMetricInputError as exc:
+        # Field names only: the report is posted on the pull request.
+        msg = (
+            f"The suite's metric {exc.metric!r} needs {exc.missing}, which the "
+            f"dataset item and the task output do not have (they have "
+            f"{exc.available}). Map them with the Suite's scoring_key_mapping."
+        )
+        raise GateConfigurationError(msg) from exc
     baseline, note = find_baseline(declaration, exclude=result.experiment_id)
     pairwise = None
     if declaration.pairwise is not None and baseline is not None and judge is not None:

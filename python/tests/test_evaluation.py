@@ -26,6 +26,7 @@ from ol_llm.evaluation import (
     JudgeModel,
     Metric,
     MetricOutcome,
+    MissingMetricInputError,
     Score,
     SkippedItem,
     Threshold,
@@ -50,7 +51,6 @@ from opik.evaluation import test_case, test_result
 from opik.evaluation.evaluation_result import EvaluationResult
 from opik.evaluation.metrics import Hallucination
 from opik.evaluation.metrics.score_result import ScoreResult
-from opik.exceptions import ScoreMethodMissingArguments
 from opik.message_processing.emulation.models import SpanModel
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import (
@@ -635,31 +635,33 @@ def test_any_other_task_error_still_aborts_the_run(
 
 
 @ON_OPIKS_ENGINE
-def test_a_missing_metric_input_still_aborts_the_run(
+@pytest.mark.parametrize("judged", [False, True])
+def test_a_missing_metric_input_aborts_the_run_with_the_librarys_error(
     production_prompt: ManagedPrompt[TextTemplate],
+    judged: bool,  # noqa: FBT001
 ) -> None:
+    # The memory backend's half of this is in test_experiments.py.
+    seed_dataset("rag-golden", RAG, app=APP)
+    metric = (
+        hallucination(judge_model(APP, JUDGE), track=False)
+        if judged
+        else ValidatorMetric("placeholders", same_placeholders, track=False)
+    )
+
     with (
         override_models(TestModel(custom_output_args=VERDICT)),
-        pytest.raises(ScoreMethodMissingArguments),
+        pytest.raises(MissingMetricInputError) as caught,
     ):
-        run_rag(production_prompt, task=lambda _item: {"output": "x"}, mapping={})
-
-
-@ON_OPIKS_ENGINE
-def test_a_validators_missing_input_aborts_the_run_too(
-    production_prompt: ManagedPrompt[TextTemplate],
-) -> None:
-    seed_dataset("rag-golden", RAG, app=APP)
-
-    with pytest.raises(ScoreMethodMissingArguments, match="placeholders"):
         evaluate(
             lambda _item: {"output": "x"},
             dataset="rag-golden",
             app=APP,
-            metrics=[ValidatorMetric("placeholders", same_placeholders)],
+            metrics=[metric],
             prompts=[production_prompt],
             task_threads=1,
         )
+    assert caught.value.metric == metric.name
+    assert caught.value.missing == (["input"] if judged else ["source"])
 
 
 @pytest.mark.usefixtures("client")
