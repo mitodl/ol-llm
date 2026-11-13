@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 import httpx2
 import opik
 import pytest
-from conftest import PromptLibrary, assert_error_kept_without_content
+from conftest import PromptLibrary, agent_for, assert_error_kept_without_content
 from ol_llm import (
     Attribution,
     LLMInvalidOutput,
@@ -20,7 +20,6 @@ from ol_llm import (
     run_sync,
     tracing,
 )
-from ol_llm.models import build_agent, override_models
 from ol_llm.testing import tracing_disabled
 from ol_llm.tracing import TracingConfig, configure_tracing
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -91,11 +90,6 @@ def failing(status: int, body: str = "provider said no") -> FunctionModel:
         yield ""  # pragma: no cover
 
     return FunctionModel(fail, stream_function=stream)
-
-
-def agent_for(use_case: UseCase, model: object, **kwargs: object) -> Agent[None, str]:
-    with override_models(model):  # type: ignore[arg-type]
-        return build_agent(use_case, **kwargs)  # type: ignore[call-overload,no-any-return]
 
 
 def streamed(

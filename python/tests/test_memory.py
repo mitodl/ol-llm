@@ -53,6 +53,7 @@ from opentelemetry.trace import StatusCode
 _T = TypeVar("_T")
 
 APPS = ("learn-ai", "mit-learn")
+OPIK_METADATA = "opik.metadata."
 USE_CASE = "tutor-recall"
 
 
@@ -132,26 +133,29 @@ def test_each_operation_has_a_span_with_attribution(
         "memory list",
         "memory delete",
     ]
+    # As Opik gets them: the attribution and keys as metadata, the content
+    # outside it, where Opik shows it as the span's input.
     for span in recorded:
-        assert {k: span[k] for k in ("app", "use_case", "environment")} == {
+        assert {k: span[OPIK_METADATA + k] for k in ("app", "use_case")} == {
             "app": "learn-ai",
             "use_case": USE_CASE,
-            "environment": "ci",
         }
-        assert {k: span[k] for k in ("user_id", "thread_id", "run_id")} == {
+        assert span[OPIK_METADATA + "environment"] == "ci"
+        assert {k: span[OPIK_METADATA + k] for k in ("user_id", "run_id")} == {
             "user_id": "user-1",
-            "thread_id": "thread-1",
             "run_id": "run-1",
         }
-        assert span["memory.scope"] == "learner"
-        assert span["memory.backend"] == "in-memory"
+        assert span["gen_ai.conversation.id"] == "thread-1"
+        assert span[OPIK_METADATA + "memory.scope"] == "learner"
+        assert span[OPIK_METADATA + "memory.backend"] == "in-memory"
+        assert not {"app", "user_id", "memory.scope"} & span.keys()
     put, get, search, *_ = recorded
-    assert put["memory.key"] == "pace"
+    assert put[OPIK_METADATA + "memory.key"] == "pace"
     assert put["memory.text"] == "Studies on weekends."
     assert search["memory.query"] == "weekends"
-    assert search["memory.result_keys"] == ("learn-ai.pace",)
+    assert search[OPIK_METADATA + "memory.result_keys"] == ("learn-ai.pace",)
     assert "Studies on weekends." in search["memory.results"]
-    assert get["memory.results_count"] == 1
+    assert get[OPIK_METADATA + "memory.results_count"] == 1
 
 
 def test_spans_carry_no_note_content_without_include_content(
@@ -169,7 +173,7 @@ def test_spans_carry_no_note_content_without_include_content(
     recorded = spans(exported)
     assert len(recorded) == 4
     assert all("secret" not in repr(span) for span in recorded), recorded
-    assert recorded[1]["memory.result_keys"] == ("learn-ai.pace",)
+    assert recorded[1][OPIK_METADATA + "memory.result_keys"] == ("learn-ai.pace",)
     [failed] = [
         span
         for span in exported.get_finished_spans()
@@ -195,8 +199,8 @@ def test_a_failed_operation_marks_its_span(exported: InMemorySpanExporter) -> No
     tracing.flush()
 
     forget, put = exported.get_finished_spans()
-    assert (forget.attributes or {})["user_id"] == "learner-1"
-    assert (forget.attributes or {})["memory.removed_count"] == 0
+    assert (forget.attributes or {})[OPIK_METADATA + "user_id"] == "learner-1"
+    assert (forget.attributes or {})[OPIK_METADATA + "memory.removed_count"] == 0
     assert put.status.status_code == StatusCode.ERROR
     assert [event.name for event in put.events] == ["exception"]
 

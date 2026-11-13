@@ -8,7 +8,7 @@ exchange at the start of each request and do not keep the result.
 
 General-memory writes and the platform's forget path use client-credentials
 tokens, cached and renewed by the same code that authenticates the Opik exporter
-(``ol_llm.tracing.KeycloakTokens``).
+(``ol_llm.keycloak.KeycloakTokens``).
 
 A backend without Keycloak (in-memory, local development) takes neither.
 """
@@ -20,6 +20,11 @@ from typing import Protocol
 import httpx
 import httpx2
 
+from ol_llm.keycloak import (
+    TOKEN_REQUEST_TIMEOUT_SECONDS,
+    KeycloakClient,
+    KeycloakTokens,
+)
 from ol_llm.loops import LoopLocal
 from ol_llm.memory.errors import (
     MemoryRejected,
@@ -28,7 +33,6 @@ from ol_llm.memory.errors import (
     from_status,
     from_transport,
 )
-from ol_llm.tracing import TOKEN_REQUEST_TIMEOUT_SECONDS, KeycloakClient, KeycloakTokens
 
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"  # noqa: S105
 ACCESS_TOKEN_TYPE = "urn:ietf:params:oauth:token-type:access_token"  # noqa: S105

@@ -8,7 +8,12 @@ from typing import Any
 
 import opik
 import pytest
-from conftest import PromptLibrary, assert_error_kept_without_content, runner_loop
+from conftest import (
+    PromptLibrary,
+    assert_error_kept_without_content,
+    failing,
+    runner_loop,
+)
 from ol_llm import (
     Attribution,
     LLMInvalidOutput,
@@ -87,13 +92,6 @@ def calling_output_tool(text: str, seen: list[AgentInfo]) -> FunctionModel:
         return ModelResponse(parts=[ToolCallPart(tool.name, {"text": text})])
 
     return FunctionModel(reply)
-
-
-def failing(status: int, body: str = "provider said no") -> FunctionModel:
-    def fail(_messages: list[ModelMessage], _info: AgentInfo) -> ModelResponse:
-        raise ModelHTTPError(status, "gpt-4o-mini", body=body)
-
-    return FunctionModel(fail)
 
 
 def complete_async(*args: object, **kwargs: object) -> object:

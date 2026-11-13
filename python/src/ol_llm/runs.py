@@ -1,24 +1,16 @@
-"""The entry points (spec §6.6): one Opik root trace per run.
+"""The entry points (spec §6.6): one call span per run.
 
-``run`` and ``run_sync`` open the root trace with the §4 attribution fields, run the
-agent under the use case's usage limits, and return an ``LLMResult``. The agent's
-model spans land inside that trace through ``OpikSpanProcessor`` (see
-``ol_llm.tracing``). Model failures reach the caller as ``LLMError`` subclasses,
-and the trace records the same error.
+``run`` and ``run_sync`` open the call span with the §4 attribution fields
+(``TracedCall.trace_scope``), run the agent under the use case's usage limits, and
+return an ``LLMResult``. The agent's model spans are the call span's children.
+Model failures reach the caller as ``LLMError`` subclasses, and the call records
+the same error. Each trace destination maps the spans to its backend; for Opik,
+the call is the run's root trace, and a run inside a caller's own ``@opik.track``
+is a span of the caller's trace (see ``ol_llm.trace_destinations``). With tracing
+off, runs open no span.
 
-A run inside a caller's own ``@opik.track`` becomes a span of the caller's trace,
-in the caller's project: Opik files a span under its trace's project. The
-attribution metadata goes on the run's span; the tags, ``thread_id``, and the
-degraded marking go on the caller's trace, so filters and scoring rules scoped by
-tag still find it. With tracing off, runs open no trace.
-
-``run_stream`` holds the same root trace open while the caller consumes the stream
-inside its own ``async with``. ``opik.track`` cannot do that: on an async generator
-it makes the trace current only during each ``__anext__``. Nor can it keep an
-exception's message off the trace when ``include_content`` is off. So every entry
-point runs the entry and exit halves of the SDK's decorator around its call
-(``TracedCall.trace_scope``) instead, which reaches into opik internals that the
-exact opik pin and the smoke test keep honest.
+``run_stream`` holds the same call span open while the caller consumes the stream
+inside its own ``async with``.
 
 ``complete`` and ``complete_sync`` are the single-call path: a tool-less agent over
 the use case's model, run by ``run``, so a call site that outgrows them builds the
@@ -34,9 +26,8 @@ from collections.abc import (
 )
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Generic, TypeVar, cast, overload
+from typing import Any, Generic, TypeVar, overload
 
-from opik import opik_context
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
@@ -50,7 +41,6 @@ from ol_llm.attribution import (
     NO_ATTRIBUTION,
     Attribution,
     DegradedReason,
-    degraded_metadata,
 )
 from ol_llm.errors import LLMError
 from ol_llm.loops import run_coroutine
@@ -68,7 +58,7 @@ from ol_llm.models import (
 )
 from ol_llm.policy import UseCase
 from ol_llm.prompts import ManagedPrompt
-from ol_llm.traces import TracedCall
+from ol_llm.traces import TracedCall, mark_degraded
 from ol_llm.tracing import enabled
 
 OutputT = TypeVar("OutputT")
@@ -125,8 +115,7 @@ class _Run(TracedCall, Generic[OutputT]):
     postprocess: Callable[[OutputT], PostProcessed[OutputT]] | None
 
     def agent_arguments(self) -> dict[str, Any]:
-        """Return what every run passes the agent, and mark the trace."""
-        self.mark_trace()
+        """Return what every run passes the agent."""
         return {
             "usage_limits": usage_limits(self.use_case),
             "model_settings": attribution_model_settings(self.attribution),
@@ -158,13 +147,7 @@ class _Run(TracedCall, Generic[OutputT]):
             output = processed.output
             reasons.extend(processed.degraded_reasons)
         degraded_reasons = tuple(dict.fromkeys(reasons))
-        if degraded_reasons and (trace := self._current_trace()) is not None:
-            # Another run in the same trace may have marked it already.
-            earlier = (trace.metadata or {}).get("degraded_reason")
-            marked = cast("list[DegradedReason]", earlier.split(",") if earlier else [])
-            opik_context.update_current_trace(
-                metadata=dict(degraded_metadata([*marked, *degraded_reasons]))
-            )
+        mark_degraded(degraded_reasons)
         named = self.prompts[0] if self.prompts else None
         return LLMResult(
             output=output,
@@ -312,8 +295,8 @@ async def run(  # noqa: PLR0913
         ``get_prompt``, or a sequence of every prompt the run used (e.g. the
         instructions' and a user message template's). The run links each version
         to the trace and puts the first prompt's name and version on the result
-        and in the trace metadata; an embedded default used because Opik was
-        unreachable marks the result and trace ``embedded_prompt``.
+        and in the trace metadata; an embedded default used because the registry
+        was unreachable marks the result and trace ``embedded_prompt``.
     :returns: the result.
     :rtype: LLMResult
     :raises LLMError: on a model failure, invalid output, a content filter, or an

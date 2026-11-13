@@ -11,7 +11,7 @@ What it proves, in an environment shaped like a consumer's runtime image:
 - ol_llm.embed_sync does the same for its embedding span;
 - both halves authenticate with a Keycloak client-credentials token, and the span
   exporter fetches a new token after a 401;
-- the spans are filed under the app's project, or under the caller's project for
+- each span names its project (opik.project_name): the app's, or the caller's for
   a run inside the caller's own @opik.track, where Opik files that run's trace;
 - ol_llm.get_prompt fetches a prompt by label through the SDK, and the run links
   its version to the root trace;
@@ -356,10 +356,9 @@ def check() -> list[str]:  # noqa: C901
         failures.append("the span exporter did not retry its 401 with a new token")
     # The first request was refused and sent again, so it is left out.
     trace_ids: dict[str, set[str]] = {}
-    for request in otlp[1:]:
-        project = request.headers.get("projectname", "")
-        ids = {span.get("opik.trace_id", "") for span in _spans(request)}
-        trace_ids.setdefault(project, set()).update(ids)
+    for span in [span for request in otlp[1:] for span in _spans(request)]:
+        project = span.get("opik.project_name", "")
+        trace_ids.setdefault(project, set()).add(span.get("opik.trace_id", ""))
     expected_ids = {
         APP: {
             trace["id"],
