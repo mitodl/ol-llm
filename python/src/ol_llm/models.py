@@ -106,9 +106,9 @@ OutputT = TypeVar("OutputT")
 _T = TypeVar("_T")
 _K = TypeVar("_K", bound=Hashable)
 _NO_DEPS: type[None] = type(None)
+DepsT = TypeVar("DepsT")
 
 log = logging.getLogger(__name__)
-DepsT = TypeVar("DepsT")
 
 RETRYABLE_STATUSES = frozenset({408, 500, 502, 503, 504, 529})
 """HTTP statuses that mean the provider is unavailable (spec §6.3)."""
@@ -803,8 +803,8 @@ class PolicyFallbackModel(FallbackModel):
 
         Once the count has fallen back, a model that cannot count (Mistral, and
         OpenAI chat completions) is skipped, and the next one counts. If none of
-        the rest can, the count comes back empty and the request goes out without
-        the check ahead of it (the run still checks the usage the response
+        the rest can, the count comes back empty, so the check ahead of the request
+        leaves out its tokens (the run still checks the usage the response
         reports): a fallback that would answer it does not fail the run for want
         of a count. The model the count starts at (the primary,
         or on a retry the model being retried) raises ``NotImplementedError`` if it
