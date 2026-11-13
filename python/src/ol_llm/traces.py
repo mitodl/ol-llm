@@ -409,8 +409,8 @@ def _record_error(span: Span, error: Exception, *, content: bool) -> None:
             else f"{kind.__module__}.{kind.__qualname__}"
         )
         span.add_event(
-            "exception",
-            attributes={"exception.type": name, "exception.escaped": "False"},
+            attrs.EXCEPTION_EVENT,
+            attributes={attrs.EXCEPTION_TYPE: name, attrs.EXCEPTION_ESCAPED: "False"},
         )
         description = None
     span.set_status(Status(StatusCode.ERROR, description=description))

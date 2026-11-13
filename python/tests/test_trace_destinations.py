@@ -275,6 +275,9 @@ def test_opik_files_ol_attributes_as_metadata_and_keeps_the_rest(
         "ol.tags": ["app:mit-learn"],
         "gen_ai.request.model": "gpt-4o-mini",
         "memory.query": "content",
+        "inputs_count": 2,
+        "input_type": "query",
+        "embedding_settings": '{"dimensions": 256}',
     }
     with provider.get_tracer("test").start_as_current_span("s", attributes=attributes):
         pass
@@ -286,6 +289,9 @@ def test_opik_files_ol_attributes_as_metadata_and_keeps_the_rest(
         "opik.tags": ("app:mit-learn",),
         "gen_ai.request.model": "gpt-4o-mini",
         "memory.query": "content",
+        "opik.metadata.inputs_count": 2,
+        "opik.metadata.input_type": "query",
+        "opik.metadata.embedding_settings": '{"dimensions": 256}',
         PROJECT_NAME: "mit-learn",
     }
 

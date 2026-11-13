@@ -88,10 +88,12 @@ _RENAMED: Mapping[str, str] = {
     attrs.TAGS: TAGS,
     attrs.INPUT: "input",
     attrs.OUTPUT: "output",
-    # Opik has no rule for these, so they would land in the span's input.
+    # Opik files these as the span's input: it has no rule for them, or, for
+    # input_type, its input* prefix rule catches it.
     attrs.EMBEDDINGS_DIMENSION_COUNT: f"{METADATA_PREFIX}embedding_dimensions",
-    # PydanticAI's embedding span names the count this way; ol-llm's, ol.*.
-    "inputs_count": f"{METADATA_PREFIX}inputs_count",
+    attrs.PYDANTIC_AI_INPUTS_COUNT: f"{METADATA_PREFIX}inputs_count",
+    attrs.PYDANTIC_AI_INPUT_TYPE: f"{METADATA_PREFIX}input_type",
+    attrs.PYDANTIC_AI_EMBEDDING_SETTINGS: f"{METADATA_PREFIX}embedding_settings",
 }
 
 OpikClient = opik.Opik

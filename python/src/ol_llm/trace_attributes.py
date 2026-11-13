@@ -30,6 +30,19 @@ EMBEDDING_INPUTS = "inputs"
 """The texts an embedding request sent, as JSON, only with content. Named as
 PydanticAI's embedding span names them."""
 
+PYDANTIC_AI_INPUTS_COUNT = "inputs_count"
+PYDANTIC_AI_INPUT_TYPE = "input_type"
+PYDANTIC_AI_EMBEDDING_SETTINGS = "embedding_settings"
+"""How PydanticAI's own embedding span names the input count, the input type
+(``query`` or ``document``), and the settings it sent."""
+
+EXCEPTION_EVENT = "exception"
+EXCEPTION_TYPE = "exception.type"
+EXCEPTION_MESSAGE = "exception.message"
+EXCEPTION_STACKTRACE = "exception.stacktrace"
+EXCEPTION_ESCAPED = "exception.escaped"
+"""OpenTelemetry's exception event and its attributes."""
+
 CONVERSATION_ID = "gen_ai.conversation.id"
 OPERATION_NAME = "gen_ai.operation.name"
 PROVIDER_NAME = "gen_ai.provider.name"
