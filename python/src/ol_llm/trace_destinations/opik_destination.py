@@ -228,12 +228,17 @@ def _resolve(parent_context: Context | None, default_project: str) -> _OpikIds:
         headers = opik_context.get_distributed_trace_headers()
     except exceptions.OpikException:
         return _OpikIds()
-    trace = opik_context.get_current_trace_data()
+    # Under a span from distributed headers there is no trace data, and the span
+    # has the project.
+    top = context_storage.top_span_data()
+    trace = context_storage.get_trace_data()
     return _OpikIds(
         trace_id=headers["opik_trace_id"],
         span_id=id_helpers.generate_id(),
         parent_span_id=headers["opik_parent_span_id"],
-        project=(trace.project_name if trace else None) or default_project,
+        project=(trace.project_name if trace else None)
+        or (top.project_name if top else None)
+        or default_project,
     )
 
 
@@ -360,12 +365,15 @@ class OpikDestination(TraceDestination):
             source=None,
             environment=fields.environment,
         )
-        opened = opik_context.get_current_trace_data() is None
+        before = context_storage.get_trace_data()
         started = _TRACKER._before_call(  # noqa: SLF001
             func=_call, track_options=options, args=(), kwargs={}
         )
-        self._mark(call, opened=opened, started=started)
         try:
+            # Under a span from distributed headers the SDK opens no trace, so
+            # the context then has a span and no trace data.
+            opened = before is None and context_storage.get_trace_data() is not None
+            self._mark(call, opened=opened, started=started)
             yield
         finally:
             self._mark_degraded(call)
@@ -380,11 +388,13 @@ class OpikDestination(TraceDestination):
             )
 
     def _mark(self, call: CallTrace, *, opened: bool, started: bool) -> None:
-        """Set the input, and put the tags and thread on the call's trace.
+        """Set the input, put the tags and thread on the trace, and bridge the span.
 
         For a call that opened its trace the tags are already there; for one in a
         caller's trace, whose own metadata lands on the call's span, this adds
-        them there. A caller's trace that already has a thread keeps it.
+        them there. A caller's trace that already has a thread keeps it. Under a
+        span from distributed headers there is no trace in this process to mark,
+        and the call's span is a child of that span, in its project.
         """
         if call.input is not None:
             if started:
@@ -392,25 +402,30 @@ class OpikDestination(TraceDestination):
             if opened:
                 opik_context.update_current_trace(input=dict(call.input))
         trace = context_storage.get_trace_data()
-        if trace is None:
-            return
-        fields = call.fields
-        opik_context.update_current_trace(
-            tags=list(fields.tags),
-            metadata={
-                key: fields.metadata[key]
-                for key in ("prompt_name", "prompt_version")
-                if key in fields.metadata
-            },
-            thread_id=None if trace.thread_id else fields.thread_id,
-        )
+        if trace is not None:
+            fields = call.fields
+            opik_context.update_current_trace(
+                tags=list(fields.tags),
+                metadata={
+                    key: fields.metadata[key]
+                    for key in ("prompt_name", "prompt_version")
+                    if key in fields.metadata
+                },
+                thread_id=None if trace.thread_id else fields.thread_id,
+            )
         top = context_storage.top_span_data() if started else None
+        trace_id = trace.id if trace is not None else top.trace_id if top else None
+        if trace_id is None:
+            # The SDK recorded nothing, so the call span goes over OTLP.
+            return
+        project = (top.project_name if top else None) or (
+            trace.project_name if trace is not None else None
+        )
         with _lock:
             _ids[call.span.get_span_context().span_id] = _OpikIds(
-                trace_id=trace.id,
+                trace_id=trace_id,
                 span_id=top.id if top else None,
-                project=(top.project_name if top else trace.project_name)
-                or self.default_project,
+                project=project or self.default_project,
                 bridged=True,
             )
 

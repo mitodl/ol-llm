@@ -8,6 +8,7 @@ from typing import Any
 
 import opik
 import pytest
+from conftest import opik_context_is_empty
 from ol_llm import (
     Attribution,
     LLMRateLimited,
@@ -147,6 +148,45 @@ def test_opik_gets_the_call_as_its_trace_and_the_model_spans_inside_it(
     assert {(s.attributes or {})[PROJECT_NAME] for s in spans} == {"mit-learn"}
     top = [s for s in spans if s.parent is None or s.parent.span_id not in ids(spans)]
     assert {(s.attributes or {})[PARENT_SPAN_ID] for s in top} == {root.id}
+
+
+@pytest.mark.parametrize("content", [True, False])
+def test_a_run_under_a_span_from_distributed_headers_attaches_to_it(
+    content: bool,  # noqa: FBT001
+    exported: InMemorySpanExporter,
+) -> None:
+    configured(include_content=content)
+
+    @opik.track(project_name="mit-learn")
+    def upstream() -> Mapping[str, Any]:
+        return opik.opik_context.get_distributed_trace_headers()
+
+    @opik.track(project_name="ol-data-platform")
+    def downstream() -> str:
+        # The SDK opens a span under the headers' span, and no trace.
+        assert opik.opik_context.get_current_trace_data() is None
+        return run_sync(agent_for(replying("ok")), "hi").output
+
+    with opik.record_traces_locally() as storage:
+        headers = upstream()
+        assert downstream(opik_distributed_trace_headers=headers) == "ok"  # type: ignore[call-arg]
+        tracing.flush()
+        span_names = [span.name for tree in storage.span_trees for span in walk(tree)]
+    assert opik_context_is_empty()
+
+    assert span_names.count("summary") == 1
+    spans = exported.get_finished_spans()
+    assert spans
+    # The call span is the SDK's, not also sent over OTLP.
+    assert "summary" not in {span.name for span in spans}
+    assert {(s.attributes or {})[TRACE_ID] for s in spans} == {headers["opik_trace_id"]}
+    assert {(s.attributes or {})[PROJECT_NAME] for s in spans} == {"ol-data-platform"}
+
+
+def walk(span: Any) -> Iterator[Any]:  # noqa: ANN401
+    yield span
+    for child in span.spans:
+        yield from walk(child)
 
 
 def ids(spans: tuple[ReadableSpan, ...]) -> set[int]:
