@@ -8,6 +8,7 @@ the extra for each provider a use case names.
 
 import asyncio
 import inspect
+import logging
 import os
 import random
 import sys
@@ -105,6 +106,8 @@ OutputT = TypeVar("OutputT")
 _T = TypeVar("_T")
 _K = TypeVar("_K", bound=Hashable)
 _NO_DEPS: type[None] = type(None)
+
+log = logging.getLogger(__name__)
 DepsT = TypeVar("DepsT")
 
 RETRYABLE_STATUSES = frozenset({408, 500, 502, 503, 504, 529})
@@ -798,14 +801,18 @@ class PolicyFallbackModel(FallbackModel):
         not fail a run its fallback would answer, and when every model fails the
         caller gets the first one's error, as for a request.
 
-        A fallback model that cannot count (Mistral, and OpenAI chat completions)
-        ends the chain there, so the caller still gets the first model's error
-        rather than ``NotImplementedError``. The model the count starts at (the
-        primary, or on a retry the model being retried) raises
-        ``NotImplementedError`` if it cannot count.
+        Once the count has fallen back, a model that cannot count (Mistral, and
+        OpenAI chat completions) is skipped, and the next one counts. If none of
+        the rest can, the count comes back empty and the request goes out without
+        the check ahead of it (the run still checks the usage the response
+        reports): a fallback that would answer it does not fail the run for want
+        of a count. The model the count starts at (the primary,
+        or on a retry the model being retried) raises ``NotImplementedError`` if it
+        cannot count, as a single model does.
         """
         chain = self._starting_at(messages)
         errors: list[LLMError] = []
+        skipped: list[str] = []
         for model in chain.models:
             try:
                 return await model.count_tokens(
@@ -818,7 +825,16 @@ class PolicyFallbackModel(FallbackModel):
             except NotImplementedError:
                 if not errors:
                     raise
-                break
+                skipped.append(cast("PolicyModel", model).catalog_id)
+        if skipped:
+            log.warning(
+                "Sending %s's request uncounted: every model that can count failed "
+                "(%s), and %s cannot count",
+                errors[0].use_case,
+                ", ".join(type(error).__name__ for error in errors),
+                ", ".join(skipped),
+            )
+            return RequestUsage()
         group = FallbackExceptionGroup("All models from FallbackModel failed", errors)
         raise errors[0].copy() from group
 
