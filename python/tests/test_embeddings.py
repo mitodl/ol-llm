@@ -446,6 +446,47 @@ def test_a_rejected_request_is_not_retried() -> None:
     assert model.calls == 1
 
 
+class Counting(TestEmbeddingModel):
+    """Raises each scripted failure in turn, then counts one token per text."""
+
+    def __init__(self, *failures: Exception) -> None:
+        super().__init__()
+        self.failures = list(failures)
+        self.counts = 0
+
+    async def count_tokens(self, text: str) -> int:  # noqa: ARG002
+        self.counts += 1
+        if self.failures:
+            raise self.failures.pop(0)
+        return 1
+
+
+def count_with(model: Counting) -> int:
+    with override_embedding_models(model):
+        policy_model = build_embedder(SEARCH).model
+    assert isinstance(policy_model, PolicyEmbeddingModel)
+    return asyncio.run(policy_model.count_tokens("the learner's query"))
+
+
+def test_a_rate_limited_count_is_retried(sleeps: list[float]) -> None:
+    model = Counting(http_error(429))
+
+    assert count_with(model) == 1
+    assert model.counts == 2
+    assert len(sleeps) == 1
+
+
+def test_a_rejected_count_is_classified_and_not_retried() -> None:
+    model = Counting(http_error(401))
+
+    with pytest.raises(LLMRejected) as caught:
+        count_with(model)
+
+    assert caught.value.model == MODEL
+    assert isinstance(caught.value.__cause__, ModelHTTPError)
+    assert model.counts == 1
+
+
 @pytest.mark.parametrize("entry", ENTRIES)
 def test_without_content_a_failure_keeps_only_its_type_and_frames(
     entry: Callable[..., EmbedResult], exported: InMemorySpanExporter

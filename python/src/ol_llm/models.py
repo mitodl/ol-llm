@@ -8,6 +8,7 @@ the extra for each provider a use case names.
 
 import asyncio
 import inspect
+import logging
 import os
 import random
 import sys
@@ -67,6 +68,7 @@ from pydantic_ai.models import (
     ModelRequestContext,
     ModelRequestParameters,
     StreamedResponse,
+    _continuation,
     infer_model,
 )
 from pydantic_ai.models.fallback import FallbackModel
@@ -105,6 +107,8 @@ _T = TypeVar("_T")
 _K = TypeVar("_K", bound=Hashable)
 _NO_DEPS: type[None] = type(None)
 DepsT = TypeVar("DepsT")
+
+log = logging.getLogger(__name__)
 
 RETRYABLE_STATUSES = frozenset({408, 500, 502, 503, 504, 529})
 """HTTP statuses that mean the provider is unavailable (spec §6.3)."""
@@ -783,6 +787,57 @@ class PolicyFallbackModel(FallbackModel):
             return self
         return _ChainTail(self, ids.index(answered_by))
 
+    async def count_tokens(
+        self,
+        messages: list[ModelMessage],
+        model_settings: ModelSettings | None,
+        model_request_parameters: ModelRequestParameters,
+    ) -> RequestUsage:
+        """Count with each model in turn, starting where the request will.
+
+        ``FallbackModel`` has no ``count_tokens``, so without this a chain fails
+        every run whose usage limits set ``count_tokens_before_request``. The count
+        falls back on the same errors as a request, so a primary that is down does
+        not fail a run its fallback would answer, and when every model fails the
+        caller gets the first one's error, as for a request.
+
+        Once the count has fallen back, a model that cannot count (Mistral, and
+        OpenAI chat completions) is skipped, and the next one counts. If none of
+        the rest can, the count comes back empty, so the check ahead of the request
+        leaves out its tokens (the run still checks the usage the response
+        reports): a fallback that would answer it does not fail the run for want
+        of a count. The model the count starts at (the primary,
+        or on a retry the model being retried) raises ``NotImplementedError`` if it
+        cannot count, as a single model does.
+        """
+        chain = self._starting_at(messages)
+        errors: list[LLMError] = []
+        skipped: list[str] = []
+        for model in chain.models:
+            try:
+                return await model.count_tokens(
+                    model.prepare_messages(messages, model_request_parameters),
+                    model_settings,
+                    model_request_parameters,
+                )
+            except FALLBACK_ON as exc:
+                errors.append(exc)
+            except NotImplementedError:
+                if not errors:
+                    raise
+                skipped.append(cast("PolicyModel", model).catalog_id)
+        if skipped:
+            log.warning(
+                "Sending %s's request uncounted: every model that can count failed "
+                "(%s), and %s cannot count",
+                errors[0].use_case,
+                ", ".join(type(error).__name__ for error in errors),
+                ", ".join(skipped),
+            )
+            return RequestUsage()
+        group = FallbackExceptionGroup("All models from FallbackModel failed", errors)
+        raise errors[0].copy() from group
+
     async def request(
         self,
         messages: list[ModelMessage],
@@ -876,6 +931,11 @@ def _primary_error(
     being retried. A request continuing a suspended response (OpenAI background
     mode) first tries the member that holds it, then the whole chain, so the group
     can open with that member's error; the first member's own comes later.
+
+    Such a request cancels the suspended job before it moves on, and marks the group
+    so the agent does not cancel it again. The copy carries that mark, since it is
+    what the agent sees in place of the group. PydanticAI has no public way to read
+    the mark, so this reads its attribute name from ``_continuation``.
     """
     first = cast("PolicyModel", chain.models[0]).catalog_id
     errors = [
@@ -883,7 +943,12 @@ def _primary_error(
         for exc in group.exceptions
         if isinstance(exc, LLMError) and exc.model == first
     ]
-    return errors[-1].copy() if errors else None
+    if not errors:
+        return None
+    primary = errors[-1].copy()
+    if getattr(group, _continuation._SUSPENDED_JOB_CANCELLED, False):  # noqa: SLF001
+        _continuation.mark_suspended_job_cancelled(primary)
+    return primary
 
 
 def _gateway_headers(route: GatewayRoute | None, use_case: UseCase) -> dict[str, str]:
