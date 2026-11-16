@@ -6,6 +6,19 @@ All notable changes to ol-llm are recorded here. The format follows
 
 <!-- scriv-insert-here -->
 
+<a id='changelog-0.0.15'></a>
+## [0.0.15] - 2026-11-16
+
+### Changed
+
+- The opik pin moves from 2.2.143 to 2.2.144, which raises its caps to `pydantic<=2.14.3`, `openai<=3.46.0`, `litellm<=1.108.2`, `click<=8.5.1`, `sentry_sdk<=2.74.0` and `boto3-stubs<=1.43.126`. ol-llm resolves under edx-platform master's pins again: they moved to pydantic 2.14.3 and click 8.5.1, which 2.2.143's `pydantic<=2.14.2` and `click<=8.5.0` excluded. The README's cap-override block is unchanged. (#82)
+
+### Fixed
+
+- A use case with fallback models can count tokens before each request (`UsageLimits(count_tokens_before_request=True)`), which raised `NotImplementedError` before. The count starts where the request will and falls back on rate limits and outages, as a request does; when every model fails, the caller gets the primary's error. Once the count has fallen back, a model that cannot count (Mistral, OpenAI chat completions) is skipped; if none of the rest can count, the check ahead of the request leaves out its tokens, and ol-llm logs a warning. The model the count starts at (the primary, or on a retry the model being retried) still raises `NotImplementedError` if it cannot count. (#81)
+- `count_tokens` on an embedder's model is retried and classified under the call policy, as `embed` is, instead of reaching the caller as the provider's raw exception. (#81)
+- A request that continues a suspended response (OpenAI background mode) and fails on every model no longer has the agent send a second cancel for the job the fallback chain already cancelled. (#81)
+
 <a id='changelog-0.0.14'></a>
 ## [0.0.14] - 2026-11-13
 
