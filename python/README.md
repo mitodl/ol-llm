@@ -959,14 +959,14 @@ ol-llm = "0d"
 ## Overriding opik's version caps
 
 opik 2.2.139 and later cap each direct dependency at a recent release (`name<=X` in the
-package metadata, e.g. `openai<=3.42.1` and `pydantic<=2.14.2` in 2.2.143), and opik
+package metadata, e.g. `openai<=3.46.0` and `sentry_sdk<=2.74.0` in 2.2.144), and opik
 releases move the caps over time. ol-llm pins opik exactly, so an application inherits the
 caps of the pinned release until ol-llm bumps opik, which it does once a month. An application that
-requires a newer version than a cap fails to resolve (`openai==3.46.0` next to opik 2.2.143 is
-unsatisfiable), and one that does not gets the capped version without a warning (pydantic
-2.14.2 under opik 2.2.143, with 2.14.3 out).
+requires a newer version than a cap fails to resolve (`openai==3.51.0` next to opik 2.2.144 is
+unsatisfiable), and one that does not gets the capped version without a warning (sentry-sdk
+2.74.0 under opik 2.2.144, with 2.75.0 out).
 
-The block below is for opik 2.2.143, the release ol-llm pins now. Copy it into
+The block below is for opik 2.2.144, the release ol-llm pins now. Copy it into
 `[tool.uv] override-dependencies`. It has one entry for every capped package.
 
 ```toml

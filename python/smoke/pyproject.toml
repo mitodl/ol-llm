@@ -16,7 +16,7 @@ package = false
 # read the lock, so it keeps the root's floors.
 constraint-dependencies = ["filelock>=4.2.1", "litellm>=1.95.0"]
 override-dependencies = [
-    # The README's cap overrides for opik 2.2.143, for the packages the slimming
+    # The README's cap overrides for opik 2.2.144, for the packages the slimming
     # entries below do not drop.
     "httpx[http2]>=0.28.1,<1",
     "jinja2>=3.1.6,<4",
