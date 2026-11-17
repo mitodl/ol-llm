@@ -442,6 +442,18 @@ def test_an_app_with_no_project_has_no_unpointed_labels(
     assert unpointed_labels(pointers(summary="v1")) == {}
 
 
+def test_an_opik_that_ignores_the_project_filter_lists_only_the_apps_prompts(
+    prompt_library: PromptLibrary,
+) -> None:
+    prompt_library.list_ignores_project = True
+    prompt_library.add("summary", "one", environments=("production",))
+    prompt_library.add(
+        "other", "x", project_name="dagster-ml", environments=("production",)
+    )
+
+    assert OpikPromptRegistry().prompt_names(app=APP) == ["summary"]
+
+
 def test_unpointed_labels_reads_every_page(
     prompt_library: PromptLibrary, monkeypatch: pytest.MonkeyPatch
 ) -> None:

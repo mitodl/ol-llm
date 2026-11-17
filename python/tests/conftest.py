@@ -74,6 +74,8 @@ class PromptLibrary:
             self.retrievals = 0
             self.delay_seconds = 0.0
             self.authorizations: list[str | None] = []
+            # An Opik that ignored project_id on the prompt list.
+            self.list_ignores_project = False
 
     def add(  # noqa: PLR0913
         self,
@@ -190,16 +192,19 @@ class PromptLibrary:
         [project_id] = query["project_id"]
         page, size = int(query["page"][0]), int(query["size"][0])
         with self._lock:
-            names = sorted(
-                name
+            rows = sorted(
+                (name, f"project-{project}")
                 for project, name in self.prompts
-                if f"project-{project}" == project_id
+                if self.list_ignores_project or f"project-{project}" == project_id
             )
-        content = [{"name": name} for name in names[(page - 1) * size : page * size]]
+        content = [
+            {"name": name, "project_id": owner}
+            for name, owner in rows[(page - 1) * size : page * size]
+        ]
         return 200, {
             "page": page,
             "size": size,
-            "total": len(names),
+            "total": len(rows),
             "content": content,
         }
 

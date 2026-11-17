@@ -233,7 +233,8 @@ class OpikPromptRegistry(PromptRegistry):
                 ).content
                 or []
             )
-            names.extend(prompt.name for prompt in content)
+            # An Opik that ignored project_id would list the whole workspace.
+            names.extend(p.name for p in content if p.project_id == project.id)
             if len(content) < _PROMPT_PAGE_SIZE:
                 return names
             page += 1
