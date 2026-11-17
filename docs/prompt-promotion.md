@@ -7,6 +7,11 @@ move the `ci` and `qa` labels. The `production` label moves only by pull request
 request changes a number and commits that version's text, and merging it moves the label.
 Rollback is a revert of the pull request.
 
+This is also the runbook: [moving production](#moving-production),
+[what a running app sees](#what-a-running-app-sees), [rolling back](#rolling-back),
+[when Opik is down](#when-opik-is-down), [overrides](#overrides), and
+[after a promotion](#after-a-promotion).
+
 ## The pointer file
 
 One per app repository:
@@ -177,3 +182,104 @@ is what catches a label moved any of those ways.
 Every prompt the app fetches should have a gate whose `paths` include the pointer file, so a
 pull request that moves a pointer also evaluates the new version. Nothing here enforces that,
 and promotion does not wait on the gate's result.
+
+## What a running app sees
+
+Deployed code calls `get_prompt(name, app=..., default=...)` per run. It resolves the label
+named by the deployment's environment (`OL_LLM_ENVIRONMENT`: `ci`, `qa`, or `production`). With
+the registry disabled (`OPIK_TRACK_DISABLE=true`, i.e. local development) it fetches nothing and
+returns the embedded default, unmarked. Each process caches what it fetched for
+`PROMPT_CACHE_TTL_SECONDS` (300 s):
+
+- A label move reaches every process within five minutes. Restarting the app is the way to apply
+  it sooner. A worker forked from a parent that had already fetched the prompt starts with the
+  parent's cache, so restart the whole app, not one worker.
+- When a refresh fails, is slow, or finds nothing, the process keeps serving the version it has
+  and tries again after another TTL. A label removed by mistake therefore keeps serving in a warm
+  process, and every process that starts afterwards raises `LookupError`.
+- With nothing cached, `get_prompt` waits `COLD_FETCH_DEADLINE_SECONDS` (2 s). If Opik has not
+  answered by then, or the fetch failed in transport, timed out, or got a 5xx, it returns the
+  embedded default (the committed export) with `degraded_reasons=("embedded_prompt",)`. A
+  successful `run` given that prompt marks its trace `degraded` with that reason (when tracing
+  is on) and returns it in the result's `degraded_reasons`.
+- A batch run should resolve the label once at the start and use that version throughout, and
+  key its rows on the prompt's `template_hash`, not its version (`ol_llm.batch.BatchKeys` does
+  both). The export hashes the same as its version, so a run that fell back to it does not redo
+  rows.
+
+The export and the label can disagree for a while. The label moves when the promotion job runs;
+the export changes when the image built from that merge deploys. Until then a cold start during
+an Opik outage runs the previous production text, marked degraded.
+
+## Rolling back
+
+Revert the pull request that moved the pointer. The revert puts back the old number and the old
+export, its check runs, and merging it runs `promote`, which moves `production` back. Nothing new
+is created in Opik: a label can point at any existing version, so rolling back never needs a
+restored copy of an old one. Until the image built from the revert deploys, the export is still
+the text being rolled back, so a cold start during an Opik outage runs it.
+
+Rolling back faster than a pull request can merge: move `production` to the old version in the
+Opik UI, then revert the pull request as above. Until the revert merges, the default branch still
+points at the version you moved away from, and every `promote` run moves the label back to it. That
+is not only a manual run (`workflow_dispatch`): any merge that touches the pointer file, e.g. a
+teammate's pointer change for another prompt, and any re-run of an earlier promotion job does it
+too. Hold all pointer-file merges and re-runs until the revert merges. The scheduled drift report
+fails in the meantime, which is expected.
+
+After a move to another prompt registry backend, an old version has a new id there, so rolling
+back to a version from before the move is a forward pointer change naming that id, not a revert.
+
+## When Opik is down
+
+- What falls back: a fetch that fails in transport, times out, misses the 2 s deadline, or gets a
+  5xx. Running processes keep serving what they cached. A process that starts fetches nothing and
+  runs on the embedded default, marked degraded, and every `get_prompt` call in it can wait up to
+  2 s until Opik answers, since the fallback is not cached.
+- What does not fall back: a 4xx, e.g. from APISIX or Keycloak in front of Opik, raises out of
+  `get_prompt`, and a 404 reads as "no such label" and raises `LookupError`. A misconfigured or
+  half-up gateway fails cold starts rather than degrading them.
+- Do not merge pointer pull requests. Merging is promoting: the promotion job fails, and the new
+  export still ships with the next image, so cold starts would fall back to text the label was
+  never moved to. If one was merged, run the workflow manually (`workflow_dispatch`) once Opik is
+  back. `promote` is idempotent and finishes whatever a failed run left.
+- `ol-llm-prompts check` and `promote` exit 1 with a traceback when Opik cannot be reached. 1 is
+  also the drift report's status, so read the log of a failed scheduled report before treating it
+  as drift. Pull request checks and evaluation gates fail the same way; re-run them when Opik is
+  back rather than merging past them.
+
+## Overrides
+
+Data passed into a prompt (a glossary, retrieved context, course facts) is a template variable,
+not an override, and does not change which version the prompt is.
+
+A per-request override that replaces the prompt text (learn-ai's staff-only `instructions` field,
+for example) is a debugging tool. It never creates a version or moves a label. Lifecycle spec §3
+item 7 allows one only if its trace carries `prompt_override=true` and the name and version it
+replaced, and if overridden traces are kept out of datasets and online scoring. ol-llm has no way
+yet for an app to add that to a run's trace (`Attribution` carries only `user_id`, `thread_id`,
+and `run_id`), so an app cannot meet the condition through ol-llm today.
+
+Inside Opik's local runner, an active prompt mask makes a fetch return the masked version instead
+of the label's. Masks live only in that runner's context, never in a deployed process.
+
+## After a promotion
+
+A run's trace names the prompt version when the call site passes the prompt to `run`
+(`prompt=`); call sites that do not are invisible to these checks. In the app's Opik project,
+read the production traces after the label moves:
+
+- New request-time traces name the new version within five minutes of the move. A trace on the
+  old version after that comes from a batch run that started before the move, a pinned
+  `version=` call, a process whose refresh is failing, or a process running on the export (whose
+  version is the old one until the image built from the merge deploys). Only the export is marked
+  `degraded` with `embedded_prompt`. A failing refresh keeps serving the cached registry version
+  unmarked, so find it by the warning it logs ("Could not refresh prompt ...; serving the cached
+  version").
+- A trace marked `embedded_prompt` means that process's cold fetch missed the deadline or failed.
+  A process that cannot reach Opik at all usually cannot deliver its trace there either, so look
+  for the warning `get_prompt` logs ("The prompt registry did not return prompt ...") in the
+  app's logs as well.
+- Online scoring rules, where an app has them, run on sampled production traces in the Opik
+  backend and select production by the `env:production` tag. Compare their scores, and any
+  feedback scores, before and after the move. A drop is a reason to roll back.
