@@ -18,8 +18,9 @@ registry. ``ol-llm-prompts`` also runs:
 
 - ``check`` on the pull request: every pointed version exists and the committed
   export for each is that version's text. With ``--environment`` it also reports
-  each label that is not on its pointed version, which is the drift report (spec
-  §1.2 item 5).
+  each label that is not on its pointed version, and each prompt in the app's
+  namespace that carries the label with no pointer naming it, which is the drift
+  report (spec §1.2 item 5).
 - ``promote`` on merge: moves the ``production`` label to each pointed version.
   It resolves every pointer before moving any label, so a pointer to a missing
   version moves nothing. Promotion jobs for a repository run one at a time and read
@@ -190,6 +191,31 @@ def label_states(
             )
         )
     return states
+
+
+def unpointed_labels(
+    pointers: PromptPointers, *, environment: str = PRODUCTION
+) -> dict[str, str]:
+    """Find the prompts that carry a label though no pointer names them.
+
+    Only the pull request that moves a pointer is meant to move ``production``, so
+    a labeled prompt with no pointer was labeled some other way and runs a version
+    nobody reviewed.
+
+    :param pointers: the pointer file.
+    :param environment: the label to look for.
+    :returns: the version carrying the label, by prompt name, in name order.
+    :rtype: dict[str, str]
+    """
+    registry = prompt_registry()
+    found = {}
+    for name in sorted(set(registry.prompt_names(app=pointers.app))):
+        if name in pointers.prompts:
+            continue
+        labeled = registry.label_version(name, app=pointers.app, label=environment)
+        if labeled is not None:
+            found[name] = labeled
+    return found
 
 
 def promote(
@@ -447,7 +473,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     ``check`` exits 2 if a pointed version does not exist or a committed export
     is not its pointed version and, with ``--environment``, 1 if a label is not on
-    its pointed version. ``promote`` moves the label and prints what moved.
+    its pointed version or a prompt no pointer names carries it. ``promote`` moves
+    the label and prints what moved.
     ``export`` writes the embedded defaults into ``exports``. Each exits 2 when the
     pointer file cannot be read or acted on.
 
@@ -512,7 +539,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{state.name}: {args.environment} is on {state.labeled or 'no version'}, "
             f"the pointer says {state.pointed}\n"
         )
-    return DRIFT_STATUS if drifted else 0
+    unpointed = unpointed_labels(pointers, environment=args.environment)
+    for name, labeled in unpointed.items():
+        sys.stdout.write(
+            f"{name}: {args.environment} is on {labeled}, and no pointer names it\n"
+        )
+    return DRIFT_STATUS if drifted or unpointed else 0
 
 
 if __name__ == "__main__":

@@ -98,8 +98,9 @@ gets the same idempotency keys as one that fetched the version.
 export is missing, is for another version, has text that is not its version's (edited by
 hand), or is for a prompt the file no longer names. The message says to run `export` and
 commit. With `--environment` it also prints each prompt whose label is on another version, or
-on none, and exits 1 if there is one: that is the drift report (spec §1.2 item 5), for a label
-someone moved in the UI.
+on none, and each prompt in the app's Opik project that carries the label while no pointer
+names it, and exits 1 if there is either: that is the drift report (spec §1.2 item 5), for a
+label someone moved in the UI.
 
 `promote` fetches every pointed version before it moves any label, so a pointer to a missing
 version moves nothing. It leaves a label that is already in place and keeps each version's

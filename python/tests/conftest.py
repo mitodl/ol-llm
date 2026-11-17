@@ -13,6 +13,7 @@ from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import ModuleType
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import ol_llm.catalog as catalog_module
 import pytest
@@ -47,6 +48,12 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 _PROMPTS = "/api/v1/private/prompts/versions"
 _ENVIRONMENTS = re.compile(rf"{_PROMPTS}/(?P<id>[^/]+)/environments")
 _WORKSPACE_ENVIRONMENTS = "/api/v1/private/environments"
+_PROJECTS_RETRIEVE = "/api/v1/private/projects/retrieve"
+_PROMPT_CONTAINERS = "/api/v1/private/prompts"
+
+
+def _decoded(body: bytes) -> bytes:
+    return gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body
 
 
 class PromptLibrary:
@@ -110,15 +117,15 @@ class PromptLibrary:
         """Answer a prompt request, or return ``None`` for any other path."""
         if path.startswith(_WORKSPACE_ENVIRONMENTS):
             return self._environment(method, path, body)
+        if method == "POST" and path == _PROJECTS_RETRIEVE:
+            return self._project(json.loads(_decoded(body))["name"])
+        if method == "GET" and path.startswith(f"{_PROMPT_CONTAINERS}?"):
+            return self._containers(parse_qs(urlsplit(path).query))
         if not path.startswith(_PROMPTS):
             return None
         with self._lock:
             self.authorizations.append(authorization)
-        request = (
-            json.loads(gzip.decompress(body) if body[:2] == b"\x1f\x8b" else body)
-            if body
-            else {}
-        )
+        request = json.loads(_decoded(body)) if body else {}
         if method == "POST" and path == f"{_PROMPTS}/retrieve":
             time.sleep(self.delay_seconds)
             with self._lock:
@@ -170,6 +177,31 @@ class PromptLibrary:
         versions.append(detail)
         self._label(version_id, environments)
         return detail
+
+    def _project(self, name: str) -> tuple[int, Any]:
+        """Answer a project lookup: a project exists once it holds a prompt."""
+        with self._lock:
+            if any(project == name for project, _ in self.prompts):
+                return 200, {"id": f"project-{name}", "name": name}
+        return 404, {"errors": ["project not found"]}
+
+    def _containers(self, query: dict[str, list[str]]) -> tuple[int, Any]:
+        """List one project's prompts a page at a time, as Opik's prompt list does."""
+        [project_id] = query["project_id"]
+        page, size = int(query["page"][0]), int(query["size"][0])
+        with self._lock:
+            names = sorted(
+                name
+                for project, name in self.prompts
+                if f"project-{project}" == project_id
+            )
+        content = [{"name": name} for name in names[(page - 1) * size : page * size]]
+        return 200, {
+            "page": page,
+            "size": size,
+            "total": len(names),
+            "content": content,
+        }
 
     def _environment(self, method: str, path: str, body: bytes) -> tuple[int, Any]:
         """Register an environment, or read one back by id, as the SDK does."""
