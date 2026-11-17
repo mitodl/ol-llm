@@ -11,5 +11,6 @@ and move here as each is implemented:
 - the entry points of the call contract (spec §6.6)
 - prompt fetch semantics ([`llm-opik-lifecycle-spec.md`](https://github.com/mitodl/ol-infrastructure/blob/main/docs/plans/llm-opik-lifecycle-spec.md) §3)
 - [prompt promotion](prompt-promotion.md): the pointer file and the job that moves
-  `production` (lifecycle spec §2.3)
+  `production` (lifecycle spec §2.3), and the runbook for promoting, rolling back, and an Opik
+  outage
 - [evaluation gates](evaluation-gate.md) (lifecycle spec §5.1)
