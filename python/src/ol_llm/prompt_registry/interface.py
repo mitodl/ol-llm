@@ -90,6 +90,18 @@ class PromptRegistry(ABC):
         :raises RegistryUnavailableError: if the registry could not be reached.
         """
 
+    @abstractmethod
+    def prompt_names(self, *, app: str) -> list[str]:
+        """Return the names of every prompt the app's namespace holds.
+
+        The drift report reads it to find a labeled prompt that no pointer names.
+
+        :param app: the app, whose namespace holds the prompts.
+        :returns: the names; empty when the namespace does not exist.
+        :rtype: list[str]
+        :raises RegistryUnavailableError: if the registry could not be reached.
+        """
+
     def label_version(self, name: str, *, app: str, label: str) -> str | None:
         """Return the version a label is on.
 

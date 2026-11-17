@@ -761,6 +761,9 @@ class DataclassRegistry(PromptRegistry):
     def fetch(self, name: str, **kwargs: Any) -> RegistryVersion | None:  # noqa: ANN401
         return self.inner.fetch(name, **kwargs)
 
+    def prompt_names(self, *, app: str) -> list[str]:
+        return self.inner.prompt_names(app=app)
+
     def move_label(self, name: str, *, app: str, version: str, label: str) -> None:
         raise NotImplementedError
 

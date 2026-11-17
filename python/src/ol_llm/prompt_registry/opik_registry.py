@@ -40,6 +40,7 @@ _TRANSPORT_FAILURES = (
     httpx.RemoteProtocolError,
     httpx.ProxyError,
 )
+_PROMPT_PAGE_SIZE = 1000
 
 
 class OpikPromptRegistry(PromptRegistry):
@@ -94,6 +95,23 @@ class OpikPromptRegistry(PromptRegistry):
             return None
         prompt = _prompt_from_detail(name, detail, app)
         return RegistryVersion(template=_template(prompt), ref=prompt)
+
+    def prompt_names(self, *, app: str) -> list[str]:
+        """Return the names of the prompts in an Opik project.
+
+        :param app: the Opik project.
+        :returns: the names; empty when the project does not exist.
+        :rtype: list[str]
+        :raises RegistryUnavailableError: on a transport failure, a timeout, or a
+            5xx from Opik or from Keycloak's token endpoint.
+        """
+        try:
+            return self._names(app)
+        except Exception as exc:
+            if _unreachable(exc):
+                msg = f"Opik did not answer listing project {app!r}: {exc!r}"
+                raise RegistryUnavailableError(msg) from exc
+            raise
 
     def move_label(self, name: str, *, app: str, version: str, label: str) -> None:
         """Move an environment label to a version, registering the environment.
@@ -192,6 +210,34 @@ class OpikPromptRegistry(PromptRegistry):
         prompt = cast("BasePrompt", ref)
         opik_context.attach_prompt_to_current_trace(prompt)
         opik_context.attach_prompt_to_current_span(prompt)
+
+    def _names(self, app: str) -> list[str]:
+        rest = tracing.opik_client().rest_client
+        try:
+            project = rest.projects.retrieve_project(name=app)
+        except ApiError as exc:
+            if exc.status_code == httpx.codes.NOT_FOUND:
+                return []
+            raise
+        # Without a project id Opik lists the whole workspace, so the id is
+        # required here, not left optional as the SDK's own search leaves it.
+        if project.id is None:
+            msg = f"Opik returned project {app!r} with no id"
+            raise LookupError(msg)
+        names: list[str] = []
+        page = 1
+        while True:
+            content = (
+                rest.prompts.get_prompts(
+                    page=page, size=_PROMPT_PAGE_SIZE, project_id=project.id
+                ).content
+                or []
+            )
+            # An Opik that ignored project_id would list the whole workspace.
+            names.extend(p.name for p in content if p.project_id == project.id)
+            if len(content) < _PROMPT_PAGE_SIZE:
+                return names
+            page += 1
 
     def _retrieve(
         self, name: str, *, app: str, version: str | None, label: str | None

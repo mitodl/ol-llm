@@ -103,8 +103,9 @@ gets the same idempotency keys as one that fetched the version.
 export is missing, is for another version, has text that is not its version's (edited by
 hand), or is for a prompt the file no longer names. The message says to run `export` and
 commit. With `--environment` it also prints each prompt whose label is on another version, or
-on none, and exits 1 if there is one: that is the drift report (spec §1.2 item 5), for a label
-someone moved in the UI.
+on none, and each prompt in the app's Opik project that carries the label while no pointer
+names it, and exits 1 if there is either: that is the drift report (spec §1.2 item 5), for a
+label someone moved in the UI.
 
 `promote` fetches every pointed version before it moves any label, so a pointer to a missing
 version moves nothing. It leaves a label that is already in place and keeps each version's
@@ -151,12 +152,14 @@ Each event does one thing:
 
 - `pull_request` runs `check`.
 - `schedule` runs `check --environment production`, the drift report, which fails when a label
-  is not where the pointer file puts it.
+  is not where the pointer file puts it, or is on a prompt the pointer file does not name. Retiring
+  a prompt therefore means removing its pointer and then its `production` label in the Opik UI
+  (`promote` never removes a label), once the app no longer fetches it.
 - `push` and `workflow_dispatch` run `promote`. It reads the pointer file from the default
   branch's head as it is when the job starts, not from the commit that triggered it, and runs
   one promotion per repository and pointer file at a time, so two merges close together cannot
   finish out of order and move the label back. A manual run restores a label someone moved in
-  the UI.
+  the UI on a pointed prompt.
 - Any other event (e.g. `merge_group`) fails the job rather than promoting or passing
   unchecked.
 

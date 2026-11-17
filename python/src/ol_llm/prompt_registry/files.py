@@ -118,6 +118,18 @@ class FilePromptRegistry(PromptRegistry):
             return None
         return RegistryVersion(template=export.template)
 
+    def prompt_names(self, *, app: str) -> list[str]:
+        """Return the names of the app's exports in the directory.
+
+        :param app: the app; another app's exports are left out.
+        :returns: the names, sorted.
+        :rtype: list[str]
+        """
+        exports = (
+            read_export(path) for path in self.directory.glob(f"*{EXPORT_SUFFIX}")
+        )
+        return sorted(export.name for export in exports if export.app == app)
+
     def move_label(self, name: str, *, app: str, version: str, label: str) -> None:
         """Refuse: exports change only by committing new ones.
 

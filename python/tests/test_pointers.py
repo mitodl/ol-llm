@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import httpx
 import ol_llm.pointers as pointers_module
 import pytest
 import yaml
@@ -14,9 +15,17 @@ from ol_llm.pointers import (
     export,
     main,
     promote,
+    render_export,
     resolve,
+    unpointed_labels,
 )
-from ol_llm.prompt_registry import FilePromptRegistry, configure_prompt_registry
+from ol_llm.prompt_registry import (
+    FilePromptRegistry,
+    OpikPromptRegistry,
+    RegistryUnavailableError,
+    configure_prompt_registry,
+    opik_registry,
+)
 
 APP = "mit-learn"
 CHAT = [
@@ -398,6 +407,90 @@ def test_check_with_an_environment_reports_drift(
     assert "summary: production is on v1, the pointer says v2" in (
         capsys.readouterr().out
     )
+
+
+def test_check_with_an_environment_reports_a_labeled_prompt_no_pointer_names(
+    prompt_library: PromptLibrary,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    prompt_library.add("summary", "one", environments=("production",))
+    prompt_library.add("sentiment", "rate it")
+    prompt_library.add("sentiment", "rate it again", environments=("production",))
+    prompt_library.add("draft", "not labeled")
+    prompt_library.add(
+        "other", "x", project_name="dagster-ml", environments=("production",)
+    )
+    path = write(tmp_path, summary="v1")
+    assert main(["export", str(path)]) == 0
+    capsys.readouterr()
+
+    assert main(["check", str(path), "--environment", "production"]) == DRIFT_STATUS
+    assert capsys.readouterr().out.splitlines()[1:] == [
+        "sentiment: production is on v2, and no pointer names it"
+    ]
+    # Nothing carries qa, so only summary's own pointer drifts.
+    main(["check", str(path), "--environment", "qa"])
+    assert "no pointer names" not in capsys.readouterr().out
+
+
+def test_an_app_with_no_project_has_no_unpointed_labels(
+    prompt_library: PromptLibrary,
+) -> None:
+    prompt_library.add("summary", "one", project_name="dagster-ml")
+
+    assert unpointed_labels(pointers(summary="v1")) == {}
+
+
+def test_an_opik_that_ignores_the_project_filter_lists_only_the_apps_prompts(
+    prompt_library: PromptLibrary,
+) -> None:
+    prompt_library.list_ignores_project = True
+    prompt_library.add("summary", "one", environments=("production",))
+    prompt_library.add(
+        "other", "x", project_name="dagster-ml", environments=("production",)
+    )
+
+    assert OpikPromptRegistry().prompt_names(app=APP) == ["summary"]
+
+
+def test_unpointed_labels_reads_every_page(
+    prompt_library: PromptLibrary, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(opik_registry, "_PROMPT_PAGE_SIZE", 2)
+    for name in ("a", "b", "c", "d", "e"):
+        prompt_library.add(name, name, environments=("production",))
+
+    assert unpointed_labels(pointers(b="v1")) == {
+        "a": "v1",
+        "c": "v1",
+        "d": "v1",
+        "e": "v1",
+    }
+
+
+@pytest.mark.usefixtures("prompt_library")
+def test_listing_prompts_from_an_unreachable_opik_raises_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def down(*_args: object, **_kwargs: object) -> None:
+        msg = "down"
+        raise httpx.ConnectError(msg)
+
+    monkeypatch.setattr(OpikPromptRegistry, "_names", down)
+
+    with pytest.raises(RegistryUnavailableError):
+        unpointed_labels(pointers(summary="v1"))
+
+
+def test_the_file_registry_lists_its_apps_exports(tmp_path: Path) -> None:
+    for name, app in (("summary", APP), ("tutor", APP), ("other", "dagster-ml")):
+        (tmp_path / f"{name}.prompt.yaml").write_text(
+            render_export(name, app, TextTemplate(template="t", version="v1")),
+            encoding="utf-8",
+        )
+
+    assert FilePromptRegistry(tmp_path).prompt_names(app=APP) == ["summary", "tutor"]
 
 
 def test_the_promote_command_says_what_moved(
