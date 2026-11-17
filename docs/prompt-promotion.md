@@ -272,8 +272,10 @@ read the production traces after the label moves:
 - New request-time traces name the new version within five minutes of the move. A trace on the
   old version after that comes from a batch run that started before the move, a pinned
   `version=` call, a process whose refresh is failing, or a process running on the export (whose
-  version is the old one until the image built from the merge deploys); the last two are marked
-  `degraded` with `embedded_prompt`.
+  version is the old one until the image built from the merge deploys). Only the export is marked
+  `degraded` with `embedded_prompt`. A failing refresh keeps serving the cached registry version
+  unmarked, so find it by the warning it logs ("Could not refresh prompt ...; serving the cached
+  version").
 - A trace marked `embedded_prompt` means that process's cold fetch missed the deadline or failed.
   A process that cannot reach Opik at all usually cannot deliver its trace there either, so look
   for the warning `get_prompt` logs ("The prompt registry did not return prompt ...") in the
