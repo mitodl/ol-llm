@@ -150,10 +150,11 @@ jobs:
       - name: Credentials are available
         env:
           OPIK_PROMOTION_CLIENT_ID: ${{ secrets.OPIK_PROMOTION_CLIENT_ID }}
+          OPIK_PROMOTION_CLIENT_SECRET: ${{ secrets.OPIK_PROMOTION_CLIENT_SECRET }}
           ENVIRONMENT: ${{ inputs.promotion-environment }}
         run: |
-          if [ -z "$OPIK_PROMOTION_CLIENT_ID" ]; then
-            echo "::error::No OPIK_PROMOTION_CLIENT_ID. Set it as a secret of the $ENVIRONMENT environment and pass it from the caller."
+          if [ -z "$OPIK_PROMOTION_CLIENT_ID" ] || [ -z "$OPIK_PROMOTION_CLIENT_SECRET" ]; then
+            echo "::error::No OPIK_PROMOTION_CLIENT_ID or OPIK_PROMOTION_CLIENT_SECRET. Set both as secrets of the $ENVIRONMENT environment and pass them from the caller."
             exit 1
           fi
       - name: Install
