@@ -417,13 +417,45 @@ thread or task. Every chat model span names the use case's model as the catalog'
 usage is not read by Opik's own LangChain tracer. The client must call the use case's model: a
 fallback the client tries when the primary fails is still named, and priced, as the primary.
 `graph` is drawn in Opik's agent graph view; `metadata` goes on the spans of the runs, not
-the root trace. `record` sets the trace's output. Retries, timeouts (from `resolve_policy`),
-and errors stay with the client; the block's exception passes through unchanged and the trace
-records it. A block left mid-stream (a `break`, an exception, a cancelled task) ends the runs
+the root trace. `record` sets the trace's output. The timeout and errors stay with the client,
+and `with_call_policy` (below) adds the use case's retries; the block's exception passes
+through unchanged and the trace records it. A block left mid-stream (a `break`, an exception, a cancelled task) ends the runs
 it left open with `cut_off` in their metadata and no error, since the block's exception is the
 root trace's; a cut-off chat span still names its model, without usage. The next `traced_chat`
 in the same task opens a trace of its own. Without
 `OL_LLM_TRACE_CONTENT`, no span keeps its input or output and an error keeps its type and frames.
+
+A LangChain chat model runs under the use case's policy in two parts. Its client takes the
+timeout, with its own retries off; for a `ChatLiteLLM`, `ol_llm.chat_litellm_kwargs(use_case)`
+returns those settings, with the caller's own `model_kwargs` merged into the ones it returns.
+`ol_llm.with_call_policy(model, use_case)` then wraps the model to retry:
+
+```python
+settings = ol_llm.chat_litellm_kwargs(TUTOR)
+llm = ChatLiteLLM(
+    model=model,
+    streaming=True,
+    **{**settings, "model_kwargs": {**settings["model_kwargs"], **model_kwargs}},
+)
+llm = ol_llm.with_call_policy(llm, TUTOR).bind_tools(tools)
+```
+
+The timeout bounds each read, so on a stream it bounds the gap between chunks, not the whole
+reply. The wrapper retries what the entry points retry (429, 408, 500, 502, 503, 504 and 529,
+and transport timeouts and disconnects) with their backoff and budget: on the request profile
+the waits share `max_backoff_seconds`, and a `Retry-After` longer than what is left ends the
+call. A stream is retried only until its first chunk. The status is read from the HTTP response
+in the exception's chain when there is one; litellm's 500 for an error it could not map (e.g. an
+error object inside a 200 stream) is not retried. Errors reach the caller as the model raised
+them, retried attempts don't appear in the trace, and `fallback_models` is not applied. Set the
+model's own fields (e.g. `temperature`) before wrapping it, and bind tools on the wrapper; its
+callbacks, tags, metadata, cache and rate limiter move to the wrapper. `with_structured_output`
+raises `NotImplementedError`, since LangChain's generic version would replace a `ChatLiteLLM`'s
+JSON-schema method with a forced tool call.
+
+The client's retries stay off because they don't keep to the policy: the OpenAI SDK waits out a
+`Retry-After` of up to 120 s whatever is left of the budget, and litellm caches an `azure/`
+client without keying on its retry count, so one use case's count would apply to another's.
 
 ### Batch
 
