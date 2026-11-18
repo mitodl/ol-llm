@@ -1,3 +1,0 @@
-### Changed
-
-- An app that does not set `OPIK_URL_OVERRIDE` (in the environment or `~/.opik.config`, and with no `OPIK_API_KEY`) no longer sends spans to Comet's hosted Opik, the SDK's default, which received prompt and completion text. The `opik` trace destination is left out with one warning per process naming `OPIK_URL_OVERRIDE`. Other named destinations, e.g. `otlp`, keep their spans, and with none left runs are untraced. `get_prompt` returns the embedded default marked degraded (`embedded_prompt`), as when Opik does not answer. Prompt sync, dataset seeding and other calls through `ol_llm.tracing.opik_client()` raise `OpikNotConfiguredError` (a `ValueError`). Set `OPIK_URL_OVERRIDE` to keep tracing to our Opik. (#90)
