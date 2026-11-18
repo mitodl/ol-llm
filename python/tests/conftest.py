@@ -11,13 +11,22 @@ import weakref
 from collections.abc import Generator, Mapping, Sequence
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import ol_llm.catalog as catalog_module
 import pytest
-from ol_llm import GatewayRoute, UseCase, loops, models, prompts, tracing
+from ol_llm import (
+    GatewayRoute,
+    UseCase,
+    loops,
+    models,
+    prompts,
+    trace_destinations,
+    tracing,
+)
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.experiments import configure_experiment_backend
 from ol_llm.models import build_agent, override_models
@@ -737,3 +746,20 @@ def recording_opik(
     reset_global_client()
     server.shutdown()
     server.server_close()
+
+
+@pytest.fixture
+def unconfigured_opik(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Generator[None]:
+    """No Opik instance named: no URL or API key in the environment, and an empty
+    SDK config file, so a developer's ``~/.opik.config`` cannot leak in."""
+    config = tmp_path / "opik.config"
+    config.write_text("")
+    monkeypatch.delenv("OPIK_URL_OVERRIDE")
+    monkeypatch.delenv("OPIK_API_KEY", raising=False)
+    monkeypatch.setenv("OPIK_CONFIG_PATH", str(config))
+    monkeypatch.setattr(trace_destinations, "_warned", set())
+    tracing.reset()
+    yield
+    tracing.reset()

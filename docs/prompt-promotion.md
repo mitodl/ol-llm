@@ -236,7 +236,7 @@ back to a version from before the move is a forward pointer change naming that i
 ## When Opik is down
 
 - What falls back: a fetch that fails in transport, times out, misses the 2 s deadline, or gets a
-  5xx. Running processes keep serving what they cached. A process that starts fetches nothing and
+  5xx, or finds no Opik configured (`OPIK_URL_OVERRIDE` unset). Running processes keep serving what they cached. A process that starts fetches nothing and
   runs on the embedded default, marked degraded, and every `get_prompt` call in it can wait up to
   2 s until Opik answers, since the fallback is not cached.
 - What does not fall back: a 4xx, e.g. from APISIX or Keycloak in front of Opik, raises out of

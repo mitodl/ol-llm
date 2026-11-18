@@ -6,9 +6,11 @@ name (e.g. Tempo), and ``memory`` for tests. Every span goes to each destination
 named. Another package adds a destination with an entry point in the
 ``ol_llm.trace_destinations`` group, naming a factory that takes
 ``DestinationSettings`` and returns a ``TraceDestination``, or in code with
-``register_trace_destination``.
+``register_trace_destination``. A destination that is named but not configured (e.g.
+``opik`` without ``OPIK_URL_OVERRIDE``) is left out, with one warning per process.
 """
 
+import logging
 from collections.abc import Callable, Mapping, Sequence
 
 from ol_llm.plugins import NamedFactories
@@ -38,6 +40,8 @@ __all__ = [
     "tracing_disabled",
 ]
 
+logger = logging.getLogger(__name__)
+
 ENTRY_POINT_GROUP = "ol_llm.trace_destinations"
 DEFAULT_DESTINATIONS = ("opik",)
 
@@ -53,6 +57,9 @@ _destinations: NamedFactories[DestinationFactory] = NamedFactories(
         "memory": MemoryDestination,
     },
 )
+
+
+_warned: set[str] = set()
 
 
 def register_trace_destination(name: str, factory: DestinationFactory) -> None:
@@ -89,7 +96,10 @@ def tracing_disabled(names: Sequence[str], environ: Mapping[str, str]) -> bool:
 def build_destinations(
     names: Sequence[str], settings: DestinationSettings
 ) -> tuple[TraceDestination, ...]:
-    """Build the named destinations, in order.
+    """Build the named destinations, in order, except those not configured.
+
+    A destination that is not configured (``TraceDestination.unconfigured``) is
+    left out and logged once per process; the rest are built as usual.
 
     :param names: the destinations' names.
     :param settings: what each is built from.
@@ -97,4 +107,15 @@ def build_destinations(
     :rtype: tuple[TraceDestination, ...]
     :raises ValueError: if a name names no destination.
     """
-    return tuple(_destinations.get(name)(settings) for name in names)
+    built = []
+    for name in names:
+        factory = _destinations.get(name)
+        if isinstance(factory, type) and issubclass(factory, TraceDestination):
+            reason = factory.unconfigured(settings.environ)
+            if reason is not None:
+                if name not in _warned:
+                    _warned.add(name)
+                    logger.warning("Trace destination %r is not used: %s", name, reason)
+                continue
+        built.append(factory(settings))
+    return tuple(built)

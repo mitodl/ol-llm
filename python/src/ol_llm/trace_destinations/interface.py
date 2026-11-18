@@ -154,6 +154,19 @@ class TraceDestination(ABC):
         """
         return False
 
+    @classmethod
+    def unconfigured(cls, environ: Mapping[str, str]) -> str | None:  # noqa: ARG003
+        """Return why the destination cannot be used as configured, if it cannot.
+
+        Checked before the destination is built. A destination that says so is
+        left out, with a warning once per process; the others keep their spans.
+
+        :param environ: the process environment.
+        :returns: the reason, or ``None`` when the destination can be built.
+        :rtype: str | None
+        """
+        return None
+
     @abstractmethod
     def span_processor(self, app: str) -> SpanProcessor:
         """Return the processor that sends one app's spans to this destination.
