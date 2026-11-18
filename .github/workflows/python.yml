@@ -165,3 +165,32 @@ jobs:
             -c "$RUNNER_TEMP/edx-base.txt" \
             --python-version 3.12 \
             -o "$RUNNER_TEMP/resolved.txt"
+
+  # The check to require in the branch ruleset, so the matrix above can change without
+  # editing the ruleset (a required matrix name like "test (Python 3.11)" would wait
+  # forever once that cell is removed). newest-dependencies and edx-platform-resolution
+  # are left out: they resolve the newest upstream releases or edx-platform master, and an
+  # upstream change there shouldn't block every PR. They still run and report.
+  ci-gate:
+    name: ci-gate
+    needs: [test, base-install, slim-smoke]
+    # Without this the gate is skipped when a dependency fails, and GitHub treats a
+    # skipped required job as successful.
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Evaluate CI result
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          failed=$(echo "$NEEDS" | jq -r '
+            to_entries[]
+            | select(.value.result != "success" and .value.result != "skipped")
+            | .key')
+          if [ -n "$failed" ]; then
+            echo "::error::CI did not succeed: $(echo "$failed" | paste -sd, -)"
+            exit 1
+          fi
