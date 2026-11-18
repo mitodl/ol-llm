@@ -83,9 +83,15 @@ jobs:
       - name: Credentials are available
         env:
           OPIK_KEYCLOAK_CLIENT_ID: ${{ secrets.OPIK_KEYCLOAK_CLIENT_ID }}
+          OPIK_KEYCLOAK_CLIENT_SECRET: ${{ secrets.OPIK_KEYCLOAK_CLIENT_SECRET }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
         run: |
-          if [ -z "$OPIK_KEYCLOAK_CLIENT_ID" ]; then
-            echo "::error::No Opik credentials. Pull requests from forks get no secrets, so their pointers cannot be checked."
+          if [ -z "$OPIK_KEYCLOAK_CLIENT_ID" ] || [ -z "$OPIK_KEYCLOAK_CLIENT_SECRET" ]; then
+            if [ "$IS_FORK" = "true" ]; then
+              echo "::error::No Opik credentials. Pull requests from forks get no secrets, so their pointers cannot be checked."
+            else
+              echo "::error::No Opik credentials. The calling workflow passed an empty OPIK_KEYCLOAK_CLIENT_ID or OPIK_KEYCLOAK_CLIENT_SECRET. Check that the repository secrets its secrets: block maps to them exist (https://github.com/mitodl/ol-llm/blob/main/docs/prompt-promotion.md)."
+            fi
             exit 1
           fi
       # The check never installs or runs the pull request's code: it runs ol-llm
@@ -144,10 +150,11 @@ jobs:
       - name: Credentials are available
         env:
           OPIK_PROMOTION_CLIENT_ID: ${{ secrets.OPIK_PROMOTION_CLIENT_ID }}
+          OPIK_PROMOTION_CLIENT_SECRET: ${{ secrets.OPIK_PROMOTION_CLIENT_SECRET }}
           ENVIRONMENT: ${{ inputs.promotion-environment }}
         run: |
-          if [ -z "$OPIK_PROMOTION_CLIENT_ID" ]; then
-            echo "::error::No OPIK_PROMOTION_CLIENT_ID. Set it as a secret of the $ENVIRONMENT environment and pass it from the caller."
+          if [ -z "$OPIK_PROMOTION_CLIENT_ID" ] || [ -z "$OPIK_PROMOTION_CLIENT_SECRET" ]; then
+            echo "::error::No OPIK_PROMOTION_CLIENT_ID or OPIK_PROMOTION_CLIENT_SECRET. Set both as secrets of the $ENVIRONMENT environment and pass them from the caller."
             exit 1
           fi
       - name: Install
