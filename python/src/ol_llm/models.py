@@ -119,6 +119,8 @@ IN_STREAM_RETRYABLE_STATUSES = frozenset({424})
 PydanticAI gives Bedrock's in-stream modelStreamErrorException status 424, and
 Bedrock says to retry it. Before a stream opens, Bedrock's 424 is a
 ModelErrorException, which it gives no retry advice for, so it stays rejected.
+Its ``originalStatusCode`` member, when it names a status that rejects one input,
+makes it a rejection of that row (``LLMRejected.original_status_code``).
 """
 
 RATE_LIMITED_STATUS = 429
@@ -270,7 +272,11 @@ def classify_failure(  # noqa: PLR0911
         ):
             return LLMUnavailable(message, use_case=use_case, model=model)
         return LLMRejected(
-            message, use_case=use_case, model=model, status_code=exc.status_code
+            message,
+            use_case=use_case,
+            model=model,
+            status_code=exc.status_code,
+            original_status_code=_original_status_code(exc, model=model),
         )
     unavailable: tuple[type[Exception], ...] = (
         ModelAPIError,
@@ -282,6 +288,27 @@ def classify_failure(  # noqa: PLR0911
     if isinstance(exc, _TRANSPORT_ERRORS):
         return LLMRejected(message, use_case=use_case, model=model, status_code=None)
     return None
+
+
+def _original_status_code(exc: ModelHTTPError, *, model: str) -> int | None:
+    """Read the ``originalStatusCode`` of a Bedrock 424 raised outside a stream.
+
+    PydanticAI passes the botocore ``ClientError.response`` as the body, and botocore
+    parses a modeled error member into that mapping's top level as an ``int``.
+    Logs it with the ``resourceName`` so the first real one shows what Bedrock sends.
+    """
+    if exc.status_code not in IN_STREAM_RETRYABLE_STATUSES or exc.in_stream:
+        return None
+    body = exc.body if isinstance(exc.body, Mapping) else {}
+    original = body.get("originalStatusCode")
+    log.warning(
+        "Bedrock ModelErrorException (424) on %s: "
+        "originalStatusCode=%r resourceName=%r",
+        model,
+        original,
+        body.get("resourceName"),
+    )
+    return original if isinstance(original, int) else None
 
 
 def _classify_group(

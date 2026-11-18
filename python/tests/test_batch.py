@@ -60,6 +60,16 @@ def row_rejected() -> LLMRejected:
     return rejected(400)
 
 
+def bedrock_424(original_status_code: int | None) -> LLMRejected:
+    return LLMRejected(
+        "model error",
+        use_case="s",
+        model=PRIMARY,
+        status_code=424,
+        original_status_code=original_status_code,
+    )
+
+
 def unavailable() -> LLMUnavailable:
     return LLMUnavailable("503", use_case="s", model=PRIMARY)
 
@@ -220,6 +230,44 @@ def test_a_rejection_of_the_account_or_model_opens_the_circuit_at_once(
     breaker = CircuitBreaker()
 
     breaker.record_failure(rejected(status_code))
+
+    assert breaker.is_open
+
+
+@pytest.mark.parametrize("original", [500, 424, None])
+def test_a_424_without_a_row_rejecting_original_status_opens_the_circuit(
+    original: int | None,
+) -> None:
+    breaker = CircuitBreaker()
+
+    breaker.record_failure(bedrock_424(original))
+
+    assert breaker.is_open
+    assert RowFailure("row", bedrock_424(original)).retry_next_run
+
+
+@pytest.mark.parametrize("original", [400, 413, 422])
+def test_a_424_with_a_row_rejecting_original_status_fails_only_the_row(
+    original: int,
+) -> None:
+    error = bedrock_424(original)
+    called, call = failing_on({"b": error})
+
+    report = process_batch(list("abcd"), call, Recorder(), chunk_size=2)
+
+    assert called == list("abcd")
+    assert report.succeeded == 3
+    assert report.failures == [RowFailure("b", error)]
+    assert not report.failures[0].retry_next_run
+    assert report.circuit_opened_by is None
+
+
+def test_424_row_rejections_count_toward_the_rejection_threshold() -> None:
+    breaker = CircuitBreaker(max_consecutive_rejections=2)
+
+    breaker.record_failure(bedrock_424(400))
+    assert not breaker.is_open
+    breaker.record_failure(bedrock_424(400))
 
     assert breaker.is_open
 
