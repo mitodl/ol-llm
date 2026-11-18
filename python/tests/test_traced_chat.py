@@ -26,6 +26,7 @@ from langchain_core.runnables import Runnable, RunnableConfig, RunnableLambda
 from ol_llm import (
     Attribution,
     UseCase,
+    chat_litellm_kwargs,
     check_chat_model,
     run_sync,
     traced_chat,
@@ -837,3 +838,24 @@ def test_a_cached_reply_carries_the_usage_opik_prices_its_provider_from(
     assert {key: usage.get(key) for key in priced_from} == priced_from
     # The SDK parsed the provider's own shape: every input token is counted once.
     assert (usage["prompt_tokens"], usage["completion_tokens"]) == (20, 5)
+
+
+def test_chat_litellm_kwargs_apply_the_profile_defaults() -> None:
+    assert chat_litellm_kwargs(TUTOR, environ={}) == {
+        "request_timeout": 60,
+        "max_retries": 1,
+        "model_kwargs": {"max_retries": 2},
+    }
+
+
+def test_chat_litellm_kwargs_follow_environment_overrides() -> None:
+    environ = {"OL_LLM_TUTOR_TIMEOUT_SECONDS": "120", "OL_LLM_REQUEST_MAX_RETRIES": "0"}
+
+    kwargs = chat_litellm_kwargs(TUTOR, environ=environ)
+
+    # Only the provider client retries, so LangChain stays at one attempt.
+    assert kwargs == {
+        "request_timeout": 120.0,
+        "max_retries": 1,
+        "model_kwargs": {"max_retries": 0},
+    }

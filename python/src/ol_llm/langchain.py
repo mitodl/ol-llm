@@ -6,8 +6,9 @@ fields, the catalog checks ``build_model`` runs, and a ``model_status`` tag for 
 deprecated or unlisted model. It yields the LangChain callbacks the trace
 destinations give for recording the call site's runs; for Opik, its LangChain
 tracer, which names and prices every chat model span by the catalog
-(``ol_llm.trace_destinations.opik_langchain``). Retries, timeouts (from
-``resolve_policy``), and errors stay with the caller's client.
+(``ol_llm.trace_destinations.opik_langchain``). Retries, timeouts, and errors stay
+with the caller's client; ``chat_litellm_kwargs`` turns the use case's policy into
+settings for a langchain-litellm ``ChatLiteLLM``.
 
 Needs the ``langchain`` extra.
 """
@@ -22,9 +23,59 @@ from langchain_core.runnables.graph import Graph
 
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution
 from ol_llm.catalog import check_chat_model
-from ol_llm.policy import UseCase
+from ol_llm.policy import UseCase, resolve_policy
 from ol_llm.traces import TracedCall, TraceOutput, current_call
 from ol_llm.tracing import destinations, enabled
+
+
+def chat_litellm_kwargs(
+    use_case: UseCase, environ: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Return ``ChatLiteLLM`` settings that apply the use case's call policy.
+
+    The timeout becomes ``request_timeout``. litellm hands it to the provider's
+    OpenAI-SDK client as the httpx timeout, which bounds each read, so on a stream
+    it bounds the wait for the response and the gap between chunks, never the
+    whole reply (checked in litellm 1.105.7 and openai 2.54.0).
+
+    The retries go to that client (``model_kwargs["max_retries"]``), which retries
+    timeouts, connection errors, 408, 409, 429 and 5xx before it returns the
+    response, so a stream is never retried once its response has started.
+    ``ChatLiteLLM.max_retries`` counts attempts, not retries, and its retry wraps
+    only the start of a stream too; it is set to 1 so the two layers don't
+    multiply. Do not set litellm's ``num_retries``, which retries the whole call
+    again on top.
+
+    Two differences from the entry points' policy: the OpenAI SDK waits as long
+    as a 429's Retry-After asks, up to 120 s per retry, where ol-llm ends the call
+    once a wait would exceed ``max_backoff_seconds``; and only providers litellm
+    calls through the OpenAI SDK (``openai/``, ``azure/``, OpenAI-compatible
+    proxies) read ``max_retries``.
+
+    For example, with the caller's own ``model_kwargs`` merged in::
+
+        policy = ol_llm.chat_litellm_kwargs(TUTOR)
+        ChatLiteLLM(
+            model=model,
+            streaming=True,
+            **{**policy, "model_kwargs": {**policy["model_kwargs"], **model_kwargs}},
+        )
+
+    :param use_case: the call site.
+    :param environ: the environment ``resolve_policy`` reads; ``os.environ`` when
+        omitted.
+    :returns: ``request_timeout``, ``max_retries`` and ``model_kwargs`` for the
+        ``ChatLiteLLM`` constructor.
+    :rtype: dict[str, Any]
+    :raises ValueError: if an environment override does not parse or is out of
+        range.
+    """
+    policy = resolve_policy(use_case, environ)
+    return {
+        "request_timeout": policy.timeout_seconds,
+        "max_retries": 1,
+        "model_kwargs": {"max_retries": policy.max_retries},
+    }
 
 
 def _root_input(user_prompt: str | None) -> None:

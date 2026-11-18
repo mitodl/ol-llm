@@ -425,6 +425,25 @@ root trace's; a cut-off chat span still names its model, without usage. The next
 in the same task opens a trace of its own. Without
 `OL_LLM_TRACE_CONTENT`, no span keeps its input or output and an error keeps its type and frames.
 
+A `ChatLiteLLM` takes the use case's policy from `ol_llm.chat_litellm_kwargs(use_case)`, with
+the caller's own `model_kwargs` merged into the ones it returns:
+
+```python
+policy = ol_llm.chat_litellm_kwargs(TUTOR)
+llm = ChatLiteLLM(
+    model=model,
+    streaming=True,
+    **{**policy, "model_kwargs": {**policy["model_kwargs"], **model_kwargs}},
+)
+```
+
+The timeout bounds each read, so on a stream it bounds the gap between chunks, not the whole
+reply. The retries run in the provider's OpenAI-SDK client, before the response starts, so a
+stream is never retried after its first chunk; `ChatLiteLLM`'s own retry is set to one attempt
+so the two don't multiply. Unlike the entry points, the SDK waits out a 429's `Retry-After` of
+up to 120 s instead of ending the call past `max_backoff_seconds`, and only providers litellm
+calls through the OpenAI SDK (`openai/`, `azure/`, OpenAI-compatible proxies) retry.
+
 ### Batch
 
 `ol_llm.process_batch(rows, call, persist)` runs `call` on each row and hands every

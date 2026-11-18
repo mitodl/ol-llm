@@ -90,7 +90,7 @@ from ol_llm.tracing import (
 
 if TYPE_CHECKING:
     from ol_llm.embeddings import EmbedResult, embed, embed_sync
-    from ol_llm.langchain import ChatTrace, traced_chat
+    from ol_llm.langchain import ChatTrace, chat_litellm_kwargs, traced_chat
     from ol_llm.models import agent_over, build_agent, build_model, usage_limits
     from ol_llm.runs import (
         LLMResult,
@@ -108,6 +108,7 @@ __version__ = version("ol-llm")
 
 _LAZY_EXPORTS = {
     "ChatTrace": "ol_llm.langchain",
+    "chat_litellm_kwargs": "ol_llm.langchain",
     "traced_chat": "ol_llm.langchain",
     "EmbedResult": "ol_llm.embeddings",
     "embed": "ol_llm.embeddings",
@@ -172,6 +173,7 @@ __all__ = [
     "build_agent",
     "build_model",
     "celery_rate_limit",
+    "chat_litellm_kwargs",
     "check_chat_model",
     "check_model_ids",
     "close_thread_loop",
