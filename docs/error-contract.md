@@ -51,7 +51,8 @@ Failures are classified by type and status, never by message text:
 | HTTP 408, 500, 502, 503, 504, 529 | `LLMUnavailable` | yes | yes |
 | a timeout, a dropped connection, a broken response | `LLMUnavailable` | yes | yes |
 | HTTP 424 inside a stream (Bedrock's `modelStreamErrorException`) | `LLMUnavailable` | yes | yes |
-| any other HTTP status, including a 424 outside a stream; any other transport error | `LLMRejected` (carries `status_code`, none for a transport error) | no | no |
+| HTTP 424 outside a stream (Bedrock's `ModelErrorException`) | `LLMRejected` (`status_code` 424, and `original_status_code` from the `originalStatusCode` member when it is an integer) | no | no |
+| any other HTTP status; any other transport error | `LLMRejected` (carries `status_code`, none for a transport error) | no | no |
 | the provider's content filter | `LLMContentFiltered` | no | no |
 | invalid output once output retries are spent | `LLMInvalidOutput` | no | no |
 | a run's usage limit | `LLMBudgetExceeded` | no | no |
@@ -100,9 +101,11 @@ is marked degraded, on the returned value and on the trace as `degraded` and
 
 A row failure records its class and does not fail the chunk. An `LLMRejected` with a 400, 413,
 or 422 rejects the row's input and fails only that row, but ten in a row open the circuit,
-since then the request is wrong for every row. Any other `LLMRejected` opens the circuit at
-once, since retrying a configuration bug burns budget. `LLMRateLimited` and `LLMUnavailable`
-count toward a separate threshold (three in a row by default). A success, or a failure the
+since then the request is wrong for every row. A Bedrock 424 outside a stream counts the same
+when its `original_status_code` is 400, 413, or 422; with any other value, or none, it is
+like any other `LLMRejected`, which opens the circuit at once, since retrying a
+configuration bug burns budget. `LLMRateLimited` and `LLMUnavailable` count toward a
+separate threshold (three in a row by default). A success, or a failure the
 provider answered (invalid output, a content filter, a usage limit, a row rejection), resets
 that count; a rate limit or an outage leaves the rejection count alone.
 

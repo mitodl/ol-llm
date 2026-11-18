@@ -76,19 +76,30 @@ class LLMUnavailable(LLMError):
 class LLMRejected(LLMError):
     """The provider refused the request: our bug or configuration, or one input.
 
-    A 400, 413, or 422 can reject one input (too long, malformed); the batch
-    helpers fail only that row (``ol_llm.batch.rejects_the_row``).
+    A 400, 413, or 422 can reject one input (too long, malformed), as can a Bedrock
+    424 whose ``originalStatusCode`` is one of those; the batch helpers fail only
+    that row (``ol_llm.batch.rejects_the_row``).
 
     :param status_code: the HTTP status, or ``None`` for a transport error that
         retrying cannot fix (a bad URL scheme, a proxy failure).
+    :param original_status_code: for a Bedrock 424 outside a stream, the
+        ``originalStatusCode`` it reported, when it is an integer. ``None`` for
+        every other rejection.
     """
 
     def __init__(
-        self, message: str, *, use_case: str, model: str, status_code: int | None
+        self,
+        message: str,
+        *,
+        use_case: str,
+        model: str,
+        status_code: int | None,
+        original_status_code: int | None = None,
     ) -> None:
         """Record the status the provider answered with."""
         super().__init__(message, use_case=use_case, model=model)
         self.status_code = status_code
+        self.original_status_code = original_status_code
 
 
 class LLMContentFiltered(LLMError):

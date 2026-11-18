@@ -161,6 +161,92 @@ def test_failures_are_classified_by_type_and_status(
         assert error.status_code == status
 
 
+def bedrock_424(
+    body: object,
+    *,
+    in_stream: bool = False,
+    code: str | None = "ModelErrorException",
+) -> ModelHTTPError:
+    return ModelHTTPError(
+        424, "claude", body=body, in_stream=in_stream, provider_error_code=code
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "original"),
+    [
+        ({"originalStatusCode": 400, "resourceName": "m"}, 400),
+        ({"originalStatusCode": 500}, 500),
+        ({"Error": {"Code": "ModelErrorException"}}, None),
+        ({"originalStatusCode": "400"}, None),
+        ("provider said no", None),
+        (None, None),
+    ],
+)
+def test_a_424_outside_a_stream_carries_its_original_status(
+    body: object, original: int | None
+) -> None:
+    error = classify_failure(bedrock_424(body), use_case="s", model=PRIMARY)
+
+    assert isinstance(error, LLMRejected)
+    assert error.status_code == 424
+    assert error.original_status_code == original
+
+
+def test_a_424_logs_the_original_status_and_resource(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    body = {"originalStatusCode": 400, "resourceName": "claude-haiku"}
+
+    classify_failure(bedrock_424(body), use_case="s", model=PRIMARY)
+
+    assert any(
+        "originalStatusCode=400" in message and "resourceName='claude-haiku'" in message
+        for message in (record.getMessage() for record in caplog.records)
+    )
+
+
+@pytest.mark.parametrize("code", [None, "SomethingElse"])
+def test_a_424_that_is_not_a_bedrock_model_error_is_not_read(
+    code: str | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    exc = bedrock_424({"originalStatusCode": 400}, code=code)
+
+    error = classify_failure(exc, use_case="s", model=PRIMARY)
+
+    assert isinstance(error, LLMRejected)
+    assert error.original_status_code is None
+    assert not [r for r in caplog.records if "originalStatusCode" in r.getMessage()]
+
+
+def test_a_bedrock_424_in_an_exception_group_keeps_its_original_status() -> None:
+    group = ExceptionGroup(
+        "titan", [bedrock_424({"originalStatusCode": 400, "resourceName": "m"})]
+    )
+
+    error = classify_failure(group, use_case="s", model=PRIMARY)
+
+    assert isinstance(error, LLMRejected)
+    assert error.original_status_code == 400
+
+
+def test_an_in_stream_424_stays_unavailable_whatever_it_carries() -> None:
+    error = classify_failure(
+        bedrock_424({"originalStatusCode": 400}, in_stream=True),
+        use_case="s",
+        model=PRIMARY,
+    )
+
+    assert type(error) is LLMUnavailable
+
+
+def test_other_rejections_have_no_original_status() -> None:
+    error = classify_failure(http_error(400), use_case="s", model=PRIMARY)
+
+    assert isinstance(error, LLMRejected)
+    assert error.original_status_code is None
+
+
 def test_rate_limit_carries_retry_after() -> None:
     error = classify_failure(
         http_error(429, {"Retry-After": "7"}), use_case="summary", model=PRIMARY
@@ -1055,15 +1141,18 @@ def test_tracing_disabled_restores_the_previous_state() -> None:
 
 
 def test_errors_survive_pickling() -> None:
-    original = LLMRejected("m", use_case="u", model=PRIMARY, status_code=400)
+    original = LLMRejected(
+        "m", use_case="u", model=PRIMARY, status_code=424, original_status_code=400
+    )
     restored = pickle.loads(pickle.dumps(original))  # noqa: S301
 
     assert type(restored) is LLMRejected
-    assert (restored.use_case, restored.status_code, restored.args) == (
-        "u",
-        400,
-        ("m",),
-    )
+    assert (
+        restored.use_case,
+        restored.status_code,
+        restored.original_status_code,
+        restored.args,
+    ) == ("u", 424, 400, ("m",))
 
 
 def test_error_copy_keeps_fields() -> None:

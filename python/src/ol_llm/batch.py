@@ -47,7 +47,8 @@ DEFAULT_MAX_CONSECUTIVE_REJECTIONS = 10
 SAMPLE_ERROR_COUNT = 3
 
 # Statuses that reject one row's input (too long, malformed, filtered on the way in)
-# rather than the account, the model, or the request every row makes.
+# rather than the account, the model, or the request every row makes. A Bedrock 424
+# counts when its original status is one of these.
 ROW_REJECTION_STATUSES = frozenset({400, 413, 422})
 
 _COUNTED = (LLMRateLimited, LLMUnavailable)
@@ -139,13 +140,18 @@ def rejects_the_row(error: LLMError) -> bool:
     """Whether a rejection is about one row's input rather than the whole batch.
 
     :param error: what the row's call raised.
-    :returns: ``True`` for an ``LLMRejected`` with a status in
-        ``ROW_REJECTION_STATUSES``.
+    :returns: ``True`` for an ``LLMRejected`` whose status, or whose
+        ``original_status_code`` when it has one, is in ``ROW_REJECTION_STATUSES``.
     :rtype: bool
     """
-    return (
-        isinstance(error, LLMRejected) and error.status_code in ROW_REJECTION_STATUSES
+    if not isinstance(error, LLMRejected):
+        return False
+    status = (
+        error.status_code
+        if error.original_status_code is None
+        else error.original_status_code
     )
+    return status in ROW_REJECTION_STATUSES
 
 
 @dataclass(frozen=True)
@@ -181,10 +187,10 @@ class CircuitBreaker:
 
     An ``LLMRejected`` of the account or the model (a 401, 403, 404, or a transport
     error) opens it at once, because it is our bug or our configuration and every
-    later row would hit it too. A rejection of one row's input (a 400, 413, or 422;
-    see ``rejects_the_row``) fails that row only, unless
-    ``max_consecutive_rejections`` come in a row, which means the request itself is
-    wrong (e.g. a parameter the model no longer takes). ``LLMRateLimited`` and
+    later row would hit it too. A rejection of one row's input (a 400, 413, or 422, or
+    a Bedrock 424 reporting one of them; see ``rejects_the_row``) fails that row only,
+    unless ``max_consecutive_rejections`` come in a row, which means the request itself
+    is wrong (e.g. a parameter the model no longer takes). ``LLMRateLimited`` and
     ``LLMUnavailable`` open it after ``max_consecutive_failures`` in a row.
 
     A success resets both counts. A row's own failure (invalid output, a content
