@@ -6,71 +6,96 @@ fields, the catalog checks ``build_model`` runs, and a ``model_status`` tag for 
 deprecated or unlisted model. It yields the LangChain callbacks the trace
 destinations give for recording the call site's runs; for Opik, its LangChain
 tracer, which names and prices every chat model span by the catalog
-(``ol_llm.trace_destinations.opik_langchain``). Retries, timeouts, and errors stay
-with the caller's client; ``chat_litellm_kwargs`` turns the use case's policy into
-settings for a langchain-litellm ``ChatLiteLLM``.
+(``ol_llm.trace_destinations.opik_langchain``). Timeouts stay with the caller's
+client; ``chat_litellm_kwargs`` sets a langchain-litellm ``ChatLiteLLM``'s from the
+use case's policy. ``with_call_policy`` wraps a chat model so its calls retry
+under that policy.
 
 Needs the ``langchain`` extra.
 """
 
-from collections.abc import Generator, Mapping, Sequence
+import asyncio
+import email.utils
+import time
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Generator,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from langchain_core.callbacks import BaseCallbackHandler
+import httpx
+import httpx2
+from langchain_core.callbacks import (
+    AsyncCallbackManagerForLLMRun,
+    BaseCallbackHandler,
+    CallbackManagerForLLMRun,
+)
+from langchain_core.language_models import BaseChatModel, LanguageModelInput
+from langchain_core.language_models.base import LangSmithParams
+from langchain_core.language_models.chat_models import (
+    agenerate_from_stream,
+    generate_from_stream,
+)
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatGenerationChunk, ChatResult
+from langchain_core.runnables import Runnable, RunnableBinding
 from langchain_core.runnables.graph import Graph
+from pydantic import ConfigDict, InstanceOf
 
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution
 from ol_llm.catalog import check_chat_model
-from ol_llm.policy import UseCase, resolve_policy
+from ol_llm.errors import LLMError, LLMRateLimited, LLMRejected, LLMUnavailable
+from ol_llm.policy import CallPolicy, UseCase, resolve_policy
+from ol_llm.retries import (
+    RATE_LIMITED_STATUS,
+    RETRYABLE_STATUSES,
+    UNAVAILABLE_TRANSPORT_ERRORS,
+    RetryBudget,
+)
 from ol_llm.traces import TracedCall, TraceOutput, current_call
 from ol_llm.tracing import destinations, enabled
+
+MILLISECONDS_PER_SECOND = 1000
+
+# Patched in tests so retries do not wait.
+_sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep
+_sync_sleep: Callable[[float], Any] = time.sleep
 
 
 def chat_litellm_kwargs(
     use_case: UseCase, environ: Mapping[str, str] | None = None
 ) -> dict[str, Any]:
-    """Return ``ChatLiteLLM`` settings that apply the use case's call policy.
+    """Return ``ChatLiteLLM`` settings for the use case's timeout, with retries off.
 
     The timeout becomes ``request_timeout``. litellm hands it to the provider's
     OpenAI-SDK client as the httpx timeout, which bounds each read, so on a stream
     it bounds the wait for the response and the gap between chunks, never the
     whole reply (checked in litellm 1.105.7 and openai 2.54.0).
 
-    The retries go to that client (``model_kwargs["max_retries"]``), which retries
-    timeouts, connection errors, 408, 409, 429 and 5xx before it returns the
-    response, so a stream is never retried once its response has started.
-    ``ChatLiteLLM.max_retries`` counts attempts, not retries, and its retry wraps
-    only the start of a stream too; it is set to 1 so the two layers don't
-    multiply. Do not set litellm's ``num_retries``, which retries the whole call
-    again on top.
-
-    Where this departs from the entry points' policy:
-
-    - The SDK retries until the response headers arrive, not until the first
-      chunk, so a stream that stalls after its headers fails without a retry.
-    - The SDK's waits are not held to ``max_backoff_seconds``. It waits as long as
-      a Retry-After on any retryable status asks, up to 120 s, and does not retry
-      past that; otherwise it backs off 0.5 s doubling to at most 8 s per wait
-      (1.5 s over the default 2 retries, about 15.5 s over 5).
-    - The server can force or suppress a retry with ``x-should-retry``.
-    - On ``azure/``, litellm caches the client without keying on ``max_retries``,
-      so the first use case to build an Azure client sets the retries for every
-      use case sharing it; the timeout still applies per request.
-    - Only providers litellm calls through the OpenAI SDK (``openai/``,
-      ``azure/``, OpenAI-compatible proxies) read ``max_retries``; others drop
-      it.
-    - ``fallback_models`` is not applied.
+    Both of the client's retry layers are turned off, because neither keeps to
+    the policy: the OpenAI SDK's (``model_kwargs["max_retries"]``) waits out a
+    Retry-After of up to 120 s whatever is left of ``max_backoff_seconds``, and
+    litellm caches an Azure client without keying on its retry count; and
+    ``ChatLiteLLM``'s own (``max_retries`` counts attempts, so 1 is none). Wrap
+    the model with ``with_call_policy`` for the use case's retries. Do not set
+    litellm's ``num_retries``, which retries the whole call on top.
 
     For example, with the caller's own ``model_kwargs`` merged in::
 
-        policy = ol_llm.chat_litellm_kwargs(TUTOR)
-        ChatLiteLLM(
+        settings = ol_llm.chat_litellm_kwargs(TUTOR)
+        llm = ChatLiteLLM(
             model=model,
             streaming=True,
-            **{**policy, "model_kwargs": {**policy["model_kwargs"], **model_kwargs}},
+            **{**settings, "model_kwargs": {**settings["model_kwargs"], **extra}},
         )
+        llm = ol_llm.with_call_policy(llm, TUTOR)
 
     :param use_case: the call site.
     :param environ: the environment ``resolve_policy`` reads; ``os.environ`` when
@@ -85,8 +110,270 @@ def chat_litellm_kwargs(
     return {
         "request_timeout": policy.timeout_seconds,
         "max_retries": 1,
-        "model_kwargs": {"max_retries": policy.max_retries},
+        "model_kwargs": {"max_retries": 0},
     }
+
+
+def with_call_policy(
+    model: BaseChatModel, use_case: UseCase, environ: Mapping[str, str] | None = None
+) -> "PolicyChatModel":
+    """Wrap a LangChain chat model so its calls retry under the use case's policy.
+
+    It retries what the entry points retry (429, 408, 5xx and 529, and transport
+    timeouts and disconnects), with their backoff and budget: on the request
+    profile the waits share ``max_backoff_seconds``, and a Retry-After longer than
+    what is left ends the call. A stream is retried only until its first chunk;
+    a failure after that reaches the caller. The model's own client must not
+    retry, or the layers multiply (``chat_litellm_kwargs`` turns a
+    ``ChatLiteLLM``'s off). The timeout stays with the client.
+
+    A failure is classified by its ``status_code`` (litellm and the OpenAI SDK
+    set it) or an httpx timeout or disconnect in its ``__cause__`` chain, so no
+    provider SDK is imported. It reaches the caller as the model raised it, not
+    as an ``LLMError``. ``fallback_models`` is not applied.
+
+    Set the model's own fields, e.g. ``temperature``, before wrapping, and bind
+    tools on the wrapper: ``with_call_policy(llm, TUTOR).bind_tools(tools)``.
+
+    :param model: the chat model, with its client's retries off.
+    :param use_case: the call site.
+    :param environ: the environment ``resolve_policy`` reads; ``os.environ`` when
+        omitted.
+    :returns: the wrapped model.
+    :rtype: PolicyChatModel
+    :raises ValueError: if an environment override does not parse or is out of
+        range.
+    """
+    return PolicyChatModel(
+        inner=model, use_case=use_case, policy=resolve_policy(use_case, environ)
+    )
+
+
+def classify_chat_failure(
+    exc: BaseException, *, use_case: str, model: str
+) -> LLMError | None:
+    """Map a LangChain chat model's failure to the library error for its class.
+
+    :param exc: what the model raised.
+    :param use_case: the use case name, for the error.
+    :param model: the model id, for the error.
+    :returns: the library error, or ``None`` when ``exc`` is not a model request
+        failure.
+    :rtype: LLMError | None
+    """
+    message = str(exc)
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        if status == RATE_LIMITED_STATUS:
+            return LLMRateLimited(
+                message, use_case=use_case, model=model, retry_after=_retry_after(exc)
+            )
+        if status in RETRYABLE_STATUSES:
+            return LLMUnavailable(message, use_case=use_case, model=model)
+        return LLMRejected(message, use_case=use_case, model=model, status_code=status)
+    cause: BaseException | None = exc
+    while cause is not None:
+        if isinstance(cause, UNAVAILABLE_TRANSPORT_ERRORS):
+            return LLMUnavailable(message, use_case=use_case, model=model)
+        cause = cause.__cause__
+    return None
+
+
+def _retry_after(exc: BaseException) -> float | None:
+    """Read the seconds a rate-limited response asked to wait, if it said."""
+    headers = getattr(exc, "litellm_response_headers", None)
+    if not headers:
+        response = getattr(exc, "response", None)
+        if not isinstance(response, httpx.Response | httpx2.Response):
+            return None
+        headers = response.headers
+    lowered = {str(key).lower(): str(value) for key, value in headers.items()}
+    if (milliseconds := lowered.get("retry-after-ms")) is not None:
+        try:
+            return float(milliseconds) / MILLISECONDS_PER_SECOND
+        except ValueError:
+            pass
+    if (value := lowered.get("retry-after")) is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    return max(when.timestamp() - time.time(), 0.0)
+
+
+class PolicyChatModel(BaseChatModel):
+    """A chat model whose calls retry under a use case's policy.
+
+    Built by ``with_call_policy``; see there for what it retries. It calls the
+    wrapped model's own generate and stream methods with the same run manager,
+    so the runs callbacks see are the wrapper's, one per call.
+
+    :param inner: the wrapped chat model.
+    :param use_case: the call site.
+    :param policy: the resolved policy.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    inner: BaseChatModel
+    use_case: InstanceOf[UseCase]
+    policy: InstanceOf[CallPolicy]
+
+    @property
+    def _llm_type(self) -> str:
+        return self.inner._llm_type  # noqa: SLF001
+
+    @property
+    def _identifying_params(self) -> dict[str, Any]:
+        return dict(self.inner._identifying_params)  # noqa: SLF001
+
+    def _get_ls_params(
+        self,
+        stop: list[str] | None = None,
+        **kwargs: Any,  # noqa: ANN401
+    ) -> LangSmithParams:
+        return self.inner._get_ls_params(stop=stop, **kwargs)  # noqa: SLF001
+
+    def _should_stream(
+        self,
+        *,
+        async_api: bool,
+        run_manager: CallbackManagerForLLMRun
+        | AsyncCallbackManagerForLLMRun
+        | None = None,
+        **kwargs: Any,  # noqa: ANN401
+    ) -> bool:
+        return self.inner._should_stream(  # noqa: SLF001
+            async_api=async_api, run_manager=run_manager, **kwargs
+        )
+
+    def bind_tools(
+        self,
+        tools: Sequence[Any],
+        **kwargs: Any,  # noqa: ANN401
+    ) -> Runnable[LanguageModelInput, AIMessage]:
+        """Bind tools the way the wrapped model binds them.
+
+        :param tools: the tools.
+        :returns: the wrapper bound with the wrapped model's tool settings.
+        :rtype: Runnable[LanguageModelInput, AIMessage]
+        :raises TypeError: if the wrapped model's ``bind_tools`` does not bind the
+            model itself, so its settings cannot move to the wrapper.
+        """
+        bound = self.inner.bind_tools(tools, **kwargs)
+        if not isinstance(bound, RunnableBinding) or bound.bound is not self.inner:
+            msg = (
+                f"{type(self.inner).__name__}.bind_tools did not bind the model "
+                "itself, so its tools cannot be bound on the policy wrapper"
+            )
+            raise TypeError(msg)
+        return self.bind(**bound.kwargs)
+
+    def _delay(self, exc: Exception, budget: RetryBudget) -> float | None:
+        error = classify_chat_failure(
+            exc, use_case=self.use_case.name, model=self.use_case.model
+        )
+        return None if error is None else budget.next_delay(error)
+
+    def _inner_streams(self, kwargs: Mapping[str, Any]) -> bool:
+        # A model like ChatLiteLLM streams inside its own generate when its
+        # streaming field is on, so that path goes through the stream's rule.
+        return bool(kwargs.get("stream", getattr(self.inner, "streaming", False)))
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,  # noqa: ANN401
+    ) -> ChatResult:
+        if self._inner_streams(kwargs):
+            return generate_from_stream(
+                self._stream(messages, stop=stop, run_manager=run_manager, **kwargs)
+            )
+        budget = RetryBudget(self.policy, self.use_case.profile)
+        while True:
+            try:
+                return self.inner._generate(  # noqa: SLF001
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                )
+            except Exception as exc:
+                if (delay := self._delay(exc, budget)) is None:
+                    raise
+            _sync_sleep(delay)
+
+    async def _agenerate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,  # noqa: ANN401
+    ) -> ChatResult:
+        if self._inner_streams(kwargs):
+            return await agenerate_from_stream(
+                self._astream(messages, stop=stop, run_manager=run_manager, **kwargs)
+            )
+        budget = RetryBudget(self.policy, self.use_case.profile)
+        while True:
+            try:
+                return await self.inner._agenerate(  # noqa: SLF001
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                )
+            except Exception as exc:
+                if (delay := self._delay(exc, budget)) is None:
+                    raise
+            await _sleep(delay)
+
+    def _stream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: Any,  # noqa: ANN401
+    ) -> Iterator[ChatGenerationChunk]:
+        budget = RetryBudget(self.policy, self.use_case.profile)
+        while True:
+            started = False
+            try:
+                for chunk in self.inner._stream(  # noqa: SLF001
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                ):
+                    started = True
+                    yield chunk
+            except Exception as exc:
+                if started or (delay := self._delay(exc, budget)) is None:
+                    raise
+            else:
+                return
+            _sync_sleep(delay)
+
+    async def _astream(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: AsyncCallbackManagerForLLMRun | None = None,
+        **kwargs: Any,  # noqa: ANN401
+    ) -> AsyncIterator[ChatGenerationChunk]:
+        budget = RetryBudget(self.policy, self.use_case.profile)
+        while True:
+            started = False
+            try:
+                async for chunk in self.inner._astream(  # noqa: SLF001
+                    messages, stop=stop, run_manager=run_manager, **kwargs
+                ):
+                    started = True
+                    yield chunk
+            except Exception as exc:
+                if started or (delay := self._delay(exc, budget)) is None:
+                    raise
+            else:
+                return
+            await _sleep(delay)
 
 
 def _root_input(user_prompt: str | None) -> None:

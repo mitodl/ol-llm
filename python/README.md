@@ -417,39 +417,40 @@ thread or task. Every chat model span names the use case's model as the catalog'
 usage is not read by Opik's own LangChain tracer. The client must call the use case's model: a
 fallback the client tries when the primary fails is still named, and priced, as the primary.
 `graph` is drawn in Opik's agent graph view; `metadata` goes on the spans of the runs, not
-the root trace. `record` sets the trace's output. Retries, timeouts, and errors stay with the
-client (a `ChatLiteLLM` takes them from `chat_litellm_kwargs`, below); the block's exception passes through unchanged and the trace
-records it. A block left mid-stream (a `break`, an exception, a cancelled task) ends the runs
+the root trace. `record` sets the trace's output. The timeout and errors stay with the client,
+and `with_call_policy` (below) adds the use case's retries; the block's exception passes
+through unchanged and the trace records it. A block left mid-stream (a `break`, an exception, a cancelled task) ends the runs
 it left open with `cut_off` in their metadata and no error, since the block's exception is the
 root trace's; a cut-off chat span still names its model, without usage. The next `traced_chat`
 in the same task opens a trace of its own. Without
 `OL_LLM_TRACE_CONTENT`, no span keeps its input or output and an error keeps its type and frames.
 
-A `ChatLiteLLM` takes the use case's policy from `ol_llm.chat_litellm_kwargs(use_case)`, with
-the caller's own `model_kwargs` merged into the ones it returns:
+A LangChain chat model runs under the use case's policy in two parts. Its client takes the
+timeout, with its own retries off; for a `ChatLiteLLM`, `ol_llm.chat_litellm_kwargs(use_case)`
+returns those settings, with the caller's own `model_kwargs` merged into the ones it returns.
+`ol_llm.with_call_policy(model, use_case)` then wraps the model to retry:
 
 ```python
-policy = ol_llm.chat_litellm_kwargs(TUTOR)
+settings = ol_llm.chat_litellm_kwargs(TUTOR)
 llm = ChatLiteLLM(
     model=model,
     streaming=True,
-    **{**policy, "model_kwargs": {**policy["model_kwargs"], **model_kwargs}},
+    **{**settings, "model_kwargs": {**settings["model_kwargs"], **model_kwargs}},
 )
+llm = ol_llm.with_call_policy(llm, TUTOR).bind_tools(tools)
 ```
 
 The timeout bounds each read, so on a stream it bounds the gap between chunks, not the whole
-reply. The retries run in the provider's OpenAI-SDK client, before the response starts, so a
-stream is never retried after its first chunk; `ChatLiteLLM`'s own retry is set to one attempt
-so the two don't multiply. Where that departs from the entry points:
+reply. The wrapper retries what the entry points retry (429, 408, 5xx and 529, and transport
+timeouts and disconnects) with their backoff and budget: on the request profile the waits share
+`max_backoff_seconds`, and a `Retry-After` longer than what is left ends the call. A stream is
+retried only until its first chunk. Errors reach the caller as the model raised them, and
+`fallback_models` is not applied. Set the model's own fields (e.g. `temperature`) before
+wrapping it, and bind tools on the wrapper.
 
-- The SDK retries until the response headers arrive, not until the first chunk.
-- Its waits are not held to `max_backoff_seconds`: it honors a `Retry-After` of up to 120 s on
-  any retryable status (and does not retry past that), and otherwise backs off 0.5 s doubling to
-  8 s per wait.
-- On `azure/`, litellm caches the client without keying on `max_retries`, so a per-use-case
-  retry override does not reliably apply there; the timeout does.
-- Only providers litellm calls through the OpenAI SDK (`openai/`, `azure/`, OpenAI-compatible
-  proxies) retry, and `fallback_models` is not applied.
+The client's retries stay off because they don't keep to the policy: the OpenAI SDK waits out a
+`Retry-After` of up to 120 s whatever is left of the budget, and litellm caches an `azure/`
+client without keying on its retry count, so one use case's count would apply to another's.
 
 ### Batch
 

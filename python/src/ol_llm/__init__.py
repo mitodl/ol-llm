@@ -90,7 +90,13 @@ from ol_llm.tracing import (
 
 if TYPE_CHECKING:
     from ol_llm.embeddings import EmbedResult, embed, embed_sync
-    from ol_llm.langchain import ChatTrace, chat_litellm_kwargs, traced_chat
+    from ol_llm.langchain import (
+        ChatTrace,
+        PolicyChatModel,
+        chat_litellm_kwargs,
+        traced_chat,
+        with_call_policy,
+    )
     from ol_llm.models import agent_over, build_agent, build_model, usage_limits
     from ol_llm.runs import (
         LLMResult,
@@ -109,7 +115,9 @@ __version__ = version("ol-llm")
 _LAZY_EXPORTS = {
     "ChatTrace": "ol_llm.langchain",
     "chat_litellm_kwargs": "ol_llm.langchain",
+    "PolicyChatModel": "ol_llm.langchain",
     "traced_chat": "ol_llm.langchain",
+    "with_call_policy": "ol_llm.langchain",
     "EmbedResult": "ol_llm.embeddings",
     "embed": "ol_llm.embeddings",
     "embed_sync": "ol_llm.embeddings",
@@ -158,6 +166,7 @@ __all__ = [
     "LLMStream",
     "LLMUnavailable",
     "ManagedPrompt",
+    "PolicyChatModel",
     "PostProcessed",
     "Profile",
     "PromptVariablesError",
@@ -202,6 +211,7 @@ __all__ = [
     "traced_chat",
     "traced_embedding",
     "usage_limits",
+    "with_call_policy",
     "worst_case_seconds",
 ]
 
