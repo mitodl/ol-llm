@@ -320,13 +320,18 @@ def destinations() -> tuple[TraceDestination, ...]:
 def active() -> bool:
     """Return whether calls are traced right now.
 
-    That is, tracing is enabled and no destination's runtime switch is off.
+    That is, tracing is enabled, at least one destination was built, and no
+    destination's runtime switch is off.
 
     :returns: whether to trace.
     :rtype: bool
     """
     state = _state()
-    return state.config.enabled and all(d.active() for d in state.destinations)
+    return (
+        state.config.enabled
+        and bool(state.destinations)
+        and all(d.active() for d in state.destinations)
+    )
 
 
 def tracer_provider(app: str) -> TracerProvider | None:

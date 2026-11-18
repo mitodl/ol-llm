@@ -550,6 +550,7 @@ def test_opik_alone_without_a_url_traces_nothing_and_warns_once(
             configure_tracing(TracingConfig(destinations=("opik",)))
             assert tracing.destinations() == ()
             assert tracing.tracer_provider("mit-learn") is None
+            assert not tracing.active()
     with opik.record_traces_locally() as storage:
         run_sync(agent_for(SUMMARY, replying("ok")), "hi")
         traces = storage.trace_trees
