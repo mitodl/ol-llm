@@ -123,6 +123,9 @@ Its ``originalStatusCode`` member, when it names a status that rejects one input
 makes it a rejection of that row (``LLMRejected.original_status_code``).
 """
 
+BEDROCK_MODEL_ERROR_CODE = "ModelErrorException"
+"""The ``Error.Code`` botocore gives Bedrock's HTTP 424 outside a stream."""
+
 RATE_LIMITED_STATUS = 429
 INITIAL_BACKOFF_SECONDS = 0.5
 FALLBACK_ON = (LLMRateLimited, LLMUnavailable)
@@ -297,7 +300,7 @@ def _original_status_code(exc: ModelHTTPError, *, model: str) -> int | None:
     parses a modeled error member into that mapping's top level as an ``int``.
     Logs it with the ``resourceName`` so the first real one shows what Bedrock sends.
     """
-    if exc.status_code not in IN_STREAM_RETRYABLE_STATUSES or exc.in_stream:
+    if exc.provider_error_code != BEDROCK_MODEL_ERROR_CODE or exc.in_stream:
         return None
     body = exc.body if isinstance(exc.body, Mapping) else {}
     original = body.get("originalStatusCode")

@@ -32,7 +32,7 @@ from ol_llm import (
     process_batch,
     run_sync,
 )
-from ol_llm.models import build_agent, override_models
+from ol_llm.models import build_agent, classify_failure, override_models
 from pydantic import BaseModel, ConfigDict, create_model
 from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
@@ -260,6 +260,20 @@ def test_a_424_with_a_row_rejecting_original_status_fails_only_the_row(
     assert report.failures == [RowFailure("b", error)]
     assert not report.failures[0].retry_next_run
     assert report.circuit_opened_by is None
+
+
+def test_a_non_bedrock_424_with_an_original_status_opens_the_circuit() -> None:
+    error = classify_failure(
+        ModelHTTPError(424, "gpt", body={"originalStatusCode": 400}),
+        use_case="s",
+        model=PRIMARY,
+    )
+    breaker = CircuitBreaker()
+
+    assert error is not None
+    breaker.record_failure(error)
+
+    assert breaker.is_open
 
 
 def test_424_row_rejections_count_toward_the_rejection_threshold() -> None:

@@ -104,7 +104,8 @@ or 422 rejects the row's input and fails only that row, but ten in a row open th
 since then the request is wrong for every row. A Bedrock 424 outside a stream counts the same
 when its `original_status_code` is 400, 413, or 422; with any other value, or none, it is
 like any other `LLMRejected`, which opens the circuit at once, since retrying a
-configuration bug burns budget. `LLMRateLimited` and `LLMUnavailable` count toward a separate threshold (three in a row by default). A success, or a failure the
+configuration bug burns budget. `LLMRateLimited` and `LLMUnavailable` count toward a
+separate threshold (three in a row by default). A success, or a failure the
 provider answered (invalid output, a content filter, a usage limit, a row rejection), resets
 that count; a rate limit or an outage leaves the rejection count alone.
 

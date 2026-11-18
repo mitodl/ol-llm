@@ -161,8 +161,15 @@ def test_failures_are_classified_by_type_and_status(
         assert error.status_code == status
 
 
-def bedrock_424(body: object, *, in_stream: bool = False) -> ModelHTTPError:
-    return ModelHTTPError(424, "claude", body=body, in_stream=in_stream)
+def bedrock_424(
+    body: object,
+    *,
+    in_stream: bool = False,
+    code: str | None = "ModelErrorException",
+) -> ModelHTTPError:
+    return ModelHTTPError(
+        424, "claude", body=body, in_stream=in_stream, provider_error_code=code
+    )
 
 
 @pytest.mark.parametrize(
@@ -197,6 +204,30 @@ def test_a_424_logs_the_original_status_and_resource(
         "originalStatusCode=400" in message and "resourceName='claude-haiku'" in message
         for message in (record.getMessage() for record in caplog.records)
     )
+
+
+@pytest.mark.parametrize("code", [None, "SomethingElse"])
+def test_a_424_that_is_not_a_bedrock_model_error_is_not_read(
+    code: str | None, caplog: pytest.LogCaptureFixture
+) -> None:
+    exc = bedrock_424({"originalStatusCode": 400}, code=code)
+
+    error = classify_failure(exc, use_case="s", model=PRIMARY)
+
+    assert isinstance(error, LLMRejected)
+    assert error.original_status_code is None
+    assert not [r for r in caplog.records if "originalStatusCode" in r.getMessage()]
+
+
+def test_a_bedrock_424_in_an_exception_group_keeps_its_original_status() -> None:
+    group = ExceptionGroup(
+        "titan", [bedrock_424({"originalStatusCode": 400, "resourceName": "m"})]
+    )
+
+    error = classify_failure(group, use_case="s", model=PRIMARY)
+
+    assert isinstance(error, LLMRejected)
+    assert error.original_status_code == 400
 
 
 def test_an_in_stream_424_stays_unavailable_whatever_it_carries() -> None:
