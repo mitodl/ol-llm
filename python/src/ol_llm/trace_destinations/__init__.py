@@ -117,8 +117,8 @@ def build_destinations(
                     _warned.add(name)
                     logger.warning(
                         "Trace destination %r is not used: %s (read when tracing "
-                        "started; set it before the first traced call or "
-                        "configure_tracing())",
+                        "started; set it before the first traced call or the "
+                        "configure_tracing() call)",
                         name,
                         reason,
                     )
