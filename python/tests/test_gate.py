@@ -548,6 +548,12 @@ def test_a_gate_runs_the_pinned_versions_and_tags_the_change(
     assert "| 2 of 2 | not compared |" in markdown
 
 
+@pytest.mark.usefixtures("prompts", "unconfigured_opik")
+def test_a_gate_without_an_opik_url_cannot_run() -> None:
+    with pytest.raises(GateConfigurationError, match="OPIK_URL_OVERRIDE"):
+        run_gate(declaration(), suite=suite, change="pr-12")
+
+
 @pytest.mark.usefixtures("prompts")
 def test_a_missing_dataset_fails_with_how_to_create_it(
     client: FakeClient, runs: list[dict[str, Any]]

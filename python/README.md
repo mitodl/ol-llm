@@ -251,7 +251,8 @@ and the trace. A missing prompt, label, or version raises `LookupError`, and any
 from Opik (a 401, say) raises that error: those are configuration errors, not an outage. A
 default of the other structure (text where the registry holds chat) raises `TypeError`.
 With tracing off (`OPIK_TRACK_DISABLE=true`) `get_prompt` returns the embedded default
-unmarked, so local development needs no Opik.
+unmarked, so local development needs no Opik. With no Opik configured (`OPIK_URL_OVERRIDE`
+unset) it returns the embedded default marked degraded, as when Opik does not answer.
 
 Passing the prompt to `complete`, `run`, or `run_stream` links its version to the run's trace and puts `prompt_name` and
 `prompt_version` on the result and in the trace metadata. A run that renders several managed
@@ -856,7 +857,14 @@ span goes to every trace destination `OL_LLM_TRACE_DESTINATIONS` names:
   attributes as `opik.metadata.*`. A run inside a caller's own `@opik.track` is a span of the
   caller's trace, as before.
   It receives everything the trace records, content included when `OL_LLM_TRACE_CONTENT` is
-  on (the default).
+  on (the default). It is used only when the instance is named, with `OPIK_URL_OVERRIDE` (in
+  the environment or the SDK's `~/.opik.config`) or an `OPIK_API_KEY`: the SDK's default is
+  Comet's hosted Opik, which would receive prompts and completions from any app that imports
+  ol-llm without configuring one. Without them the destination is left out and one warning
+  naming `OPIK_URL_OVERRIDE` is logged per process. The other destinations keep their spans,
+  and with none left runs are untraced, as with `OPIK_TRACK_DISABLE=true`. Explicit Opik
+  operations (prompt sync, datasets, experiments) raise `OpikNotConfiguredError`, a
+  `ValueError`, instead; `get_prompt` falls back to the embedded default, marked degraded.
 - `otlp`: the spans unmapped, to the OTLP/HTTP endpoint the standard `OTEL_EXPORTER_OTLP_*`
   variables name, e.g. a Tempo. It receives the `ol.*` and `gen_ai.*` attributes (and no
   others but the content ones below), and by default none that carry learner content or
@@ -881,7 +889,7 @@ always send to the same instance:
 | --- | --- |
 | `OL_LLM_TRACE_DESTINATIONS` | comma-separated destinations, `opik` when unset |
 | `OL_LLM_TRACE_OTLP_CONTENT` | `true` lets the `otlp` destination receive content and user ids; off by default |
-| `OPIK_URL_OVERRIDE` | the Opik API, e.g. `https://opik-qa.ol.mit.edu/api` |
+| `OPIK_URL_OVERRIDE` | the Opik API, e.g. `https://opik-qa.ol.mit.edu/api`. Required for the `opik` destination and for any SDK call the app makes itself; unset, nothing is sent to Opik |
 | `OPIK_WORKSPACE` | `default` on our instances |
 | `OPIK_KEYCLOAK_TOKEN_URL`, `OPIK_KEYCLOAK_CLIENT_ID`, `OPIK_KEYCLOAK_CLIENT_SECRET` | the Keycloak client the app authenticates to Opik with; `OPIK_KEYCLOAK_SCOPE` if it needs one. Leave `OPIK_API_KEY` unset |
 | `OPIK_TRACK_DISABLE` | `true` turns tracing off when `opik` is a destination, for local development without an Opik. Runs open no call span and export no spans; SDK calls the app makes itself (prompt sync, datasets, experiments) still send the Keycloak token |

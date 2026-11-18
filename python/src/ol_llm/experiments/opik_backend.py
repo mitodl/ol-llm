@@ -66,6 +66,7 @@ from ol_llm.prompt_registry.opik_registry import opik_prompt, opik_version_id
 from ol_llm.prompts import ManagedPrompt
 from ol_llm.runs import LLMResult
 from ol_llm.settings import get_settings
+from ol_llm.trace_destinations.opik_destination import NOT_CONFIGURED, opik_configured
 
 _ITEM_FIELDS = frozenset(
     {
@@ -92,10 +93,15 @@ class OpikExperimentBackend(ExperimentBackend):
     """Datasets and experiments in the Opik that tracing is configured for."""
 
     def disabled_reason(self) -> str | None:
-        """Say that tracing is off, since then there is no Opik to run against."""
-        if tracing.enabled():
-            return None
-        return "Tracing is off (OPIK_TRACK_DISABLE), so there is no Opik to run against"
+        """Say why there is no Opik to run against: tracing is off or no URL is set."""
+        if not tracing.enabled():
+            return (
+                "Tracing is off (OPIK_TRACK_DISABLE), so there is no Opik to run "
+                "against"
+            )
+        if not opik_configured():
+            return NOT_CONFIGURED
+        return None
 
     def seed_dataset(
         self,

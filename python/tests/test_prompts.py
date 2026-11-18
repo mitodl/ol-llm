@@ -324,6 +324,16 @@ def test_a_cold_fetch_with_opik_unreachable_uses_the_embedded_default(
     assert prompt.degraded_reasons == ("embedded_prompt",)
 
 
+def test_a_fetch_with_no_opik_configured_uses_the_embedded_default(
+    unconfigured_opik: None,  # noqa: ARG001
+) -> None:
+    prompt = fetch(environment="production")
+
+    assert prompt.source == "embedded"
+    assert prompt.template == DEFAULT
+    assert prompt.degraded_reasons == ("embedded_prompt",)
+
+
 def test_a_refusal_from_opik_is_not_an_outage(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         OpikPromptRegistry, "_retrieve", failing(ApiError(status_code=401, body="no"))

@@ -4,7 +4,11 @@ Every call is recorded as OpenTelemetry spans (library spec §8.2 principle 5): 
 call span ``ol_llm.traces`` opens, with the §4 attribution as attributes named in
 ``ol_llm.trace_attributes``, and PydanticAI's, embedding, and memory spans under
 it. Each app gets a tracer provider whose span processors send every span to each
-configured trace destination (``ol_llm.trace_destinations``), Opik by default.
+configured trace destination (``ol_llm.trace_destinations``), Opik by default. Opik
+is used only when ``OPIK_URL_OVERRIDE`` names the instance (or an ``OPIK_API_KEY``
+is set): the SDK's default is Comet's hosted Opik, and spans carry prompts and
+completions. Otherwise that destination is left out with a warning, the others
+keep their spans, and with none left runs are untraced.
 
 Configuration is the environment: ``OL_LLM_TRACE_DESTINATIONS`` names the
 destinations, ``OL_LLM_TRACE_CONTENT`` says whether traces carry content, and
@@ -282,8 +286,11 @@ def opik_client() -> _opik.OpikClient:
 
     :returns: the client.
     :rtype: opik.Opik
+    :raises OpikNotConfiguredError: if ``OPIK_URL_OVERRIDE`` is not set, since the
+        SDK would then use Comet's hosted Opik; a ``ValueError``.
     :raises ValueError: if Keycloak is configured alongside ``OPIK_API_KEY``.
     """
+    _opik.require_configured()
     with _lock:
         state = _state()
         if not state.sdk_client_used:
@@ -313,25 +320,31 @@ def destinations() -> tuple[TraceDestination, ...]:
 def active() -> bool:
     """Return whether calls are traced right now.
 
-    That is, tracing is enabled and no destination's runtime switch is off.
+    That is, tracing is enabled, at least one destination was built, and no
+    destination's runtime switch is off.
 
     :returns: whether to trace.
     :rtype: bool
     """
     state = _state()
-    return state.config.enabled and all(d.active() for d in state.destinations)
+    return (
+        state.config.enabled
+        and bool(state.destinations)
+        and all(d.active() for d in state.destinations)
+    )
 
 
 def tracer_provider(app: str) -> TracerProvider | None:
     """Return the tracer provider for an app's spans.
 
     :param app: the app; a span outside any call goes to its project.
-    :returns: the provider, or ``None`` when tracing is off.
+    :returns: the provider, or ``None`` when tracing is off or no destination
+        remains (each named one was not configured).
     :rtype: TracerProvider | None
     """
     with _lock:
         state = _state()
-        if not state.config.enabled:
+        if not state.config.enabled or not state.destinations:
             return None
         if (provider := state.providers.get(app)) is None:
             provider = state.providers[app] = _build_provider(app, state)

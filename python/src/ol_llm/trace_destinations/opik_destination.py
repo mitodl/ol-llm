@@ -24,6 +24,9 @@ against the Opik 2.2.143 backend source; see the library spec §4.1 and §8.3):
 
 Configuration is the environment the SDK reads, so the SDK and the exporter agree
 on the instance: ``OPIK_URL_OVERRIDE``, ``OPIK_WORKSPACE``, ``OPIK_TRACK_DISABLE``.
+The instance must be named: the SDK's default is Comet's hosted Opik, so without
+``OPIK_URL_OVERRIDE`` (or an ``OPIK_API_KEY``, which says the app means Comet) the
+destination is dropped and ``tracing.opik_client`` refuses (``opik_configured``).
 A forked child drops the SDK's client and connection bundle without closing them,
 and builds new ones on its next SDK call.
 """
@@ -82,6 +85,11 @@ OTLP_TRACES_PATH = "/v1/private/otel/v1/traces"
 DEFAULT_EXPORT_TIMEOUT_SECONDS = 10.0
 """The OTLP exporter's timeout when no variable sets it."""
 
+NOT_CONFIGURED = (
+    "OPIK_URL_OVERRIDE is not set, so the Opik SDK would use Comet's hosted Opik; "
+    "set it to the Opik instance's API URL"
+)
+
 WORKSPACE_HEADER = "Comet-Workspace"
 PROJECT_HEADER = "projectName"
 
@@ -110,6 +118,37 @@ OpikClient = opik.Opik
 
 # Drives the call's Opik trace with the halves of opik.track's own wrapper.
 _TRACKER = OpikTrackDecorator()
+
+
+class OpikNotConfiguredError(ValueError):
+    """The Opik instance was not named, so the SDK would default to Comet's."""
+
+
+def opik_configured() -> bool:
+    """Return whether the app named an Opik instance.
+
+    The SDK's default URL is Comet's hosted Opik, which would get spans carrying
+    prompts and completions. A non-blank URL set in the environment or the SDK's
+    config file counts, and so does an ``OPIK_API_KEY`` that is not blank (the SDK
+    reads a blank one as unset), with which the app chose Comet.
+
+    :returns: whether to use the SDK's configuration.
+    :rtype: bool
+    """
+    config = OpikConfig()
+    named_url = "url_override" in config.model_fields_set and bool(
+        config.url_override.strip()
+    )
+    return named_url or config.api_key is not None
+
+
+def require_configured() -> None:
+    """Refuse an explicit Opik operation when no instance was named.
+
+    :raises OpikNotConfiguredError: if ``opik_configured`` is false.
+    """
+    if not opik_configured():
+        raise OpikNotConfiguredError(NOT_CONFIGURED)
 
 
 def global_client() -> opik.Opik:
@@ -319,6 +358,11 @@ class OpikDestination(TraceDestination):
         Read as the SDK reads it, from the process environment and config file.
         """
         return OpikConfig().track_disable
+
+    @classmethod
+    def unconfigured(cls, environ: Mapping[str, str]) -> str | None:  # noqa: ARG003
+        """Say why the destination is dropped when no Opik instance was named."""
+        return None if opik_configured() else NOT_CONFIGURED
 
     def __init__(self, settings: DestinationSettings) -> None:
         """Read the instance from the SDK's configuration, and authenticate the SDK.

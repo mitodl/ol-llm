@@ -32,6 +32,7 @@ from ol_llm.prompt_registry.interface import (
     RegistryVersion,
 )
 from ol_llm.templates import ChatTemplate, TemplateType, TextTemplate
+from ol_llm.trace_destinations.opik_destination import OpikNotConfiguredError
 
 _TRANSPORT_FAILURES = (
     TimeoutError,
@@ -79,7 +80,8 @@ class OpikPromptRegistry(PromptRegistry):
         :raises ValueError: unless exactly one of ``version`` and ``label`` is
             given.
         :raises RegistryUnavailableError: on a transport failure, a timeout, or a
-            5xx from Opik or from Keycloak's token endpoint.
+            5xx from Opik or from Keycloak's token endpoint, or when no Opik
+            instance is configured (``OPIK_URL_OVERRIDE``).
         """
         if (version is None) == (label is None):
             msg = "Pass exactly one of version and label"
@@ -87,6 +89,9 @@ class OpikPromptRegistry(PromptRegistry):
         try:
             detail = self._retrieve(name, app=app, version=version, label=label)
         except Exception as exc:
+            if isinstance(exc, OpikNotConfiguredError):
+                msg = f"No Opik is configured for prompt {name!r}: {exc}"
+                raise RegistryUnavailableError(msg) from exc
             if _unreachable(exc):
                 msg = f"Opik did not answer for prompt {name!r}: {exc!r}"
                 raise RegistryUnavailableError(msg) from exc
