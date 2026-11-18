@@ -6,6 +6,20 @@ All notable changes to ol-llm are recorded here. The format follows
 
 <!-- scriv-insert-here -->
 
+<a id='changelog-0.0.17'></a>
+## [0.0.17] - 2026-11-18
+
+### Added
+
+- `ol_llm.with_call_policy(model, use_case)` wraps a LangChain chat model in a
+  `PolicyChatModel` whose calls retry under the use case's policy, with the entry points'
+  backoff and `max_backoff_seconds` budget, and a stream only until its first chunk. Its
+  `with_structured_output` raises `NotImplementedError`. (#93)
+- `ol_llm.chat_litellm_kwargs(use_case)` returns `ChatLiteLLM` settings for the use case's
+  timeout, which bounds each read (the gap between chunks on a stream), with the client's own
+  retries off. (#93)
+- Catalog entries for `openai:gpt-5.4`, `openai:gpt-5.4-mini`, `azure:gpt-5.4`, and `azure:gpt-5.4-mini`, so they build without the `model_status:uncataloged` tag and have a price in the spend rules. GPT-5.4 is priced by prompt length, and the catalog records the price for prompts up to 272,000 tokens (#94).
+
 <a id='changelog-0.0.16'></a>
 ## [0.0.16] - 2026-11-18
 
