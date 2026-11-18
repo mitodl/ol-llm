@@ -110,8 +110,9 @@ are routed, traced, and costed under `eval-judge` like any other call. It should
 model under test. `judge_max_tokens` (a positive int, needs `judge_model`) caps each judge
 call's output. Set it for a Bedrock judge: without it the request asks for the model's maximum
 output, and Bedrock reserves that against the account's tokens-per-minute quota at the start of
-each call, so the experiment throttles early. The metrics are ol-llm's (`ol_llm.evaluation.Metric`): `ValidatorMetric`,
-the judge metrics `hallucination`, `answer_relevance`, `context_precision` and
+each call, so the experiment throttles early. A Claude judge's thinking tokens count toward the
+cap, so leave room for them. The metrics are ol-llm's (`ol_llm.evaluation.Metric`):
+`ValidatorMetric`, the judge metrics `hallucination`, `answer_relevance`, `context_precision` and
 `context_recall`, or a `Metric` subclass of the app's own. A suite imports no Opik.
 
 The gate runs on the experiment backend `OL_LLM_EXPERIMENT_BACKEND` names, Opik by default
