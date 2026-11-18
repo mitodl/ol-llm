@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import inspect
 import json
@@ -31,6 +32,7 @@ from ol_llm.evaluation import (
     SkippedItem,
     Threshold,
     ValidatorMetric,
+    _choose,
     check_experiment,
     check_thresholds,
     evaluate,
@@ -813,6 +815,71 @@ def test_the_judge_takes_no_provider_options() -> None:
 
 
 @pytest.mark.usefixtures("provider_env")
+def recording_judge(seen: list[int | None]) -> FunctionModel:
+    def reply(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        seen.append((info.model_settings or {}).get("max_tokens"))
+        if info.output_tools:
+            [tool] = info.output_tools
+            return ModelResponse(
+                parts=[ToolCallPart(tool.name, {"better": "A", "reason": "x"})]
+            )
+        return ModelResponse(parts=[TextPart("ok")])
+
+    return FunctionModel(reply)
+
+
+MESSAGES = [{"role": "user", "content": "q"}]
+
+
+def ask_sync(judge: JudgeModel) -> None:
+    judge.generate_string("q")
+    judge.generate_chat_completion(MESSAGES)
+    judge.respond(MESSAGES)
+
+
+async def ask_async(judge: JudgeModel) -> None:
+    await judge.agenerate_string("q")
+    await judge.agenerate_chat_completion(MESSAGES)
+    await judge.arespond(MESSAGES)
+
+
+def test_the_judge_bounds_every_call_to_max_tokens() -> None:
+    seen: list[int | None] = []
+    judge = judge_model(APP, JUDGE, max_tokens=256)
+
+    with override_models(recording_judge(seen)):
+        ask_sync(judge)
+        asyncio.run(ask_async(judge))
+
+    assert seen == [256] * 6
+
+
+def test_the_judge_sends_no_max_tokens_unless_set() -> None:
+    seen: list[int | None] = []
+    judge = judge_model(APP, JUDGE)
+
+    with override_models(recording_judge(seen)):
+        ask_sync(judge)
+        asyncio.run(ask_async(judge))
+
+    assert seen == [None] * 6
+
+
+def test_the_pairwise_judge_bounds_its_calls_to_max_tokens() -> None:
+    seen: list[int | None] = []
+
+    with override_models(recording_judge(seen)):
+        _choose(judge_model(APP, JUDGE, max_tokens=64), "Better.", {}, {}, {})
+
+    assert seen == [64]
+
+
+@pytest.mark.parametrize("max_tokens", [0, -1])
+def test_a_judge_max_tokens_must_be_positive(max_tokens: int) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        judge_model(APP, JUDGE, max_tokens=max_tokens)
+
+
 def test_the_judge_model_comes_from_the_catalog_under_the_judge_use_case() -> None:
     judge = judge_model(APP, JUDGE)
 

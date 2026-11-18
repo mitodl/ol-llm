@@ -1212,7 +1212,11 @@ def _choose(
         for label, value in (("Request", item), ("Answer A", a), ("Answer B", b))
     )
     return complete_sync(
-        judge.use_case, request, output_type=_PairwiseChoice, instructions=instructions
+        judge.use_case,
+        request,
+        output_type=_PairwiseChoice,
+        instructions=instructions,
+        model_settings=judge.model_settings,
     ).output
 
 

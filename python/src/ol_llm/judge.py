@@ -16,6 +16,7 @@ from pydantic_ai.messages import (
     TextPart,
     UserPromptPart,
 )
+from pydantic_ai.settings import ModelSettings
 
 from ol_llm.catalog import load_catalog
 from ol_llm.policy import UseCase
@@ -29,7 +30,7 @@ ChatMessage = Mapping[str, Any]
 ``content``."""
 
 
-def judge_model(app: str, model: str) -> "JudgeModel":
+def judge_model(app: str, model: str, *, max_tokens: int | None = None) -> "JudgeModel":
     """Return a judge that calls through ol-llm under the ``eval-judge`` use case.
 
     Pass it to a judge metric, e.g. ``hallucination(judge_model("learn-ai",
@@ -39,15 +40,20 @@ def judge_model(app: str, model: str) -> "JudgeModel":
     :param app: the app being evaluated; the judge's calls are traced and costed
         under it.
     :param model: the judge's model id, in ``provider:model`` form.
+    :param max_tokens: the most output tokens a judge call may produce. A
+        verdict is short, so set it: a request without one asks for the model's
+        maximum output, which Bedrock reserves against the account's
+        tokens-per-minute quota when the request starts.
     :returns: the judge.
     :rtype: JudgeModel
     :raises ValueError: if the catalog does not list the model, or lists it as
         retired or as an embedding model. Unlike a call site, a judge may not use
         an uncataloged model: its spend is shared evaluation cost, and the catalog
-        is where that is priced.
+        is where that is priced. Also if ``max_tokens`` is not positive.
     """
     return JudgeModel(
-        UseCase(app=app, name=JUDGE_USE_CASE, profile="batch", model=model)
+        UseCase(app=app, name=JUDGE_USE_CASE, profile="batch", model=model),
+        max_tokens=max_tokens,
     )
 
 
@@ -62,12 +68,18 @@ class JudgeModel:
     Build it with ``judge_model``, which names the use case ``eval-judge``.
 
     :param use_case: the judge's use case.
+    :param max_tokens: the most output tokens a judge call may produce; see
+        ``judge_model``.
     :raises ValueError: if the catalog does not list the use case's model, or
-        lists it as retired or as an embedding model.
+        lists it as retired or as an embedding model, or ``max_tokens`` is not
+        positive.
     """
 
-    def __init__(self, use_case: UseCase) -> None:
+    def __init__(self, use_case: UseCase, *, max_tokens: int | None = None) -> None:
         """Check the model against the catalog; it is built on the first call."""
+        if max_tokens is not None and max_tokens < 1:
+            msg = f"max_tokens must be a positive integer, got {max_tokens!r}"
+            raise ValueError(msg)
         if load_catalog().buildable(use_case.model, kind="chat") is None:
             msg = (
                 f"{use_case.model!r} is not in the model catalog; a judge must use "
@@ -75,6 +87,14 @@ class JudgeModel:
             )
             raise ValueError(msg)
         self.use_case = use_case
+        self.max_tokens = max_tokens
+
+    @property
+    def model_settings(self) -> ModelSettings | None:
+        """The settings every judge call carries; ``None`` when there are none."""
+        if self.max_tokens is None:
+            return None
+        return ModelSettings(max_tokens=self.max_tokens)
 
     @property
     def model_name(self) -> str:
@@ -98,7 +118,12 @@ class JudgeModel:
         """
         _no_options(kwargs)
         return _content(
-            complete_sync(self.use_case, input, output_type=response_format or str)
+            complete_sync(
+                self.use_case,
+                input,
+                output_type=response_format or str,
+                model_settings=self.model_settings,
+            )
         )
 
     async def agenerate_string(
@@ -110,7 +135,10 @@ class JudgeModel:
         """Answer one user message; see ``generate_string``."""
         _no_options(kwargs)
         result = await complete(
-            self.use_case, input, output_type=response_format or str
+            self.use_case,
+            input,
+            output_type=response_format or str,
+            model_settings=self.model_settings,
         )
         return _content(result)
 
@@ -138,6 +166,7 @@ class JudgeModel:
             history,
             output_type=response_format or str,
             instructions=instructions,
+            model_settings=self.model_settings,
         )
         return {"role": "assistant", "content": _content(result)}
 
@@ -155,6 +184,7 @@ class JudgeModel:
             history,
             output_type=response_format or str,
             instructions=instructions,
+            model_settings=self.model_settings,
         )
         return {"role": "assistant", "content": _content(result)}
 
@@ -172,7 +202,12 @@ class JudgeModel:
         """
         _no_options(kwargs)
         instructions, history = _conversation(messages)
-        return complete_sync(self.use_case, history, instructions=instructions)
+        return complete_sync(
+            self.use_case,
+            history,
+            instructions=instructions,
+            model_settings=self.model_settings,
+        )
 
     async def arespond(
         self,
@@ -182,7 +217,12 @@ class JudgeModel:
         """Answer a conversation and return the whole result; see ``respond``."""
         _no_options(kwargs)
         instructions, history = _conversation(messages)
-        return await complete(self.use_case, history, instructions=instructions)
+        return await complete(
+            self.use_case,
+            history,
+            instructions=instructions,
+            model_settings=self.model_settings,
+        )
 
 
 def _no_options(kwargs: Mapping[str, Any]) -> None:

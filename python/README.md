@@ -673,7 +673,11 @@ judge metric's own `LLMError` is a failed score too. Any other exception still a
 `judge_model(app, model)` is a judge that calls through `complete`, under the `eval-judge`
 use case in the app's project: it is routed, retried, traced, and costed like any other call.
 Its model must be in the catalog; an uncataloged id raises. It should not be the model under
-test. The judge metrics `hallucination`, `answer_relevance`, `context_precision` and
+test. Pass `max_tokens=` to bound each judge call's output (`judge_model(app, model,
+max_tokens=1024)`, a positive int, sent as the request's `max_tokens`). Without it a Bedrock
+Claude judge asks for the model's maximum output, which Bedrock reserves against the account's
+tokens-per-minute quota when the request starts, so a judged experiment throttles early. A
+verdict is short, so set it. The judge metrics `hallucination`, `answer_relevance`, `context_precision` and
 `context_recall` take it. They are Opik's metric classes, run in this process on the judge
 whatever the experiment backend, and keep Opik's score names (`hallucination_metric`,
 `answer_relevance_metric`, `context_precision_metric`, `context_recall_metric`). Apps do not
