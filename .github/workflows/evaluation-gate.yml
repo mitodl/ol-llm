@@ -78,9 +78,14 @@ jobs:
       - name: Credentials are available
         env:
           OPIK_KEYCLOAK_CLIENT_ID: ${{ secrets.OPIK_KEYCLOAK_CLIENT_ID }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
         run: |
           if [ -z "$OPIK_KEYCLOAK_CLIENT_ID" ]; then
-            echo "::error::No Opik credentials. Pull requests from forks get no secrets, so the gate cannot run for them."
+            if [ "$IS_FORK" = "true" ]; then
+              echo "::error::No Opik credentials. Pull requests from forks get no secrets, so the gate cannot run for them."
+            else
+              echo "::error::No Opik credentials. This is not a fork pull request, so the calling repository has not passed the secrets. Set OPIK_KEYCLOAK_CLIENT_ID and OPIK_KEYCLOAK_CLIENT_SECRET as Actions secrets there (or on the environment the calling job uses) and pass them to this workflow with secrets: inherit or an explicit secrets: block."
+            fi
             exit 1
           fi
       - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
