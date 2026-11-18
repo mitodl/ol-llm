@@ -90,7 +90,7 @@ jobs:
             if [ "$IS_FORK" = "true" ]; then
               echo "::error::No Opik credentials. Pull requests from forks get no secrets, so their pointers cannot be checked."
             else
-              echo "::error::No Opik credentials. The calling repository has not passed OPIK_KEYCLOAK_CLIENT_ID and OPIK_KEYCLOAK_CLIENT_SECRET. Set them as Actions secrets there (or on the environment the calling job uses) and pass them with secrets: inherit or a secrets: block."
+              echo "::error::No Opik credentials. The calling workflow passed an empty OPIK_KEYCLOAK_CLIENT_ID or OPIK_KEYCLOAK_CLIENT_SECRET. Check that the repository secrets its secrets: block maps to them exist (https://github.com/mitodl/ol-llm/blob/main/docs/prompt-promotion.md)."
             fi
             exit 1
           fi
