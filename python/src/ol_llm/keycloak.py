@@ -27,6 +27,11 @@ from ol_llm.loops import register_at_fork
 REFRESH_SKEW_SECONDS = 30
 # A hung Keycloak must not wedge the SDK's sender threads or the span exporter.
 TOKEN_REQUEST_TIMEOUT_SECONDS = 10
+# After a request fails, bounded callers fail at once for this long instead of
+# each starting another. Long enough to cover a flush that drains many batches
+# (each is one export), short enough that the next flush or a recovered Keycloak is
+# tried again within a few seconds.
+FAILED_FETCH_BACKOFF_SECONDS = 5.0
 # Used when the token response carries no expires_in.
 DEFAULT_TOKEN_LIFETIME_SECONDS = 60
 
@@ -47,12 +52,32 @@ class KeycloakClient:
     scope: str | None = None
 
 
+class _Fetch:
+    """One token request, run on a daemon thread.
+
+    :param done: set when the request has succeeded or failed.
+    :param error: what it failed with, once ``done``.
+    """
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.error: Exception | None = None
+
+
 class KeycloakTokens:
     """One cached Keycloak access token, shared by every client that sends to Opik.
 
     The token is renewed ``REFRESH_SKEW_SECONDS`` before it expires, and on demand
     after a 401. Thread-safe: the SDK's sender threads and the span exporter's
     thread share it.
+
+    At most one token request is in flight, on a daemon thread, and every caller
+    that needs a token waits on it. A caller that passes ``timeout`` waits no longer
+    than that in wall-clock time and then fails; the request carries on and fills
+    the cache if it succeeds. While a request that a bounded caller gave up on is
+    still running, and for ``FAILED_FETCH_BACKOFF_SECONDS`` after a request fails,
+    bounded callers fail at once, so a flush of many batches against a hung Keycloak
+    waits one timeout, not one per batch. Callers with no ``timeout`` ignore both.
     """
 
     def __init__(
@@ -70,11 +95,21 @@ class KeycloakTokens:
         self._lock = threading.Lock()
         self._token: str | None = None
         self._expires_at = 0.0
+        self._reset_fetches()
         _token_caches.add(self)
 
+    def _reset_fetches(self) -> None:
+        self._inflight: _Fetch | None = None
+        # The request a bounded caller gave up on, while it still runs.
+        self._abandoned: _Fetch | None = None
+        self._failed_until = 0.0
+        self._failure: Exception | None = None
+
     def _after_fork(self) -> None:
-        # A sender thread may have held the lock when the parent forked.
+        # A sender thread may have held the lock when the parent forked, and the
+        # parent's fetch thread does not exist in the child.
         self._lock = threading.Lock()
+        self._reset_fetches()
         if self._owns_http:
             self._http = httpx.Client(timeout=TOKEN_REQUEST_TIMEOUT_SECONDS)
 
@@ -82,31 +117,64 @@ class KeycloakTokens:
         """Return a current access token.
 
         :param refresh: fetch a new token even if the cached one has not expired.
-        :param timeout: the longest to wait, in seconds, for another thread's fetch
-            and for this one's request; ``None`` waits for the former without limit
-            and gives the request the HTTP client's timeout.
+        :param timeout: the longest to wait for a token, in seconds of wall-clock
+            time, across waiting for another caller's request and this one's. It
+            bounds the wait, not whatever the caller does next. ``None`` waits for
+            the request, which the HTTP client's timeout bounds per phase.
         :returns: the token.
         :rtype: str
         :raises httpx.HTTPError: if Keycloak cannot be reached or refuses.
-        :raises TimeoutError: if another thread's fetch holds the cache past
-            ``timeout``.
+        :raises TimeoutError: if ``timeout`` passes, or a bounded caller already
+            timed out on the request in flight.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
-        if not self._lock.acquire(timeout=-1 if timeout is None else timeout):
+        with self._lock:
+            now = time.monotonic()
+            if not refresh and self._token is not None and now < self._expires_at:
+                return self._token
+            if deadline is not None:
+                if self._failure is not None and now < self._failed_until:
+                    raise self._failure
+                if self._inflight is not None and self._inflight is self._abandoned:
+                    msg = "A Keycloak token request is still running"
+                    raise TimeoutError(msg)
+            if self._inflight is None:
+                self._inflight = _Fetch()
+                threading.Thread(
+                    target=self._run, args=(self._inflight,), daemon=True
+                ).start()
+            fetch = self._inflight
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        if not fetch.done.wait(remaining):
+            with self._lock:
+                self._abandoned = fetch
             msg = f"No Keycloak token within {timeout} seconds"
             raise TimeoutError(msg)
-        try:
-            if refresh or self._token is None or time.monotonic() >= self._expires_at:
-                self._fetch(
-                    None if deadline is None else max(0.0, deadline - time.monotonic())
-                )
-            if self._token is None:  # pragma: no cover - _fetch sets it or raises
+        if fetch.error is not None:
+            raise fetch.error
+        with self._lock:
+            if self._token is None:  # pragma: no cover - a finished fetch sets it
                 raise AssertionError
             return self._token
-        finally:
-            self._lock.release()
 
-    def _fetch(self, timeout: float | None) -> None:
+    def _run(self, fetch: _Fetch) -> None:
+        try:
+            token, expires_at = self._request()
+        except Exception as error:  # noqa: BLE001 - handed to every waiter
+            with self._lock:
+                self._failure = error
+                self._failed_until = time.monotonic() + FAILED_FETCH_BACKOFF_SECONDS
+                self._inflight = None
+            fetch.error = error
+        else:
+            with self._lock:
+                self._token, self._expires_at = token, expires_at
+                self._failure = None
+                self._inflight = None
+        finally:
+            fetch.done.set()
+
+    def _request(self) -> tuple[str, float]:
         data = {
             "grant_type": "client_credentials",
             "client_id": self._client.client_id,
@@ -114,16 +182,13 @@ class KeycloakTokens:
         }
         if self._client.scope:
             data["scope"] = self._client.scope
-        response = self._http.post(
-            self._client.token_url,
-            data=data,
-            timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout,
-        )
+        response = self._http.post(self._client.token_url, data=data)
         response.raise_for_status()
         payload = response.json()
         lifetime = float(payload.get("expires_in", DEFAULT_TOKEN_LIFETIME_SECONDS))
-        self._token = payload["access_token"]
-        self._expires_at = time.monotonic() + max(0.0, lifetime - REFRESH_SKEW_SECONDS)
+        return payload["access_token"], time.monotonic() + max(
+            0.0, lifetime - REFRESH_SKEW_SECONDS
+        )
 
     def close(self) -> None:
         """Close the token endpoint's HTTP client."""
@@ -175,9 +240,11 @@ class RequestsBearerAuth(AuthBase):
 
     The OTLP exporter takes a ``requests.Session`` and only static headers
     otherwise, so this is where an expiring token can be attached. ``requests``
-    runs this before the exporter's own timeout applies, so a token wait is bounded
-    here, by the exporter's timeout. An error raised from here is an export
-    failure the exporter logs, not an exception in the app.
+    runs this before the exporter's own timeout applies, so the wait for a token is
+    bounded here, by the exporter's timeout. Only that wait is bounded: ``requests``
+    fixes the request's timeout before this runs, so one export attempt can still
+    take about twice the timeout, or four times with a 401. An error raised from
+    here is an export failure the exporter logs, not an exception in the app.
     """
 
     def __init__(
@@ -186,8 +253,8 @@ class RequestsBearerAuth(AuthBase):
         """Use the given token cache.
 
         :param tokens: the shared token cache.
-        :param timeout_seconds: the longest a token wait may take, per request;
-            ``None`` leaves it to the cache's HTTP client.
+        :param timeout_seconds: the longest each token wait may take; ``None`` leaves
+            it to the cache's HTTP client.
         """
         self._tokens = tokens
         self._timeout_seconds = timeout_seconds
