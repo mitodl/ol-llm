@@ -128,14 +128,18 @@ def opik_configured() -> bool:
     """Return whether the app named an Opik instance.
 
     The SDK's default URL is Comet's hosted Opik, which would get spans carrying
-    prompts and completions. A URL set in the environment or the SDK's config file
-    counts, and so does an ``OPIK_API_KEY``, with which the app chose Comet.
+    prompts and completions. A non-blank URL set in the environment or the SDK's
+    config file counts, and so does an ``OPIK_API_KEY`` that is not blank (the SDK
+    reads a blank one as unset), with which the app chose Comet.
 
     :returns: whether to use the SDK's configuration.
     :rtype: bool
     """
     config = OpikConfig()
-    return bool({"url_override", "api_key"} & config.model_fields_set)
+    named_url = "url_override" in config.model_fields_set and bool(
+        config.url_override.strip()
+    )
+    return named_url or config.api_key is not None
 
 
 def require_configured() -> None:

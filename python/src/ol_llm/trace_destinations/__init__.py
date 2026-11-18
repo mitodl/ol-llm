@@ -115,7 +115,13 @@ def build_destinations(
             if reason is not None:
                 if name not in _warned:
                     _warned.add(name)
-                    logger.warning("Trace destination %r is not used: %s", name, reason)
+                    logger.warning(
+                        "Trace destination %r is not used: %s (read when tracing "
+                        "started; set it before the first traced call or "
+                        "configure_tracing())",
+                        name,
+                        reason,
+                    )
                 continue
         built.append(factory(settings))
     return tuple(built)

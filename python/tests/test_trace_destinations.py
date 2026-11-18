@@ -615,3 +615,47 @@ def test_the_opik_instance_is_named_by_a_url_or_an_api_key(
     assert [type(d) for d in tracing.destinations()] == [
         opik_destination.OpikDestination
     ]
+
+
+@pytest.mark.usefixtures("unconfigured_opik")
+@pytest.mark.parametrize(
+    ("environ", "config_file"),
+    [
+        ({"OPIK_API_KEY": ""}, ""),
+        ({"OPIK_API_KEY": "   "}, ""),
+        ({"OPIK_URL_OVERRIDE": ""}, ""),
+        ({"OPIK_URL_OVERRIDE": "  "}, ""),
+        ({}, "[opik]\napi_key =\n"),
+    ],
+    ids=[
+        "blank-key",
+        "whitespace-key",
+        "blank-url",
+        "whitespace-url",
+        "empty-file-key",
+    ],
+)
+def test_a_blank_url_or_api_key_does_not_name_an_instance(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    exported: InMemorySpanExporter,
+    environ: Mapping[str, str],
+    config_file: str,
+) -> None:
+    Path(os.environ["OPIK_CONFIG_PATH"]).write_text(config_file)
+    for name, value in environ.items():
+        monkeypatch.setenv(name, value)
+
+    with caplog.at_level(logging.WARNING):
+        configure_tracing(TracingConfig(destinations=("opik",)))
+    with opik.record_traces_locally() as storage:
+        run_sync(agent_for(SUMMARY, replying("ok")), "hi")
+        traces = storage.trace_trees
+    tracing.flush()
+
+    assert not opik_destination.opik_configured()
+    assert tracing.destinations() == ()
+    assert traces == []
+    assert exported.get_finished_spans() == ()
+    [warning] = [r for r in caplog.records if "OPIK_URL_OVERRIDE" in r.getMessage()]
+    assert "when tracing started" in warning.getMessage()
