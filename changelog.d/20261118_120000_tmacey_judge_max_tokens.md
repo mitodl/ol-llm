@@ -1,3 +1,0 @@
-### Added
-
-- `judge_model(app, model, max_tokens=...)` and `JudgeModel(use_case, max_tokens=...)` bound the output of every judge call, including `judge_pairwise`'s, by sending `max_tokens` as a model setting. Without it a Bedrock Claude judge asks for the model's maximum output, which Bedrock reserves against the account's tokens-per-minute quota when the request starts, so a judged experiment throttles early. A gate declaration takes the same bound as `judge_max_tokens`, which needs `judge_model` and is recorded in the experiment's config when set. The value must be a positive integer, and nothing is sent when it is unset. (#88)
