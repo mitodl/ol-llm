@@ -7,6 +7,7 @@ import ol_llm.langchain as langchain_module
 import pytest
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
+    BaseCallbackHandler,
     CallbackManagerForLLMRun,
 )
 from langchain_core.language_models import BaseChatModel
@@ -124,6 +125,10 @@ def _astream(model: PolicyChatModel, received: list[str]) -> None:
     asyncio.run(collect())
 
 
+def test_chat_litellm_kwargs_apply_the_profile_default_timeout() -> None:
+    assert chat_litellm_kwargs(TUTOR, environ={})["request_timeout"] == 60
+
+
 def test_chat_litellm_kwargs_set_the_timeout_and_turn_client_retries_off() -> None:
     environ = {"OL_LLM_TUTOR_TIMEOUT_SECONDS": "120", "OL_LLM_REQUEST_MAX_RETRIES": "5"}
 
@@ -158,7 +163,7 @@ def test_a_failure_after_the_first_chunk_is_not_retried(waits: list[float]) -> N
 
 
 def test_retries_stop_at_the_policy(waits: list[float]) -> None:
-    model = _wrapped(ProviderError(500))
+    model = _wrapped(ProviderError(503))
 
     with pytest.raises(ProviderError):
         _astream(model, [])
@@ -282,6 +287,8 @@ def test_bind_tools_refuses_a_binding_it_cannot_move() -> None:
         (503, "LLMUnavailable"),
         (408, "LLMUnavailable"),
         (400, "LLMRejected"),
+        # litellm's status for an error it could not map, with no response behind it.
+        (500, "LLMRejected"),
     ],
 )
 def test_classify_chat_failure_by_status(status: int, expected: str) -> None:
@@ -290,3 +297,72 @@ def test_classify_chat_failure_by_status(status: int, expected: str) -> None:
     )
 
     assert type(error).__name__ == expected
+
+
+def _http_error(status: int, headers: dict[str, str] | None = None) -> ProviderError:
+    """A provider error whose chain holds the HTTP response, as litellm's does."""
+    request = httpx.Request("POST", "https://provider.test/v1/chat/completions")
+    response = httpx.Response(status, headers=headers, request=request)
+    error = ProviderError(status)
+    error.__context__ = httpx.HTTPStatusError(
+        "failed", request=request, response=response
+    )
+    return error
+
+
+def test_a_500_from_the_provider_is_retried(waits: list[float]) -> None:
+    model = _wrapped(_http_error(500), "ok")
+    received: list[str] = []
+
+    _astream(model, received)
+
+    assert received == ["part0 ", "part1"]
+    assert _attempts(model) == 2
+    assert len(waits) == 1
+
+
+@pytest.mark.usefixtures("waits")
+def test_a_500_with_no_response_behind_it_is_not_retried() -> None:
+    model = _wrapped(ProviderError(500), "ok")
+
+    with pytest.raises(ProviderError):
+        _astream(model, [])
+
+    assert _attempts(model) == 1
+
+
+def test_the_responses_status_wins_over_the_exceptions() -> None:
+    error = ProviderError(500)
+    error.__context__ = _http_error(400).__context__
+
+    classified = classify_chat_failure(
+        error, use_case="tutor", model="openai:gpt-4o-mini"
+    )
+
+    assert type(classified).__name__ == "LLMRejected"
+
+
+def test_retry_after_is_read_from_the_response_in_the_chain(waits: list[float]) -> None:
+    model = _wrapped(_http_error(429, {"Retry-After": "3"}), "ok")
+
+    _astream(model, [])
+
+    assert waits == [3.0]
+
+
+def test_the_models_run_settings_move_to_the_wrapper() -> None:
+    handler = BaseCallbackHandler()
+    inner = ScriptedChatModel(
+        script=["ok"], callbacks=[handler], tags=["tutor"], metadata={"course": "x"}
+    )
+
+    model = with_call_policy(inner, TUTOR, environ=ENVIRON)
+
+    assert model.callbacks == [handler]
+    assert model.tags == ["tutor"]
+    assert (model.metadata or {})["course"] == "x"
+
+
+def test_with_structured_output_is_refused() -> None:
+    with pytest.raises(NotImplementedError, match="with_structured_output"):
+        _wrapped("ok").with_structured_output({"type": "object"})

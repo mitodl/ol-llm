@@ -28,7 +28,7 @@ from collections.abc import (
 )
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 
 import httpx
 import httpx2
@@ -63,6 +63,8 @@ from ol_llm.traces import TracedCall, TraceOutput, current_call
 from ol_llm.tracing import destinations, enabled
 
 MILLISECONDS_PER_SECOND = 1000
+UNMAPPED_ERROR_STATUS = 500
+"""The status litellm gives an error it cannot map to a provider response."""
 
 # Patched in tests so retries do not wait.
 _sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep
@@ -79,13 +81,13 @@ def chat_litellm_kwargs(
     it bounds the wait for the response and the gap between chunks, never the
     whole reply (checked in litellm 1.105.7 and openai 2.54.0).
 
-    Both of the client's retry layers are turned off, because neither keeps to
-    the policy: the OpenAI SDK's (``model_kwargs["max_retries"]``) waits out a
-    Retry-After of up to 120 s whatever is left of ``max_backoff_seconds``, and
-    litellm caches an Azure client without keying on its retry count; and
-    ``ChatLiteLLM``'s own (``max_retries`` counts attempts, so 1 is none). Wrap
-    the model with ``with_call_policy`` for the use case's retries. Do not set
-    litellm's ``num_retries``, which retries the whole call on top.
+    Both of the client's retry layers are turned off, so that ``with_call_policy``
+    is the only one. The OpenAI SDK's (``model_kwargs["max_retries"]``) waits out
+    a Retry-After of up to 120 s whatever is left of ``max_backoff_seconds``, and
+    litellm caches an Azure client without keying on its retry count.
+    ``ChatLiteLLM``'s own (``max_retries``, which counts attempts, so 1 is none)
+    waits 4 to 10 s per retry with no budget. Do not set litellm's
+    ``num_retries``, which retries the whole call on top.
 
     For example, with the caller's own ``model_kwargs`` merged in::
 
@@ -119,21 +121,25 @@ def with_call_policy(
 ) -> "PolicyChatModel":
     """Wrap a LangChain chat model so its calls retry under the use case's policy.
 
-    It retries what the entry points retry (429, 408, 5xx and 529, and transport
-    timeouts and disconnects), with their backoff and budget: on the request
+    It retries what the entry points retry (429, 408, 500, 502, 503, 504 and 529,
+    and transport timeouts and disconnects), with their backoff and budget: on the
+    request
     profile the waits share ``max_backoff_seconds``, and a Retry-After longer than
     what is left ends the call. A stream is retried only until its first chunk;
     a failure after that reaches the caller. The model's own client must not
     retry, or the layers multiply (``chat_litellm_kwargs`` turns a
     ``ChatLiteLLM``'s off). The timeout stays with the client.
 
-    A failure is classified by its ``status_code`` (litellm and the OpenAI SDK
-    set it) or an httpx timeout or disconnect in its ``__cause__`` chain, so no
-    provider SDK is imported. It reaches the caller as the model raised it, not
-    as an ``LLMError``. ``fallback_models`` is not applied.
+    A failure is classified from its exception chain (``classify_chat_failure``),
+    so no provider SDK is imported. It reaches the caller as the model raised it,
+    not as an ``LLMError``. Retried attempts are not reported to callbacks; a
+    trace shows one span. ``fallback_models`` is not applied.
 
     Set the model's own fields, e.g. ``temperature``, before wrapping, and bind
-    tools on the wrapper: ``with_call_policy(llm, TUTOR).bind_tools(tools)``.
+    tools on the wrapper: ``with_call_policy(llm, TUTOR).bind_tools(tools)``. The
+    model's callbacks, tags, metadata, cache and rate limiter move to the wrapper.
+    ``with_structured_output`` is refused, since LangChain's generic version would
+    switch a model like ``ChatLiteLLM`` from its JSON-schema method to tool calls.
 
     :param model: the chat model, with its client's retries off.
     :param use_case: the call site.
@@ -144,8 +150,18 @@ def with_call_policy(
     :raises ValueError: if an environment override does not parse or is out of
         range.
     """
+    # The wrapper calls the model's generate and stream methods directly, so the
+    # run-level settings that BaseChatModel reads move to the wrapper.
     return PolicyChatModel(
-        inner=model, use_case=use_case, policy=resolve_policy(use_case, environ)
+        inner=model,
+        use_case=use_case,
+        policy=resolve_policy(use_case, environ),
+        callbacks=model.callbacks,
+        tags=model.tags,
+        metadata=model.metadata,
+        cache=model.cache,
+        rate_limiter=model.rate_limiter,
+        verbose=model.verbose,
     )
 
 
@@ -153,6 +169,13 @@ def classify_chat_failure(
     exc: BaseException, *, use_case: str, model: str
 ) -> LLMError | None:
     """Map a LangChain chat model's failure to the library error for its class.
+
+    The status comes from the HTTP response in the exception's chain
+    (``original_exception``, ``__cause__``, ``__context__``) when there is one,
+    else from an httpx timeout or disconnect there, else from the exception's
+    ``status_code``. A bare 500 is a rejection: litellm gives 500 to whatever it
+    cannot map, e.g. an error object inside a 200 stream or a failing credential
+    hook, and nothing in it says the provider is down.
 
     :param exc: what the model raised.
     :param use_case: the use case name, for the error.
@@ -162,31 +185,67 @@ def classify_chat_failure(
     :rtype: LLMError | None
     """
     message = str(exc)
-    status = getattr(exc, "status_code", None)
-    if isinstance(status, int) and not isinstance(status, bool):
-        if status == RATE_LIMITED_STATUS:
-            return LLMRateLimited(
-                message, use_case=use_case, model=model, retry_after=_retry_after(exc)
+    chain = list(_exception_chain(exc))
+    status = next(
+        (
+            link.response.status_code
+            for link in chain
+            if isinstance(link, httpx.HTTPStatusError | httpx2.HTTPStatusError)
+        ),
+        None,
+    )
+    if status is None:
+        if any(isinstance(link, UNAVAILABLE_TRANSPORT_ERRORS) for link in chain):
+            return LLMUnavailable(message, use_case=use_case, model=model)
+        status = getattr(exc, "status_code", None)
+        if not isinstance(status, int) or isinstance(status, bool):
+            return None
+        if status == UNMAPPED_ERROR_STATUS:
+            return LLMRejected(
+                message, use_case=use_case, model=model, status_code=None
             )
-        if status in RETRYABLE_STATUSES:
-            return LLMUnavailable(message, use_case=use_case, model=model)
-        return LLMRejected(message, use_case=use_case, model=model, status_code=status)
-    cause: BaseException | None = exc
-    while cause is not None:
-        if isinstance(cause, UNAVAILABLE_TRANSPORT_ERRORS):
-            return LLMUnavailable(message, use_case=use_case, model=model)
-        cause = cause.__cause__
+    if status == RATE_LIMITED_STATUS:
+        return LLMRateLimited(
+            message, use_case=use_case, model=model, retry_after=_retry_after(chain)
+        )
+    if status in RETRYABLE_STATUSES:
+        return LLMUnavailable(message, use_case=use_case, model=model)
+    return LLMRejected(message, use_case=use_case, model=model, status_code=status)
+
+
+def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
+    """Yield ``exc`` and every exception it wraps, each once."""
+    seen: set[int] = set()
+    pending: list[BaseException | None] = [exc]
+    while pending:
+        link = pending.pop(0)
+        if link is None or id(link) in seen:
+            continue
+        seen.add(id(link))
+        yield link
+        original = getattr(link, "original_exception", None)
+        pending.extend(
+            (
+                original if isinstance(original, BaseException) else None,
+                link.__cause__,
+                link.__context__,
+            )
+        )
+
+
+def _retry_after(chain: Sequence[BaseException]) -> float | None:
+    """Read the seconds a rate-limited response asked to wait, if it said."""
+    for link in chain:
+        if headers := getattr(link, "litellm_response_headers", None):
+            return _parse_retry_after(headers)
+    for link in chain:
+        response = getattr(link, "response", None)
+        if isinstance(response, httpx.Response | httpx2.Response) and response.headers:
+            return _parse_retry_after(response.headers)
     return None
 
 
-def _retry_after(exc: BaseException) -> float | None:
-    """Read the seconds a rate-limited response asked to wait, if it said."""
-    headers = getattr(exc, "litellm_response_headers", None)
-    if not headers:
-        response = getattr(exc, "response", None)
-        if not isinstance(response, httpx.Response | httpx2.Response):
-            return None
-        headers = response.headers
+def _parse_retry_after(headers: Mapping[str, str]) -> float | None:
     lowered = {str(key).lower(): str(value) for key, value in headers.items()}
     if (milliseconds := lowered.get("retry-after-ms")) is not None:
         try:
@@ -273,6 +332,25 @@ class PolicyChatModel(BaseChatModel):
             )
             raise TypeError(msg)
         return self.bind(**bound.kwargs)
+
+    def with_structured_output(
+        self,
+        schema: Any,  # noqa: ANN401
+        **kwargs: Any,  # noqa: ANN401
+    ) -> NoReturn:
+        """Refuse, rather than change how the wrapped model asks for structure.
+
+        LangChain's generic ``with_structured_output`` forces a tool call and
+        drops ``method`` and ``strict``, where e.g. ``ChatLiteLLM`` defaults to a
+        JSON-schema response format.
+
+        :raises NotImplementedError: always.
+        """
+        msg = (
+            "PolicyChatModel does not support with_structured_output: LangChain's "
+            f"generic version would replace {type(self.inner).__name__}'s own method"
+        )
+        raise NotImplementedError(msg)
 
     def _delay(self, exc: Exception, budget: RetryBudget) -> float | None:
         error = classify_chat_failure(

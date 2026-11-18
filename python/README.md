@@ -441,12 +441,17 @@ llm = ol_llm.with_call_policy(llm, TUTOR).bind_tools(tools)
 ```
 
 The timeout bounds each read, so on a stream it bounds the gap between chunks, not the whole
-reply. The wrapper retries what the entry points retry (429, 408, 5xx and 529, and transport
-timeouts and disconnects) with their backoff and budget: on the request profile the waits share
-`max_backoff_seconds`, and a `Retry-After` longer than what is left ends the call. A stream is
-retried only until its first chunk. Errors reach the caller as the model raised them, and
-`fallback_models` is not applied. Set the model's own fields (e.g. `temperature`) before
-wrapping it, and bind tools on the wrapper.
+reply. The wrapper retries what the entry points retry (429, 408, 500, 502, 503, 504 and 529,
+and transport timeouts and disconnects) with their backoff and budget: on the request profile
+the waits share `max_backoff_seconds`, and a `Retry-After` longer than what is left ends the
+call. A stream is retried only until its first chunk. The status is read from the HTTP response
+in the exception's chain when there is one; litellm's 500 for an error it could not map (e.g. an
+error object inside a 200 stream) is not retried. Errors reach the caller as the model raised
+them, retried attempts don't appear in the trace, and `fallback_models` is not applied. Set the
+model's own fields (e.g. `temperature`) before wrapping it, and bind tools on the wrapper; its
+callbacks, tags, metadata, cache and rate limiter move to the wrapper. `with_structured_output`
+raises `NotImplementedError`, since LangChain's generic version would replace a `ChatLiteLLM`'s
+JSON-schema method with a forced tool call.
 
 The client's retries stay off because they don't keep to the policy: the OpenAI SDK waits out a
 `Retry-After` of up to 120 s whatever is left of the budget, and litellm caches an `azure/`
