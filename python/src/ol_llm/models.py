@@ -10,7 +10,6 @@ import asyncio
 import inspect
 import logging
 import os
-import random
 import sys
 import threading
 from collections.abc import (
@@ -99,6 +98,12 @@ from ol_llm.errors import (
 )
 from ol_llm.loops import LoopLocal, register_at_fork
 from ol_llm.policy import CallPolicy, Profile, UseCase, resolve_policy
+from ol_llm.retries import (
+    RATE_LIMITED_STATUS,
+    RETRYABLE_STATUSES,
+    UNAVAILABLE_TRANSPORT_ERRORS,
+    RetryBudget,
+)
 from ol_llm.settings import GatewayRoute, Settings, get_settings
 from ol_llm.tracing import include_content, tracer_provider
 
@@ -109,9 +114,6 @@ _NO_DEPS: type[None] = type(None)
 DepsT = TypeVar("DepsT")
 
 log = logging.getLogger(__name__)
-
-RETRYABLE_STATUSES = frozenset({408, 500, 502, 503, 504, 529})
-"""HTTP statuses that mean the provider is unavailable (spec §6.3)."""
 
 IN_STREAM_RETRYABLE_STATUSES = frozenset({424})
 """Statuses that mean the provider is unavailable only when reported inside a stream.
@@ -126,21 +128,11 @@ makes it a rejection of that row (``LLMRejected.original_status_code``).
 BEDROCK_MODEL_ERROR_CODE = "ModelErrorException"
 """The ``Error.Code`` botocore gives Bedrock's HTTP 424 outside a stream."""
 
-RATE_LIMITED_STATUS = 429
-INITIAL_BACKOFF_SECONDS = 0.5
 FALLBACK_ON = (LLMRateLimited, LLMUnavailable)
 
-# Transport failures that mean no answer came back. Google and Mistral raise these
-# raw from httpx2 rather than as ModelAPIError (spec §6.1); any other transport
-# error is permanent (a bad URL scheme, a proxy failure) and is not retried.
-_UNAVAILABLE_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
-    httpx.TimeoutException,
-    httpx.NetworkError,
-    httpx.RemoteProtocolError,
-    httpx2.TimeoutException,
-    httpx2.NetworkError,
-    httpx2.RemoteProtocolError,
-)
+# Google and Mistral raise UNAVAILABLE_TRANSPORT_ERRORS raw from httpx2 rather than
+# as ModelAPIError (spec §6.1); any other transport error is permanent (a bad URL
+# scheme, a proxy failure) and is not retried.
 _TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
     httpx.TransportError,
     httpx2.TransportError,
@@ -283,7 +275,7 @@ def classify_failure(  # noqa: PLR0911
         )
     unavailable: tuple[type[Exception], ...] = (
         ModelAPIError,
-        *_UNAVAILABLE_TRANSPORT_ERRORS,
+        *UNAVAILABLE_TRANSPORT_ERRORS,
         *_botocore_transport_errors(),
     )
     if isinstance(exc, unavailable):
@@ -365,39 +357,6 @@ def classify_run_failure(
     return None
 
 
-@dataclass
-class _RetryBudget:
-    policy: CallPolicy
-    profile: Profile
-    retries: int = 0
-    waited: float = 0
-
-    def next_delay(self, error: LLMError) -> float | None:
-        """Return how long to wait before the next attempt, or None to give up."""
-        if not error.retryable or self.retries >= self.policy.max_retries:
-            return None
-        backoff = INITIAL_BACKOFF_SECONDS * 2**self.retries
-        # Jitter spreads out callers that failed together; it is not security.
-        delay = random.uniform(backoff / 2, backoff)  # noqa: S311
-        retry_after = error.retry_after if isinstance(error, LLMRateLimited) else None
-        if retry_after is not None:
-            delay = max(delay, retry_after)
-        if self.profile == "request":
-            # A total budget: a Retry-After longer than what is left ends the call
-            # so the caller can tell the user instead of holding a request open.
-            # Once the budget is spent, retrying with no wait would hammer a
-            # provider that is already failing.
-            remaining = self.policy.max_backoff_seconds - self.waited
-            if remaining <= 0 or (retry_after is not None and retry_after > remaining):
-                return None
-            delay = min(delay, remaining)
-        else:
-            delay = min(delay, self.policy.max_backoff_seconds)
-        self.retries += 1
-        self.waited += delay
-        return delay
-
-
 async def retrying(
     attempt: Callable[[], Awaitable[_T]],
     *,
@@ -419,7 +378,7 @@ async def retrying(
         with the provider's exception as ``__cause__``. Anything that is not a
         model request failure is re-raised unchanged.
     """
-    budget = _RetryBudget(policy, profile)
+    budget = RetryBudget(policy, profile)
     while True:
         try:
             return await attempt()
@@ -429,7 +388,7 @@ async def retrying(
 
 
 def _retry_delay(
-    exc: Exception, budget: _RetryBudget, *, use_case: str, model: str
+    exc: Exception, budget: RetryBudget, *, use_case: str, model: str
 ) -> float:
     """Return the wait before the next attempt, or raise what the caller sees.
 
@@ -674,7 +633,7 @@ class PolicyModel(WrapperModel):
     def _classify(self, exc: BaseException) -> LLMError | None:
         return classify_failure(exc, use_case=self.use_case, model=self.catalog_id)
 
-    def _retry_delay(self, exc: Exception, budget: _RetryBudget) -> float:
+    def _retry_delay(self, exc: Exception, budget: RetryBudget) -> float:
         return _retry_delay(exc, budget, use_case=self.use_case, model=self.catalog_id)
 
     async def _retrying(self, attempt: Callable[[], Awaitable[_T]]) -> _T:
@@ -711,7 +670,7 @@ class PolicyModel(WrapperModel):
     ) -> AsyncGenerator[StreamedResponse]:
         """Open a stream, retrying transient failures until the first chunk."""
         settings = self._with_timeout(model_settings)
-        budget = _RetryBudget(self.policy, self.profile_name)
+        budget = RetryBudget(self.policy, self.profile_name)
         provider = self._loop_model()
         while True:
             stream_cm = provider.request_stream(
