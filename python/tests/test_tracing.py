@@ -1,3 +1,4 @@
+import os
 import socket
 import threading
 import time
@@ -29,6 +30,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 )
 from opik.hooks import HttpxClientHook
 from requests.adapters import BaseAdapter
+from test_loops import run_in_fork
 
 KEYCLOAK = KeycloakClient(
     token_url="https://sso.example/token",
@@ -442,9 +444,9 @@ def test_a_failed_fetch_is_remembered_for_the_backoff(
     http, started = slow_token_server(0, failures=1)
     tokens = KeycloakTokens(KEYCLOAK, http=http)
 
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(keycloak.TokenFetchError):
         tokens.token(timeout=1)
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(keycloak.TokenFetchError):
         tokens.token(timeout=1)
     assert len(started) == 1
 
@@ -466,13 +468,69 @@ def test_a_forked_child_drops_the_parents_fetch_state() -> None:
     assert tokens._abandoned is None  # noqa: SLF001
 
 
+def test_a_remembered_failure_is_raised_fresh_each_time() -> None:
+    http, _ = slow_token_server(0, failures=1)
+    tokens = KeycloakTokens(KEYCLOAK, http=http)
+    raised: list[keycloak.TokenFetchError] = []
+    for _ in range(4):
+        with pytest.raises(keycloak.TokenFetchError) as caught:
+            tokens.token(timeout=1)
+        raised.append(caught.value)
+
+    assert len({id(error) for error in raised}) == 4
+    assert len({id(error.__cause__) for error in raised}) == 1
+    cause = raised[0].__cause__
+    assert isinstance(cause, httpx.HTTPStatusError)
+    frames = 0
+    traceback = cause.__traceback__
+    while traceback is not None:
+        frames += 1
+        traceback = traceback.tb_next
+    assert frames <= 3
+
+
+def test_requests_auth_bounds_the_token_refresh_after_a_401() -> None:
+    fetches: list[float] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        fetches.append(time.monotonic())
+        if len(fetches) > 1:
+            time.sleep(3)
+        return httpx.Response(200, json={"access_token": "t", "expires_in": 300})
+
+    tokens = KeycloakTokens(
+        KEYCLOAK, http=httpx.Client(transport=httpx.MockTransport(handle))
+    )
+    adapter = RecordingAdapter([401, 200])
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.auth = RequestsBearerAuth(tokens, timeout_seconds=0.3)
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        session.post("https://opik.example/api")
+
+    assert time.monotonic() - started < 1
+    assert adapter.seen == ["Bearer t"]
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+def test_a_forked_child_starts_its_own_token_fetch() -> None:
+    http, started = slow_token_server(0.5)
+    tokens = KeycloakTokens(KEYCLOAK, http=http)
+    with pytest.raises(TimeoutError):
+        tokens.token(timeout=0.1)
+
+    assert run_in_fork(lambda: (tokens.token(timeout=3), len(started))) == ("t", 2)
+
+
 def test_an_unbounded_caller_ignores_the_backoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(keycloak, "FAILED_FETCH_BACKOFF_SECONDS", 60)
     http, started = slow_token_server(0, failures=1)
     tokens = KeycloakTokens(KEYCLOAK, http=http)
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(keycloak.TokenFetchError):
         tokens.token(timeout=1)
 
     assert tokens.token() == "t"

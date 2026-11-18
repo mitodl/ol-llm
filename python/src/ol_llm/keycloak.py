@@ -52,6 +52,14 @@ class KeycloakClient:
     scope: str | None = None
 
 
+class TokenFetchError(RuntimeError):
+    """A bounded caller's token request failed, now or within the backoff.
+
+    A fresh exception chained to the failure, so the stored failure's traceback
+    does not grow with every caller, nor keep each caller's frames alive.
+    """
+
+
 class _Fetch:
     """One token request, run on a daemon thread.
 
@@ -123,7 +131,11 @@ class KeycloakTokens:
             the request, which the HTTP client's timeout bounds per phase.
         :returns: the token.
         :rtype: str
-        :raises httpx.HTTPError: if Keycloak cannot be reached or refuses.
+        :raises httpx.HTTPError: if Keycloak cannot be reached or refuses, for a
+            caller with no ``timeout``.
+        :raises TokenFetchError: if the request failed, or failed within the last
+            ``FAILED_FETCH_BACKOFF_SECONDS``, for a caller with a ``timeout``;
+            chained to the failure.
         :raises TimeoutError: if ``timeout`` passes, or a bounded caller already
             timed out on the request in flight.
         """
@@ -134,7 +146,8 @@ class KeycloakTokens:
                 return self._token
             if deadline is not None:
                 if self._failure is not None and now < self._failed_until:
-                    raise self._failure
+                    msg = "The last Keycloak token request failed"
+                    raise TokenFetchError(msg) from self._failure
                 if self._inflight is not None and self._inflight is self._abandoned:
                     msg = "A Keycloak token request is still running"
                     raise TimeoutError(msg)
@@ -151,7 +164,10 @@ class KeycloakTokens:
             msg = f"No Keycloak token within {timeout} seconds"
             raise TimeoutError(msg)
         if fetch.error is not None:
-            raise fetch.error
+            if timeout is None:
+                raise fetch.error
+            msg = "The Keycloak token request failed"
+            raise TokenFetchError(msg) from fetch.error
         with self._lock:
             if self._token is None:  # pragma: no cover - a finished fetch sets it
                 raise AssertionError
