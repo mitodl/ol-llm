@@ -46,11 +46,22 @@ def chat_litellm_kwargs(
     multiply. Do not set litellm's ``num_retries``, which retries the whole call
     again on top.
 
-    Two differences from the entry points' policy: the OpenAI SDK waits as long
-    as a 429's Retry-After asks, up to 120 s per retry, where ol-llm ends the call
-    once a wait would exceed ``max_backoff_seconds``; and only providers litellm
-    calls through the OpenAI SDK (``openai/``, ``azure/``, OpenAI-compatible
-    proxies) read ``max_retries``.
+    Where this departs from the entry points' policy:
+
+    - The SDK retries until the response headers arrive, not until the first
+      chunk, so a stream that stalls after its headers fails without a retry.
+    - The SDK's waits are not held to ``max_backoff_seconds``. It waits as long as
+      a Retry-After on any retryable status asks, up to 120 s, and does not retry
+      past that; otherwise it backs off 0.5 s doubling to at most 8 s per wait
+      (1.5 s over the default 2 retries, about 15.5 s over 5).
+    - The server can force or suppress a retry with ``x-should-retry``.
+    - On ``azure/``, litellm caches the client without keying on ``max_retries``,
+      so the first use case to build an Azure client sets the retries for every
+      use case sharing it; the timeout still applies per request.
+    - Only providers litellm calls through the OpenAI SDK (``openai/``,
+      ``azure/``, OpenAI-compatible proxies) read ``max_retries``; others drop
+      it.
+    - ``fallback_models`` is not applied.
 
     For example, with the caller's own ``model_kwargs`` merged in::
 

@@ -440,9 +440,16 @@ llm = ChatLiteLLM(
 The timeout bounds each read, so on a stream it bounds the gap between chunks, not the whole
 reply. The retries run in the provider's OpenAI-SDK client, before the response starts, so a
 stream is never retried after its first chunk; `ChatLiteLLM`'s own retry is set to one attempt
-so the two don't multiply. Unlike the entry points, the SDK waits out a 429's `Retry-After` of
-up to 120 s instead of ending the call past `max_backoff_seconds`, and only providers litellm
-calls through the OpenAI SDK (`openai/`, `azure/`, OpenAI-compatible proxies) retry.
+so the two don't multiply. Where that departs from the entry points:
+
+- The SDK retries until the response headers arrive, not until the first chunk.
+- Its waits are not held to `max_backoff_seconds`: it honors a `Retry-After` of up to 120 s on
+  any retryable status (and does not retry past that), and otherwise backs off 0.5 s doubling to
+  8 s per wait.
+- On `azure/`, litellm caches the client without keying on `max_retries`, so a per-use-case
+  retry override does not reliably apply there; the timeout does.
+- Only providers litellm calls through the OpenAI SDK (`openai/`, `azure/`, OpenAI-compatible
+  proxies) retry, and `fallback_models` is not applied.
 
 ### Batch
 
