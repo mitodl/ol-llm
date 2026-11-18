@@ -577,6 +577,8 @@ def run_gate(
         "change": change,
         "judge_model": declaration.judge_model,
     }
+    if declaration.judge_max_tokens is not None:
+        config["judge_max_tokens"] = declaration.judge_max_tokens
     try:
         result = evaluate(
             built.task,

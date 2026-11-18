@@ -814,7 +814,6 @@ def test_the_judge_takes_no_provider_options() -> None:
         judge_model(APP, JUDGE).generate_string("q", temperature=0)
 
 
-@pytest.mark.usefixtures("provider_env")
 def recording_judge(seen: list[int | None]) -> FunctionModel:
     def reply(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         seen.append((info.model_settings or {}).get("max_tokens"))
@@ -880,6 +879,7 @@ def test_a_judge_max_tokens_must_be_positive(max_tokens: int) -> None:
         judge_model(APP, JUDGE, max_tokens=max_tokens)
 
 
+@pytest.mark.usefixtures("provider_env")
 def test_the_judge_model_comes_from_the_catalog_under_the_judge_use_case() -> None:
     judge = judge_model(APP, JUDGE)
 

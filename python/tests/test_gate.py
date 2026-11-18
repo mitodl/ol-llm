@@ -716,6 +716,20 @@ def test_the_declared_judge_max_tokens_reaches_the_judge(client: FakeClient) -> 
 
 
 @pytest.mark.usefixtures("prompts")
+def test_the_judge_max_tokens_is_part_of_the_experiment_config(
+    client: FakeClient, runs: list[dict[str, Any]]
+) -> None:
+    seeded(client)
+    run_gate(
+        declaration(judge_model="openai:gpt-4o-mini", judge_max_tokens=512),
+        suite=suite,
+        change="pr-1",
+    )
+    [call] = runs
+    assert call["experiment_config"]["judge_max_tokens"] == 512
+
+
+@pytest.mark.usefixtures("prompts")
 def test_an_uncataloged_judge_cannot_run(client: FakeClient) -> None:
     seeded(client)
 
