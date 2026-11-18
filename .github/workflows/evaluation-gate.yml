@@ -78,13 +78,14 @@ jobs:
       - name: Credentials are available
         env:
           OPIK_KEYCLOAK_CLIENT_ID: ${{ secrets.OPIK_KEYCLOAK_CLIENT_ID }}
+          OPIK_KEYCLOAK_CLIENT_SECRET: ${{ secrets.OPIK_KEYCLOAK_CLIENT_SECRET }}
           IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
         run: |
-          if [ -z "$OPIK_KEYCLOAK_CLIENT_ID" ]; then
+          if [ -z "$OPIK_KEYCLOAK_CLIENT_ID" ] || [ -z "$OPIK_KEYCLOAK_CLIENT_SECRET" ]; then
             if [ "$IS_FORK" = "true" ]; then
               echo "::error::No Opik credentials. Pull requests from forks get no secrets, so the gate cannot run for them."
             else
-              echo "::error::No Opik credentials. This is not a fork pull request, so the calling repository has not passed the secrets. Set OPIK_KEYCLOAK_CLIENT_ID and OPIK_KEYCLOAK_CLIENT_SECRET as Actions secrets there (or on the environment the calling job uses) and pass them to this workflow with secrets: inherit or an explicit secrets: block."
+              echo "::error::No Opik credentials. The calling repository has not passed OPIK_KEYCLOAK_CLIENT_ID and OPIK_KEYCLOAK_CLIENT_SECRET. Set them as Actions secrets there (or on the environment the calling job uses) and pass them with secrets: inherit or a secrets: block."
             fi
             exit 1
           fi
