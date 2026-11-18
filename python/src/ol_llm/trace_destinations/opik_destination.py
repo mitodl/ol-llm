@@ -28,6 +28,7 @@ A forked child drops the SDK's client and connection bundle without closing them
 and builds new ones on its next SDK call.
 """
 
+import os
 import threading
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager
@@ -39,6 +40,10 @@ import opik
 import requests
 from opentelemetry.context import Context
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.environment_variables import (
+    OTEL_EXPORTER_OTLP_TIMEOUT,
+    OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+)
 from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
 from opentelemetry.trace import INVALID_SPAN, get_current_span
@@ -73,6 +78,9 @@ if TYPE_CHECKING:
 
 OTLP_TRACES_PATH = "/v1/private/otel/v1/traces"
 """Opik's OTLP/HTTP traces endpoint, relative to the SDK's API base URL."""
+
+DEFAULT_EXPORT_TIMEOUT_SECONDS = 10.0
+"""The OTLP exporter's timeout when no variable sets it."""
 
 WORKSPACE_HEADER = "Comet-Workspace"
 PROJECT_HEADER = "projectName"
@@ -466,6 +474,27 @@ class OpikDestination(TraceDestination):
             yield callbacks
 
 
+def export_timeout_seconds() -> float:
+    """Return the OTLP exporter's timeout, resolved as the exporter resolves it.
+
+    ``OTEL_EXPORTER_OTLP_TRACES_TIMEOUT``, else ``OTEL_EXPORTER_OTLP_TIMEOUT``, in
+    seconds, else ``DEFAULT_EXPORT_TIMEOUT_SECONDS``; so is a value that is not a
+    number.
+
+    :returns: the timeout in seconds.
+    :rtype: float
+    """
+    raw = (
+        os.environ.get(OTEL_EXPORTER_OTLP_TRACES_TIMEOUT)
+        or os.environ.get(OTEL_EXPORTER_OTLP_TIMEOUT)
+        or DEFAULT_EXPORT_TIMEOUT_SECONDS
+    )
+    try:
+        return float(raw)
+    except ValueError:
+        return DEFAULT_EXPORT_TIMEOUT_SECONDS
+
+
 def _exporter(destination: OpikDestination, app: str) -> SpanExporter:
     """Build the exporter to Opik's OTLP endpoint, authenticated with Keycloak.
 
@@ -475,10 +504,14 @@ def _exporter(destination: OpikDestination, app: str) -> SpanExporter:
     """
 
     def otlp() -> SpanExporter:
+        timeout = export_timeout_seconds()
         session = requests.Session()
         if destination.tokens is not None:
-            session.auth = RequestsBearerAuth(destination.tokens)
+            session.auth = RequestsBearerAuth(
+                destination.tokens, timeout_seconds=timeout
+            )
         return OTLPSpanExporter(
+            timeout=timeout,
             endpoint=destination.url.rstrip("/") + OTLP_TRACES_PATH,
             headers={WORKSPACE_HEADER: destination.workspace, PROJECT_HEADER: app},
             session=session,

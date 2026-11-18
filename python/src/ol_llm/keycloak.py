@@ -78,22 +78,35 @@ class KeycloakTokens:
         if self._owns_http:
             self._http = httpx.Client(timeout=TOKEN_REQUEST_TIMEOUT_SECONDS)
 
-    def token(self, *, refresh: bool = False) -> str:
+    def token(self, *, refresh: bool = False, timeout: float | None = None) -> str:
         """Return a current access token.
 
         :param refresh: fetch a new token even if the cached one has not expired.
+        :param timeout: the longest to wait, in seconds, for another thread's fetch
+            and for this one's request; ``None`` waits for the former without limit
+            and gives the request the HTTP client's timeout.
         :returns: the token.
         :rtype: str
         :raises httpx.HTTPError: if Keycloak cannot be reached or refuses.
+        :raises TimeoutError: if another thread's fetch holds the cache past
+            ``timeout``.
         """
-        with self._lock:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        if not self._lock.acquire(timeout=-1 if timeout is None else timeout):
+            msg = f"No Keycloak token within {timeout} seconds"
+            raise TimeoutError(msg)
+        try:
             if refresh or self._token is None or time.monotonic() >= self._expires_at:
-                self._fetch()
+                self._fetch(
+                    None if deadline is None else max(0.0, deadline - time.monotonic())
+                )
             if self._token is None:  # pragma: no cover - _fetch sets it or raises
                 raise AssertionError
             return self._token
+        finally:
+            self._lock.release()
 
-    def _fetch(self) -> None:
+    def _fetch(self, timeout: float | None) -> None:
         data = {
             "grant_type": "client_credentials",
             "client_id": self._client.client_id,
@@ -101,7 +114,11 @@ class KeycloakTokens:
         }
         if self._client.scope:
             data["scope"] = self._client.scope
-        response = self._http.post(self._client.token_url, data=data)
+        response = self._http.post(
+            self._client.token_url,
+            data=data,
+            timeout=httpx.USE_CLIENT_DEFAULT if timeout is None else timeout,
+        )
         response.raise_for_status()
         payload = response.json()
         lifetime = float(payload.get("expires_in", DEFAULT_TOKEN_LIFETIME_SECONDS))
@@ -157,19 +174,29 @@ class RequestsBearerAuth(AuthBase):
     """Bearer auth for the span exporter's ``requests`` session, retried on a 401.
 
     The OTLP exporter takes a ``requests.Session`` and only static headers
-    otherwise, so this is where an expiring token can be attached.
+    otherwise, so this is where an expiring token can be attached. ``requests``
+    runs this before the exporter's own timeout applies, so a token wait is bounded
+    here, by the exporter's timeout. An error raised from here is an export
+    failure the exporter logs, not an exception in the app.
     """
 
-    def __init__(self, tokens: KeycloakTokens) -> None:
+    def __init__(
+        self, tokens: KeycloakTokens, *, timeout_seconds: float | None = None
+    ) -> None:
         """Use the given token cache.
 
         :param tokens: the shared token cache.
+        :param timeout_seconds: the longest a token wait may take, per request;
+            ``None`` leaves it to the cache's HTTP client.
         """
         self._tokens = tokens
+        self._timeout_seconds = timeout_seconds
 
     def __call__(self, request: requests.PreparedRequest) -> requests.PreparedRequest:
         """Attach the cached token and the hook that retries a 401."""
-        request.headers["Authorization"] = f"Bearer {self._tokens.token()}"
+        request.headers["Authorization"] = (
+            f"Bearer {self._tokens.token(timeout=self._timeout_seconds)}"
+        )
         request.register_hook("response", self._retry_unauthorized)
         return request
 
@@ -190,7 +217,8 @@ class RequestsBearerAuth(AuthBase):
             event: [hook for hook in hooks if hook != self._retry_unauthorized]
             for event, hooks in retry.hooks.items()
         }
-        retry.headers["Authorization"] = f"Bearer {self._tokens.token(refresh=True)}"
+        token = self._tokens.token(refresh=True, timeout=self._timeout_seconds)
+        retry.headers["Authorization"] = f"Bearer {token}"
         retried: requests.Response = response.connection.send(retry, **kwargs)
         retried.history.append(response)
         retried.request = retry

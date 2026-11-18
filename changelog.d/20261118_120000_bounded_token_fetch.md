@@ -1,0 +1,3 @@
+### Fixed
+
+- A span export no longer waits on Keycloak longer than the exporter's own timeout (`OTEL_EXPORTER_OTLP_TRACES_TIMEOUT`, else `OTEL_EXPORTER_OTLP_TIMEOUT`, else 10 s). The token was fetched while the request was prepared, before that timeout applied, so a cold or expired token with a slow Keycloak held a flush for the full 10 s `TOKEN_REQUEST_TIMEOUT_SECONDS` per exporter. A fetch that exceeds the budget fails that export, which the exporter logs and drops, and the next export tries again. `KeycloakTokens.token` takes an optional `timeout`, and `RequestsBearerAuth` a `timeout_seconds`; the Opik SDK's auth keeps the 10 s timeout.

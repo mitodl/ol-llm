@@ -1,12 +1,17 @@
+import socket
+import threading
+import time
 from collections.abc import Callable, Iterator
 
 import httpx
 import opik
 import pytest
 import requests
+from conftest import _REAL_EXPORTER
 from ol_llm import keycloak, tracing
 from ol_llm.testing import tracing_disabled
 from ol_llm.trace_destinations import opik_destination
+from ol_llm.trace_destinations.interface import DestinationSettings
 from ol_llm.trace_destinations.opik_destination import PROJECT_NAME
 from ol_llm.tracing import (
     HttpxBearerAuth,
@@ -17,6 +22,8 @@ from ol_llm.tracing import (
     configure_tracing,
     tracer_provider,
 )
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
@@ -226,6 +233,81 @@ def test_requests_auth_returns_a_second_401() -> None:
 
     assert session.post("https://opik.example/api").status_code == 401
     assert len(adapter.seen) == 2
+
+
+@pytest.fixture
+def hung_keycloak() -> Iterator[KeycloakClient]:
+    """Serve a token endpoint that accepts connections and never answers."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    held: list[socket.socket] = []
+
+    def accept() -> None:
+        while True:
+            try:
+                held.append(listener.accept()[0])
+            except OSError:
+                return
+
+    threading.Thread(target=accept, daemon=True).start()
+    host, port = listener.getsockname()
+    yield KeycloakClient(
+        token_url=f"http://{host}:{port}/token", client_id="c", client_secret="s"
+    )
+    listener.close()
+    for conn in held:
+        conn.close()
+
+
+def test_a_span_export_waits_on_a_hung_keycloak_no_longer_than_its_timeout(
+    hung_keycloak: KeycloakClient,
+    hooks: list[HttpxClientHook],  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    export_timeout_seconds = 1
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TIMEOUT", str(export_timeout_seconds))
+    tokens = KeycloakTokens(hung_keycloak)
+    destination = opik_destination.OpikDestination(
+        DestinationSettings(environ={}, tokens=tokens)
+    )
+    exporter = _REAL_EXPORTER(destination, "app")
+
+    memory = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(memory))
+    provider.get_tracer("test").start_span("span").end()
+
+    started = time.monotonic()
+    result = exporter.export(memory.get_finished_spans())
+    elapsed = time.monotonic() - started
+    tokens.close()
+
+    assert result is SpanExportResult.FAILURE
+    assert elapsed < export_timeout_seconds + 1
+
+
+def test_the_export_timeout_resolves_as_the_otlp_exporter_resolves_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "OTEL_EXPORTER_OTLP_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert opik_destination.export_timeout_seconds() == 10
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "2")
+    assert opik_destination.export_timeout_seconds() == 2
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT", "3.5")
+    assert opik_destination.export_timeout_seconds() == 3.5
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT", "soon")
+    assert opik_destination.export_timeout_seconds() == 10
+
+
+def test_a_token_wait_behind_another_fetch_times_out() -> None:
+    tokens = KeycloakTokens(KEYCLOAK, http=token_server([300])[0])
+    with tokens._lock, pytest.raises(TimeoutError):  # noqa: SLF001
+        tokens.token(timeout=0.05)
 
 
 OTHER_KEYCLOAK = KeycloakClient(
