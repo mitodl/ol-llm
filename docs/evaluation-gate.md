@@ -29,6 +29,7 @@ use_case = "feedback-summary"
 mode = "advisory"                        # every gate starts advisory
 suite = "feedback_summary_eval:suite"    # module:attribute
 judge_model = "bedrock:us.anthropic.claude-sonnet-5"
+judge_max_tokens = 1024                  # optional; bounds each judge call's output
 pointers = "../prompts.toml"             # the app's pointer file
 prompts = ["feedback-summary"]           # tested at the version it points at
 
@@ -106,8 +107,12 @@ def suite(context: GateContext) -> Suite:
 
 `context.require_judge()` returns the declared judge, built with `judge_model`, so its calls
 are routed, traced, and costed under `eval-judge` like any other call. It should not be the
-model under test. The metrics are ol-llm's (`ol_llm.evaluation.Metric`): `ValidatorMetric`,
-the judge metrics `hallucination`, `answer_relevance`, `context_precision` and
+model under test. `judge_max_tokens` (a positive int, needs `judge_model`) caps each judge
+call's output. Set it for a Bedrock judge: without it the request asks for the model's maximum
+output, and Bedrock reserves that against the account's tokens-per-minute quota at the start of
+each call, so the experiment throttles early. A Claude judge's thinking tokens count toward the
+cap, so leave room for them. The metrics are ol-llm's (`ol_llm.evaluation.Metric`):
+`ValidatorMetric`, the judge metrics `hallucination`, `answer_relevance`, `context_precision` and
 `context_recall`, or a `Metric` subclass of the app's own. A suite imports no Opik.
 
 The gate runs on the experiment backend `OL_LLM_EXPERIMENT_BACKEND` names, Opik by default

@@ -8,6 +8,7 @@ the owning team reviews like code (spec §5.1 item 3)::
     mode = "advisory"                   # until the owner trusts the thresholds
     suite = "feedback_summary_eval:suite"
     judge_model = "bedrock:us.anthropic.claude-sonnet-5"
+    judge_max_tokens = 1024             # optional: bounds each judge call's output
     pointers = "../prompts.toml"        # the app's pointer file, from this file
     prompts = ["feedback-summary"]      # tested at the version it points at
 
@@ -164,6 +165,10 @@ class GateDeclaration(pydantic.BaseModel):
     :param suite: ``module:attribute`` of the callable that builds the ``Suite``.
     :param judge_model: the judge's model id, when a metric needs a judge. It
         should not be the model under test (spec §5.1 item 7).
+    :param judge_max_tokens: the most output tokens a judge call may produce;
+        needs ``judge_model``. Set it for a Bedrock judge, which otherwise asks
+        for the model's maximum output and reserves that against the account's
+        tokens-per-minute quota.
     :param prompts: prompt name to the version under test, from the pointer
         file: on a pull request that changes a pointer, the new version;
         otherwise production's.
@@ -180,6 +185,7 @@ class GateDeclaration(pydantic.BaseModel):
     mode: GateMode = "advisory"
     suite: Annotated[str, pydantic.StringConstraints(pattern=r"^[\w.]+:[\w.]+$")]
     judge_model: str | None = None
+    judge_max_tokens: pydantic.PositiveInt | None = None
     prompts: Annotated[dict[PromptName, VersionName], pydantic.Field(min_length=1)]
     dataset: DatasetPin
     thresholds: Annotated[list[Threshold], pydantic.Field(min_length=1)]
@@ -196,6 +202,9 @@ class GateDeclaration(pydantic.BaseModel):
 
     @pydantic.model_validator(mode="after")
     def _pairwise_is_judged_and_bounded(self) -> "GateDeclaration":
+        if self.judge_max_tokens is not None and self.judge_model is None:
+            msg = "judge_max_tokens needs judge_model set"
+            raise ValueError(msg)
         bound = next((t for t in self.thresholds if t.metric == PAIRWISE_METRIC), None)
         if self.pairwise is None:
             if bound is not None:
@@ -546,7 +555,11 @@ def run_gate(
     judge = None
     if declaration.judge_model is not None:
         try:
-            judge = judge_model(declaration.app, declaration.judge_model)
+            judge = judge_model(
+                declaration.app,
+                declaration.judge_model,
+                max_tokens=declaration.judge_max_tokens,
+            )
         except ValueError as exc:
             raise GateConfigurationError(str(exc)) from exc
     built = suite(
@@ -564,6 +577,8 @@ def run_gate(
         "change": change,
         "judge_model": declaration.judge_model,
     }
+    if declaration.judge_max_tokens is not None:
+        config["judge_max_tokens"] = declaration.judge_max_tokens
     try:
         result = evaluate(
             built.task,

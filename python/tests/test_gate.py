@@ -455,6 +455,11 @@ def test_a_declaration_takes_its_versions_from_the_pointer_file(
             "one threshold",
         ),
         ({"mode": "strict"}, "'advisory' or 'blocking'"),
+        ({"judge_max_tokens": 512}, "judge_max_tokens needs judge_model"),
+        (
+            {"judge_model": "openai:gpt-4o-mini", "judge_max_tokens": 0},
+            "greater than 0",
+        ),
         ({"suite": "no_attribute"}, "should match pattern"),
         (
             {"pairwise": {"criteria": "Better."}, "judge_model": "openai:gpt-4o-mini"},
@@ -687,6 +692,41 @@ def test_the_judge_is_built_through_the_library(client: FakeClient) -> None:
 
     [judge] = judges
     assert (judge.use_case.app, judge.use_case.name) == (APP, "eval-judge")
+
+
+@pytest.mark.usefixtures("prompts")
+def test_the_declared_judge_max_tokens_reaches_the_judge(client: FakeClient) -> None:
+    seeded(client)
+    judges = []
+
+    def judged(context: GateContext) -> Suite:
+        judges.append(context.require_judge())
+        msg = "stop"
+        raise GateConfigurationError(msg)
+
+    with pytest.raises(GateConfigurationError, match="stop"):
+        run_gate(
+            declaration(judge_model="openai:gpt-4o-mini", judge_max_tokens=512),
+            suite=judged,
+            change="pr-1",
+        )
+
+    [judge] = judges
+    assert judge.max_tokens == 512
+
+
+@pytest.mark.usefixtures("prompts")
+def test_the_judge_max_tokens_is_part_of_the_experiment_config(
+    client: FakeClient, runs: list[dict[str, Any]]
+) -> None:
+    seeded(client)
+    run_gate(
+        declaration(judge_model="openai:gpt-4o-mini", judge_max_tokens=512),
+        suite=suite,
+        change="pr-1",
+    )
+    [call] = runs
+    assert call["experiment_config"]["judge_max_tokens"] == 512
 
 
 @pytest.mark.usefixtures("prompts")
