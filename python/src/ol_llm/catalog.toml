@@ -97,6 +97,26 @@ opik_model = "gpt-5.4-mini"
 input_usd_per_mtok = "0.75"
 output_usd_per_mtok = "4.50"
 
+# Priced by prompt length: $0.20/$0.75 above 272,000 prompt tokens.
+[[model]]
+id = "openai:gpt-6-luna"
+kind = "chat"
+floating = true
+opik_provider = "openai"
+opik_model = "gpt-6-luna"
+input_usd_per_mtok = "0.10"
+output_usd_per_mtok = "0.50"
+
+# Priced by prompt length: $4.00/$15.00 above 272,000 prompt tokens.
+[[model]]
+id = "openai:gpt-6-sol"
+kind = "chat"
+floating = true
+opik_provider = "openai"
+opik_model = "gpt-6-sol"
+input_usd_per_mtok = "2.00"
+output_usd_per_mtok = "10.00"
+
 [[model]]
 id = "openai:text-embedding-3-large"
 kind = "embedding"
@@ -165,6 +185,26 @@ opik_provider = "azure"
 opik_model = "gpt-5.4-mini"
 input_usd_per_mtok = "0.75"
 output_usd_per_mtok = "4.50"
+
+# Priced by prompt length: $0.20/$0.75 above 272,000 prompt tokens.
+[[model]]
+id = "azure:gpt-6-luna"
+kind = "chat"
+floating = true
+opik_provider = "azure"
+opik_model = "gpt-6-luna"
+input_usd_per_mtok = "0.10"
+output_usd_per_mtok = "0.50"
+
+# Priced by prompt length: $4.00/$15.00 above 272,000 prompt tokens.
+[[model]]
+id = "azure:gpt-6-sol"
+kind = "chat"
+floating = true
+opik_provider = "azure"
+opik_model = "gpt-6-sol"
+input_usd_per_mtok = "2.00"
+output_usd_per_mtok = "10.00"
 
 [[model]]
 id = "azure:text-embedding-3-large"
