@@ -58,13 +58,13 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from ol_llm import trace_attributes as attrs
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution
 from ol_llm.catalog import check_decision_model
-from ol_llm.errors import LLMInvalidOutput
+from ol_llm.errors import LLMError, LLMInvalidOutput, LLMRejected
 from ol_llm.loops import LoopLocal, run_coroutine
 from ol_llm.policy import CallPolicy, UseCase, resolve_policy
-from ol_llm.retries import RetryBudget, classify_http_failure
+from ol_llm.retries import TRANSPORT_ERRORS, RetryBudget, classify_http_failure
 from ol_llm.settings import Settings, get_settings
-from ol_llm.traces import TracedCall, record_error
-from ol_llm.tracing import enabled, include_content, tracer_provider
+from ol_llm.traces import TracedCall, model_span
+from ol_llm.tracing import enabled
 
 DECISION_PROVIDERS = frozenset({"azure", "typesafe", "systemone"})
 """The providers ``decide`` sends requests to; see the module docstring."""
@@ -321,13 +321,26 @@ class _WireResponse(_Wire):
 
 @dataclass(frozen=True)
 class _Endpoint:
+    """Where a request goes, and the bearer token for it.
+
+    :param token: returns the bearer token, or ``None`` for a server that takes
+        none. Called per attempt, so an Entra token provider can refresh.
+    """
+
     url: str
     model: str
-    headers: Mapping[str, str]
+    token: Callable[[], str | None]
+
+    def headers(self) -> dict[str, str]:
+        """Return the request's auth header, fetching the token now."""
+        token = self.token()
+        return {"Authorization": f"Bearer {token}"} if token else {}
 
 
 def _endpoint(use_case: UseCase, settings: Settings) -> _Endpoint:
     """Return where a use case's request goes and how it authenticates.
+
+    Fetches no token: ``_Endpoint.headers`` does, per attempt.
 
     :raises ValueError: for a provider ``decide`` does not call, or one whose
         endpoint or credential is not configured.
@@ -345,14 +358,12 @@ def _endpoint(use_case: UseCase, settings: Settings) -> _Endpoint:
         return _Endpoint(
             url=settings.azure_decision_endpoint.rstrip("/") + AZURE_DECISION_PATH,
             model=model,
-            headers={"Authorization": f"Bearer {settings.azure_ad_token_provider()}"},
+            token=settings.azure_ad_token_provider,
         )
     if provider == "typesafe":
         key = settings.typesafe_api_key or os.environ["TYPESAFE_API_KEY"]
         return _Endpoint(
-            url=TYPESAFE_BASE_URL + SYSTEMONE_PATH,
-            model=model,
-            headers={"Authorization": f"Bearer {key}"},
+            url=TYPESAFE_BASE_URL + SYSTEMONE_PATH, model=model, token=lambda: key
         )
     if provider == "systemone":
         if not settings.systemone_base_url:
@@ -362,7 +373,7 @@ def _endpoint(use_case: UseCase, settings: Settings) -> _Endpoint:
         return _Endpoint(
             url=settings.systemone_base_url.rstrip("/") + SYSTEMONE_PATH,
             model=model,
-            headers={"Authorization": f"Bearer {bearer}"} if bearer else {},
+            token=lambda: bearer,
         )
     msg = (
         f"ol-llm does not call {provider!r} decision models; supported providers "
@@ -463,9 +474,13 @@ def _answer(
         ):
             return None
         probabilities = tuple(wire.probabilities.values())
+        # A server may leave out a level it gives no weight, so each level keeps
+        # its position.
         answer = ScoreAnswer(
             wire.score,
-            tuple(wire.probabilities[i] for i in sorted(wire.probabilities)),
+            tuple(wire.probabilities.get(level, 0.0) for level in levels)
+            if wire.probabilities
+            else (),
         )
     else:
         return None
@@ -490,17 +505,37 @@ def _decision_input(state: object, questions: object) -> None:
 
 
 async def _attempt(
-    endpoint: _Endpoint, body: Mapping[str, Any], policy: CallPolicy
+    endpoint: _Endpoint,
+    body: Mapping[str, Any],
+    headers: Mapping[str, str],
+    policy: CallPolicy,
 ) -> bytes:
     async with _client() as client:
         response = await client.post(
             endpoint.url,
             json={**body, "model": endpoint.model},
-            headers=dict(endpoint.headers),
+            headers=dict(headers),
             timeout=policy.timeout_seconds,
         )
     response.raise_for_status()
     return response.content
+
+
+def _classify(exc: Exception, use_case: UseCase) -> LLMError | None:
+    """Map a failed request to its library error, or ``None`` to raise it as is.
+
+    Beyond ``classify_http_failure``: any other transport error (a proxy failure,
+    a bad URL scheme) is a rejection, as on the chat path, and a body that cannot
+    be decoded is invalid output.
+    """
+    name, model = use_case.name, use_case.model
+    if (error := classify_http_failure(exc, use_case=name, model=model)) is not None:
+        return error
+    if isinstance(exc, TRANSPORT_ERRORS):
+        return LLMRejected(str(exc), use_case=name, model=model, status_code=None)
+    if isinstance(exc, httpx2.DecodingError):
+        return LLMInvalidOutput(str(exc), use_case=name, model=model)
+    return None
 
 
 async def _request(
@@ -512,16 +547,15 @@ async def _request(
         or ``LLMInvalidOutput`` on a body that is not a System One response.
     """
     budget = RetryBudget(policy := resolve_policy(use_case), use_case.profile)
+    endpoint = _endpoint(use_case, settings)
     while True:
-        # Per attempt: a token provider hands out a new token near expiry.
-        endpoint = _endpoint(use_case, settings)
+        # Per attempt: a token provider hands out a new token near expiry. Its own
+        # failure (e.g. azure-identity's) is not a model failure and propagates.
+        headers = endpoint.headers()
         try:
-            content = await _attempt(endpoint, body, policy)
+            content = await _attempt(endpoint, body, headers, policy)
         except Exception as exc:
-            error = classify_http_failure(
-                exc, use_case=use_case.name, model=use_case.model
-            )
-            if error is None:
+            if (error := _classify(exc, use_case)) is None:
                 raise
             if (delay := budget.next_delay(error)) is None:
                 raise error from exc
@@ -580,7 +614,7 @@ async def decide(
         traced=enabled(),
     )
     with call.trace_scope(_decision_input, sent_state, wire_questions) as output:
-        async with _decision_span(call) as span:
+        with model_span(call, "decision", {}) as span:
             response = await _request(
                 use_case,
                 {"state": sent_state, "questions": wire_questions},
@@ -628,34 +662,6 @@ def _answer_output(answer: Answer) -> dict[str, Any]:
     if isinstance(answer, ChoiceAnswer):
         return {"choice": answer.choice, "confidence": answer.confidence}
     return {"score": answer.score}
-
-
-@asynccontextmanager
-async def _decision_span(call: TracedCall) -> AsyncIterator[Span | None]:
-    """Open the model request's span, with the GenAI request attributes.
-
-    Yields ``None`` when the call is not traced.
-    """
-    provider = tracer_provider(call.use_case.app) if call.traced else None
-    if provider is None:
-        yield None
-        return
-    system, _, model_name = call.use_case.model.partition(":")
-    with provider.get_tracer("ol_llm").start_as_current_span(
-        f"decision {model_name}",
-        attributes={
-            attrs.OPERATION_NAME: "decision",
-            attrs.PROVIDER_NAME: system,
-            attrs.REQUEST_MODEL: model_name,
-        },
-        record_exception=False,
-        set_status_on_exception=False,
-    ) as span:
-        try:
-            yield span
-        except Exception as exc:
-            record_error(span, exc, content=include_content())
-            raise
 
 
 def _record(span: Span | None, decision: Decision) -> None:

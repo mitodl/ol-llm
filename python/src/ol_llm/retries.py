@@ -30,6 +30,13 @@ UNAVAILABLE_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
 )
 """Transport failures that mean no answer came back."""
 
+TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
+    httpx.TransportError,
+    httpx2.TransportError,
+)
+"""Every transport failure. Those not in ``UNAVAILABLE_TRANSPORT_ERRORS`` are
+permanent (a bad URL scheme, a proxy failure) and are not retried."""
+
 RATE_LIMITED_STATUS = 429
 INITIAL_BACKOFF_SECONDS = 0.5
 MILLISECONDS_PER_SECOND = 1000

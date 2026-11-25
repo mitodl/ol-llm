@@ -35,7 +35,6 @@ from types import TracebackType
 from typing import Any, NoReturn, Self, TypeVar, cast, overload
 
 import anyio
-import httpx
 import httpx2
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities import (
@@ -101,6 +100,7 @@ from ol_llm.policy import CallPolicy, Profile, UseCase, resolve_policy
 from ol_llm.retries import (
     RATE_LIMITED_STATUS,
     RETRYABLE_STATUSES,
+    TRANSPORT_ERRORS,
     UNAVAILABLE_TRANSPORT_ERRORS,
     RetryBudget,
 )
@@ -130,13 +130,6 @@ BEDROCK_MODEL_ERROR_CODE = "ModelErrorException"
 
 FALLBACK_ON = (LLMRateLimited, LLMUnavailable)
 
-# Google and Mistral raise UNAVAILABLE_TRANSPORT_ERRORS raw from httpx2 rather than
-# as ModelAPIError (spec §6.1); any other transport error is permanent (a bad URL
-# scheme, a proxy failure) and is not retried.
-_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
-    httpx.TransportError,
-    httpx2.TransportError,
-)
 
 _OPENAI_PROVIDERS = frozenset({"openai", "openai-chat", "openai-responses"})
 _AZURE_PROVIDERS = frozenset({"azure", "azure-responses"})
@@ -280,7 +273,7 @@ def classify_failure(  # noqa: PLR0911
     )
     if isinstance(exc, unavailable):
         return LLMUnavailable(message, use_case=use_case, model=model)
-    if isinstance(exc, _TRANSPORT_ERRORS):
+    if isinstance(exc, TRANSPORT_ERRORS):
         return LLMRejected(message, use_case=use_case, model=model, status_code=None)
     return None
 

@@ -498,3 +498,85 @@ def test_decide_runs_on_the_callers_loop(requests: list[httpx2.Request]) -> None
         decision = asyncio.run(decide(REPLY, "x", QUESTIONS))
 
     assert decision.yes_no("wants_a_person").probability == 0.1
+
+
+def raising(exc: Exception) -> override_decision_transport:
+    def handler(_request: httpx2.Request) -> httpx2.Response:
+        raise exc
+
+    return override_decision_transport(httpx2.MockTransport(handler))
+
+
+def test_a_permanent_transport_failure_is_a_rejection(
+    decision_sleeps: list[float],
+) -> None:
+    msg = "proxy refused"
+    with raising(httpx2.ProxyError(msg)), pytest.raises(LLMRejected) as raised:
+        decide_sync(REPLY, "x", QUESTIONS)
+
+    assert raised.value.status_code is None
+    assert decision_sleeps == []
+
+
+def test_a_body_that_cannot_be_decoded_is_invalid_output() -> None:
+    msg = "corrupt gzip"
+    with raising(httpx2.DecodingError(msg)), pytest.raises(LLMInvalidOutput):
+        decide_sync(REPLY, "x", QUESTIONS)
+
+
+def test_a_score_keeps_each_levels_position_when_a_level_is_left_out(
+    requests: list[httpx2.Request],
+) -> None:
+    answers = {
+        **ANSWERS,
+        "urgency": {
+            "type": "score",
+            "score": 1.6,
+            "probabilities": {"1": 0.4, "2": 0.6},
+        },
+    }
+    with serving(requests, ok(answers)):
+        decision = decide_sync(REPLY, "x", QUESTIONS)
+
+    assert decision.score("urgency").probabilities == (0.0, 0.4, 0.6)
+
+
+def test_the_token_is_fetched_for_each_attempt(
+    requests: list[httpx2.Request], decision_sleeps: list[float]
+) -> None:
+    tokens = iter(["first", "second"])
+    configure(
+        Settings(
+            environment="ci",
+            azure_decision_endpoint=ENDPOINT,
+            azure_ad_token_provider=lambda: next(tokens),
+        )
+    )
+    with serving(requests, httpx2.Response(503), ok()):
+        decide_sync(REPLY, "x", QUESTIONS)
+
+    assert [r.headers["authorization"] for r in requests] == [
+        "Bearer first",
+        "Bearer second",
+    ]
+    assert len(decision_sleeps) == 1
+
+
+def test_a_token_provider_failure_is_not_a_model_failure(
+    requests: list[httpx2.Request],
+) -> None:
+    def no_token() -> str:
+        msg = "managed identity unavailable"
+        raise RuntimeError(msg)
+
+    configure(
+        Settings(
+            environment="ci",
+            azure_decision_endpoint=ENDPOINT,
+            azure_ad_token_provider=no_token,
+        )
+    )
+    with serving(requests, ok()), pytest.raises(RuntimeError, match="managed"):
+        decide_sync(REPLY, "x", QUESTIONS)
+
+    assert requests == []

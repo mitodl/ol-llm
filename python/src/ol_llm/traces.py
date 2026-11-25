@@ -363,30 +363,47 @@ def _embedding_span(call: TracedCall, texts: list[str]) -> Generator[Span | None
 
     Yields ``None`` when the call is not traced.
     """
+    attributes: dict[str, AttributeValue] = {attrs.INPUTS_COUNT: len(texts)}
+    if include_content():
+        attributes[attrs.EMBEDDING_INPUTS] = json.dumps(texts)
+    with model_span(call, "embeddings", attributes) as span:
+        yield span
+
+
+@contextmanager
+def model_span(
+    call: TracedCall, operation: str, attributes: Mapping[str, AttributeValue]
+) -> Generator[Span | None]:
+    """Open the span of one model request a traced call makes, named as GenAI does.
+
+    It carries the operation, provider and requested model, and records an
+    exception the block raises the way ``record_error`` does. Yields ``None`` when
+    the call is not traced.
+
+    :param call: the traced call the request belongs to.
+    :param operation: the GenAI operation, e.g. ``embeddings``; it names the span.
+    :param attributes: the operation's own attributes.
+    """
     provider = tracer_provider(call.use_case.app) if call.traced else None
     if provider is None:
         yield None
         return
     system, _, model_name = call.use_case.model.partition(":")
-    attributes: dict[str, str | int] = {
-        attrs.OPERATION_NAME: "embeddings",
-        attrs.PROVIDER_NAME: system,
-        attrs.REQUEST_MODEL: model_name,
-        attrs.INPUTS_COUNT: len(texts),
-    }
-    content = include_content()
-    if content:
-        attributes[attrs.EMBEDDING_INPUTS] = json.dumps(texts)
     with provider.get_tracer("ol_llm").start_as_current_span(
-        f"embeddings {model_name}",
-        attributes=attributes,
+        f"{operation} {model_name}",
+        attributes={
+            attrs.OPERATION_NAME: operation,
+            attrs.PROVIDER_NAME: system,
+            attrs.REQUEST_MODEL: model_name,
+            **attributes,
+        },
         record_exception=False,
         set_status_on_exception=False,
     ) as span:
         try:
             yield span
         except Exception as exc:
-            record_error(span, exc, content=content)
+            record_error(span, exc, content=include_content())
             raise
 
 
