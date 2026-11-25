@@ -49,6 +49,7 @@ PROVIDER_NAME = "gen_ai.provider.name"
 REQUEST_MODEL = "gen_ai.request.model"
 RESPONSE_MODEL = "gen_ai.response.model"
 USAGE_INPUT_TOKENS = "gen_ai.usage.input_tokens"
+USAGE_OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
 EMBEDDINGS_DIMENSION_COUNT = "gen_ai.embeddings.dimension.count"
 
 MEMORY_OPERATION = "ol.memory.operation"

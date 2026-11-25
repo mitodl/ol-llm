@@ -12,7 +12,9 @@
 #   id                  PydanticAI form, provider:model. Bedrock ids are inference
 #                       profile ids; Azure ids name the deployment, which is
 #                       deployed under the model's own name.
-#   kind                chat or embedding.
+#   kind                chat, embedding, or decision (a system-one model that
+#                       answers typed questions with probabilities, through
+#                       ol_llm.decisions).
 #   status              [allowed] allowed, deprecated (needs retires_on), or
 #                       retired. A deprecated id builds and tags the trace
 #                       model_status:deprecated; a retired id raises.
@@ -183,6 +185,16 @@ dimensions = 1536
 opik_provider = "azure"
 opik_model = "text-embedding-3-small"
 input_usd_per_mtok = "0.02"
+output_usd_per_mtok = "0"
+
+# Deployed to learn-ai's Azure Foundry (AIServices) account, pinned to version 1.
+# Azure bills one meter, "Decision 1.1 Gl 1M Tokens", at $0.042 for GlobalStandard
+# (Azure retail prices API, read 2026-11-25); output tokens are not billed. Opik has
+# no price for it.
+[[model]]
+id = "azure:Microsoft-Decision-1.1"
+kind = "decision"
+input_usd_per_mtok = "0.042"
 output_usd_per_mtok = "0"
 
 # Anthropic direct.

@@ -109,10 +109,10 @@ def test_catalog(monkeypatch: pytest.MonkeyPatch) -> Catalog:
     return catalog
 
 
-def test_released_catalog_has_both_kinds() -> None:
+def test_released_catalog_has_every_kind() -> None:
     kinds = {entry.kind for entry in CATALOG.entries.values()}
 
-    assert kinds == {"chat", "embedding"}
+    assert kinds == {"chat", "embedding", "decision"}
 
 
 def test_unlisted_model_builds_and_warns(caplog: pytest.LogCaptureFixture) -> None:

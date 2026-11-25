@@ -42,7 +42,7 @@ from pydantic import (
 from ol_llm.loops import register_at_fork
 from ol_llm.policy import UseCase
 
-ModelKind = Literal["chat", "embedding"]
+ModelKind = Literal["chat", "embedding", "decision"]
 ModelStatus = Literal["allowed", "deprecated", "retired"]
 Route = Literal["direct", "gateway"]
 
@@ -101,7 +101,7 @@ class CatalogEntry(BaseModel):
         route, a price that is not a quoted decimal, a deprecated entry with no
         ``retires_on``, ``route_falls_back`` on a direct route, only one of the two
         Opik names, a negative price, an embedding entry without a positive
-        ``dimensions``, or a chat entry with one.
+        ``dimensions``, or another kind of entry with one.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
@@ -152,7 +152,7 @@ class CatalogEntry(BaseModel):
         if self.kind == "embedding" and (self.dimensions or 0) <= 0:
             msg = "an embedding entry needs a positive dimensions"
             raise ValueError(msg)
-        if self.kind == "chat" and self.dimensions is not None:
+        if self.kind != "embedding" and self.dimensions is not None:
             msg = "only an embedding entry has dimensions"
             raise ValueError(msg)
         return self
@@ -505,6 +505,31 @@ def embedding_entry(use_case: UseCase) -> CatalogEntry | None:
         )
         raise ValueError(msg)
     return entry
+
+
+@CachedCheck
+def check_decision_model(use_case: UseCase) -> tuple[str, ...]:
+    """Check a decision use case against the catalog, as ``decide`` does.
+
+    A decision use case takes no ``fallback_models``: each model calibrates its
+    probabilities differently, so a threshold tuned on one does not carry over.
+    A rejected use case raises every time; an unlisted or deprecated model warns
+    once, until its use case falls out of ``UseCaseCache``.
+
+    :param use_case: the call site.
+    :returns: the ``model_status`` trace tags, from ``status_tags``.
+    :rtype: tuple[str, ...]
+    :raises ValueError: if the use case declares fallbacks, or its model is not in
+        ``provider:model`` form, is retired, or is listed as another kind.
+    """
+    if use_case.fallback_models:
+        msg = (
+            f"Use case {use_case.name!r} declares fallback_models; a decision use "
+            "case takes none, since each model calibrates its probabilities "
+            "differently"
+        )
+        raise ValueError(msg)
+    return status_tags(catalog_entries(use_case, kind="decision"))
 
 
 @dataclass(frozen=True)

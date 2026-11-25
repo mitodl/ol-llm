@@ -10,6 +10,11 @@ Provider credentials are not read here. Each provider SDK reads its own variable
 Vertex use the default credential chain, which covers IRSA and workload identity.
 A host that configures in code can pass Together's key and an Azure token provider
 on ``Settings`` instead.
+
+Decision models (``ol_llm.decisions``) have no provider SDK, so where they are
+served is set here: ``OL_LLM_AZURE_DECISION_ENDPOINT`` for an Azure Foundry account
+and ``OL_LLM_SYSTEMONE_BASE_URL`` (with ``OL_LLM_SYSTEMONE_API_KEY`` when the server
+wants one) for a self-hosted server. TypeSafe's key is ``TYPESAFE_API_KEY``.
 """
 
 import inspect
@@ -58,12 +63,26 @@ class Settings:
         loop that awaits it.
     :param together_api_key: the Together AI API key; ``None`` reads
         ``TOGETHER_API_KEY``.
+    :param azure_decision_endpoint: the endpoint of the Azure Foundry account that
+        serves ``azure:`` decision models, e.g.
+        ``https://<account>.cognitiveservices.azure.com``. Requests authenticate
+        with ``azure_ad_token_provider``.
+    :param typesafe_api_key: the TypeSafe API key, for ``typesafe:`` decision
+        models; ``None`` reads ``TYPESAFE_API_KEY``.
+    :param systemone_base_url: the base URL of a self-hosted server speaking the
+        System One decision API (``laya-serve``, ``strands-decider serve``), for
+        ``systemone:`` decision models.
+    :param systemone_api_key: the bearer token that server wants, if any.
     """
 
     environment: str
     gateway_routes: Mapping[str, GatewayRoute] = field(default_factory=dict)
     azure_ad_token_provider: Callable[[], str] | None = field(default=None, repr=False)
     together_api_key: str | None = field(default=None, repr=False)
+    azure_decision_endpoint: str | None = None
+    typesafe_api_key: str | None = field(default=None, repr=False)
+    systemone_base_url: str | None = None
+    systemone_api_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Reject an empty environment and routes for unknown families.
@@ -93,7 +112,8 @@ class Settings:
 
         ``OL_LLM_ENVIRONMENT`` is required. A gateway route for a family is set by
         ``OL_LLM_GATEWAY_<FAMILY>_BASE_URL`` and ``OL_LLM_GATEWAY_<FAMILY>_API_KEY``
-        together.
+        together. The decision model servers are ``OL_LLM_AZURE_DECISION_ENDPOINT``,
+        ``OL_LLM_SYSTEMONE_BASE_URL`` and ``OL_LLM_SYSTEMONE_API_KEY``.
 
         :param environ: the environment to read; ``os.environ`` when omitted.
         :returns: the settings.
@@ -116,7 +136,13 @@ class Settings:
                 msg = f"{prefix}_BASE_URL and {prefix}_API_KEY must be set together"
                 raise ValueError(msg)
             routes[family] = GatewayRoute(base_url=base_url, api_key=api_key)
-        return cls(environment=environment, gateway_routes=routes)
+        return cls(
+            environment=environment,
+            gateway_routes=routes,
+            azure_decision_endpoint=env.get(f"{_ENV_PREFIX}_AZURE_DECISION_ENDPOINT"),
+            systemone_base_url=env.get(f"{_ENV_PREFIX}_SYSTEMONE_BASE_URL"),
+            systemone_api_key=env.get(f"{_ENV_PREFIX}_SYSTEMONE_API_KEY"),
+        )
 
 
 _lock = threading.Lock()

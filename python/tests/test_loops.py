@@ -34,10 +34,12 @@ from ol_llm import (
     KeycloakClient,
     TracingConfig,
     UseCase,
+    YesNo,
     close_thread_loop,
     complete,
     complete_sync,
     configure_tracing,
+    decide,
     embed,
     embeddings,
     loops,
@@ -72,6 +74,9 @@ SEARCH = UseCase(
     name="search-query",
     profile="request",
     model="openai:text-embedding-3-small",
+)
+DECIDE = UseCase(
+    app="learn-ai", name="support-reply", profile="request", model="systemone:laya"
 )
 
 
@@ -157,6 +162,11 @@ async def _embedding() -> object:
     return (await embed(SEARCH, ["hi"], input_type="query")).dimensions
 
 
+async def _decision() -> object:
+    question = {"done": YesNo(instructions="Is the learner done?")}
+    return (await decide(DECIDE, "thanks!", question)).yes_no("done").probability
+
+
 def _token_resource(url: str) -> Resource:
     tokens = KeycloakTokens(
         KeycloakClient(token_url=f"{url}/token", client_id="app", client_secret="s")
@@ -195,6 +205,7 @@ def _memory_exchange_resource(url: str) -> Resource:
 RESOURCES: dict[str, Callable[[str], Resource]] = {
     "model": lambda _url: Resource(_chat, "ok"),
     "embedding": lambda _url: Resource(_embedding, 3),
+    "decision": lambda _url: Resource(_decision, 0.9),
     "token": _token_resource,
     "memory": _memory_resource,
     "memory-exchange": _memory_exchange_resource,
@@ -204,7 +215,13 @@ RESOURCES: dict[str, Callable[[str], Resource]] = {
 @pytest.fixture(params=sorted(RESOURCES))
 def resource(keepalive_url: str, request: pytest.FixtureRequest) -> Resource:
     route = GatewayRoute(base_url=f"{keepalive_url}/v1", api_key="app-key")
-    configure(Settings(environment="ci", gateway_routes={"openai": route}))
+    configure(
+        Settings(
+            environment="ci",
+            gateway_routes={"openai": route},
+            systemone_base_url=keepalive_url,
+        )
+    )
     return RESOURCES[request.param](keepalive_url)
 
 
