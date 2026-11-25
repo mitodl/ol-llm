@@ -61,6 +61,7 @@ from ol_llm.settings import GatewayRoute, Settings, configure
 from ol_llm.testing import override_models
 from ol_llm.trace_destinations.opik_destination import OTLP_TRACES_PATH
 from ol_llm.tracing import KeycloakTokens
+from pydantic import BaseModel, Field
 from pydantic_ai.models import Model
 
 FORK_TIMEOUT_SECONDS = 30
@@ -73,6 +74,15 @@ SEARCH = UseCase(
     profile="request",
     model="openai:text-embedding-3-small",
 )
+DECIDE = UseCase(
+    app="learn-ai", name="support-reply", profile="request", model="system-one:laya"
+)
+
+
+class Done(BaseModel):
+    """Whether the learner is done."""
+
+    done: bool = Field(description="Is the learner done?")
 
 
 def run_in_fork(target: Callable[[], object]) -> object:
@@ -157,6 +167,11 @@ async def _embedding() -> object:
     return (await embed(SEARCH, ["hi"], input_type="query")).dimensions
 
 
+async def _decision() -> object:
+    result = await complete(DECIDE, "thanks!", output_type=Done)
+    return result.output.done
+
+
 def _token_resource(url: str) -> Resource:
     tokens = KeycloakTokens(
         KeycloakClient(token_url=f"{url}/token", client_id="app", client_secret="s")
@@ -195,6 +210,7 @@ def _memory_exchange_resource(url: str) -> Resource:
 RESOURCES: dict[str, Callable[[str], Resource]] = {
     "model": lambda _url: Resource(_chat, "ok"),
     "embedding": lambda _url: Resource(_embedding, 3),
+    "decision": lambda _url: Resource(_decision, True),  # noqa: FBT003
     "token": _token_resource,
     "memory": _memory_resource,
     "memory-exchange": _memory_exchange_resource,
@@ -204,7 +220,13 @@ RESOURCES: dict[str, Callable[[str], Resource]] = {
 @pytest.fixture(params=sorted(RESOURCES))
 def resource(keepalive_url: str, request: pytest.FixtureRequest) -> Resource:
     route = GatewayRoute(base_url=f"{keepalive_url}/v1", api_key="app-key")
-    configure(Settings(environment="ci", gateway_routes={"openai": route}))
+    configure(
+        Settings(
+            environment="ci",
+            gateway_routes={"openai": route},
+            systemone_base_url=keepalive_url,
+        )
+    )
     return RESOURCES[request.param](keepalive_url)
 
 

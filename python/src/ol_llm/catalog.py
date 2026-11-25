@@ -42,9 +42,15 @@ from pydantic import (
 from ol_llm.loops import register_at_fork
 from ol_llm.policy import UseCase
 
-ModelKind = Literal["chat", "embedding"]
+ModelKind = Literal["chat", "embedding", "decision"]
 ModelStatus = Literal["allowed", "deprecated", "retired"]
 Route = Literal["direct", "gateway"]
+
+DECISION_PROVIDERS = frozenset(
+    {"azure-decision", "typesafe", "system-one", "openai-decisions", "google-decisions"}
+)
+"""Providers of decision models: an agent on one answers its output type's fields
+as typed questions, with probabilities, rather than generating text."""
 
 TOKENS_PER_MTOK = 1_000_000
 
@@ -101,7 +107,7 @@ class CatalogEntry(BaseModel):
         route, a price that is not a quoted decimal, a deprecated entry with no
         ``retires_on``, ``route_falls_back`` on a direct route, only one of the two
         Opik names, a negative price, an embedding entry without a positive
-        ``dimensions``, or a chat entry with one.
+        ``dimensions``, or another kind of entry with one.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
@@ -152,7 +158,7 @@ class CatalogEntry(BaseModel):
         if self.kind == "embedding" and (self.dimensions or 0) <= 0:
             msg = "an embedding entry needs a positive dimensions"
             raise ValueError(msg)
-        if self.kind == "chat" and self.dimensions is not None:
+        if self.kind != "embedding" and self.dimensions is not None:
             msg = "only an embedding entry has dimensions"
             raise ValueError(msg)
         return self
@@ -249,14 +255,29 @@ def load_catalog() -> Catalog:
     return Catalog.from_toml(text)
 
 
-def catalog_entries(use_case: UseCase, *, kind: ModelKind) -> list[CatalogEntry | None]:
+def model_kind(model_id: str) -> Literal["chat", "decision"]:
+    """Return whether an agent's model id names a chat or a decision model.
+
+    :param model_id: a ``provider:model`` id.
+    :returns: ``decision`` for a ``DECISION_PROVIDERS`` provider, else ``chat``.
+    :rtype: Literal["chat", "decision"]
+    """
+    provider = model_id.partition(":")[0]
+    return "decision" if provider in DECISION_PROVIDERS else "chat"
+
+
+def catalog_entries(
+    use_case: UseCase, *, kind: ModelKind | None
+) -> list[CatalogEntry | None]:
     """Look up every model the use case names; retired models and other kinds raise.
 
     The catalog is not an allowlist: an id it does not list builds, with a warning
     and no entry, and a deprecated one builds with a warning.
 
     :param use_case: the call site.
-    :param kind: the kind of model the caller builds.
+    :param kind: the kind of model the caller builds, or ``None`` for an agent's
+        models, each a chat or decision model by its provider (``model_kind``), so
+        a decision model can fall back to a chat model.
     :returns: the entries, in the order of ``use_case.model_ids``, with ``None``
         for an id the catalog does not list.
     :rtype: list[CatalogEntry | None]
@@ -266,7 +287,8 @@ def catalog_entries(use_case: UseCase, *, kind: ModelKind) -> list[CatalogEntry 
     """
     catalog = load_catalog()
     entries = [
-        catalog.buildable(model_id, kind=kind) for model_id in use_case.model_ids
+        catalog.buildable(model_id, kind=kind or model_kind(model_id))
+        for model_id in use_case.model_ids
     ]
     primary = entries[0]
     if use_case.fallback_models and primary is not None and primary.route_falls_back:

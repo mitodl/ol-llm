@@ -27,7 +27,7 @@ from ol_llm import (
     trace_destinations,
     tracing,
 )
-from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
+from ol_llm.catalog import CachedCheck, Catalog, CatalogEntry, load_catalog
 from ol_llm.experiments import configure_experiment_backend
 from ol_llm.models import build_agent, override_models
 from ol_llm.prompt_registry import configure_prompt_registry
@@ -444,6 +444,16 @@ def clear_policy_env(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(name)
 
 
+def fresh_checks(check: CachedCheck[Any]) -> Generator[None]:
+    """Check each test's use cases against the catalog it patches in.
+
+    For an autouse fixture: ``yield from fresh_checks(check_chat_model)``.
+    """
+    check.cache_clear()
+    yield
+    check.cache_clear()
+
+
 def record_sleeps(monkeypatch: pytest.MonkeyPatch, module: ModuleType) -> list[float]:
     """Replace ``module._sleep`` so backoff waits are recorded instead of slept."""
     recorded: list[float] = []
@@ -543,14 +553,19 @@ EMBEDDINGS_REPLY = {
 TOKEN_REPLY = {"access_token": "token", "expires_in": 300}
 # Hindsight's answer to a recall that finds nothing.
 RECALL_REPLY: dict[str, object] = {"results": []}
+DECISION_REPLY = {
+    "model": "laya",
+    "answers": {"done": {"type": "noul", "noul": 0.9}},
+    "usage": {"input_tokens": 1, "output_tokens": 1},
+}
 PRIMARY = "openai:gpt-4o-mini"
 # Not in the released catalog; the fixture adds it.
 GEMINI = "google:gemini-3.1-pro-preview"
 
 
 class KeepAliveProvider(BaseHTTPRequestHandler):
-    """Answers OpenAI Responses and embeddings, Gemini, Keycloak token requests, and
-    Hindsight recalls.
+    """Answers OpenAI Responses and embeddings, Gemini, Keycloak token requests,
+    Hindsight recalls, and System One decisions.
 
     Over persistent connections. Paths under ``/unavailable`` answer 503, so a
     chain falls back. Gemini's streaming endpoint answers with one server-sent
@@ -573,6 +588,8 @@ class KeepAliveProvider(BaseHTTPRequestHandler):
                 reply = EMBEDDINGS_REPLY
             elif self.path.endswith("/memories/recall"):
                 reply = RECALL_REPLY
+            elif self.path.endswith("/systemone"):
+                reply = DECISION_REPLY
             elif self.path.endswith("/token"):
                 reply = TOKEN_REPLY
             elif "generateContent" in self.path:

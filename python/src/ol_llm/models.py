@@ -32,10 +32,9 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial
 from types import TracebackType
-from typing import Any, NoReturn, Self, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, NoReturn, Self, TypeVar, cast, overload
 
 import anyio
-import httpx
 import httpx2
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.capabilities import (
@@ -70,6 +69,7 @@ from pydantic_ai.models import (
     _continuation,
     infer_model,
 )
+from pydantic_ai.models.decision import DecisionHandOff
 from pydantic_ai.models.fallback import FallbackModel
 from pydantic_ai.models.instrumented import InstrumentationSettings
 from pydantic_ai.models.wrapper import WrapperModel
@@ -81,6 +81,7 @@ from pydantic_ai.usage import RequestUsage, UsageLimits
 
 from ol_llm.attribution import USE_CASE_HEADER, Attribution
 from ol_llm.catalog import (
+    DECISION_PROVIDERS,
     CatalogEntry,
     UseCaseCache,
     catalog_entries,
@@ -101,11 +102,17 @@ from ol_llm.policy import CallPolicy, Profile, UseCase, resolve_policy
 from ol_llm.retries import (
     RATE_LIMITED_STATUS,
     RETRYABLE_STATUSES,
+    TRANSPORT_ERRORS,
     UNAVAILABLE_TRANSPORT_ERRORS,
     RetryBudget,
+    delay_or_raise,
+    retry_attempts,
 )
 from ol_llm.settings import GatewayRoute, Settings, get_settings
 from ol_llm.tracing import include_content, tracer_provider
+
+if TYPE_CHECKING:
+    from pydantic_ai.providers.system_one import SystemOneProvider
 
 OutputT = TypeVar("OutputT")
 _T = TypeVar("_T")
@@ -130,13 +137,6 @@ BEDROCK_MODEL_ERROR_CODE = "ModelErrorException"
 
 FALLBACK_ON = (LLMRateLimited, LLMUnavailable)
 
-# Google and Mistral raise UNAVAILABLE_TRANSPORT_ERRORS raw from httpx2 rather than
-# as ModelAPIError (spec §6.1); any other transport error is permanent (a bad URL
-# scheme, a proxy failure) and is not retried.
-_TRANSPORT_ERRORS: tuple[type[Exception], ...] = (
-    httpx.TransportError,
-    httpx2.TransportError,
-)
 
 _OPENAI_PROVIDERS = frozenset({"openai", "openai-chat", "openai-responses"})
 _AZURE_PROVIDERS = frozenset({"azure", "azure-responses"})
@@ -151,8 +151,16 @@ SUPPORTED_PROVIDERS = frozenset(
         "google-cloud",
         "mistral",
         "together",
+        *DECISION_PROVIDERS,
     }
 )
+
+# Decision models on System One servers ol-llm knows the address of.
+_SYSTEM_ONE_SERVERS = frozenset({"azure-decision", "typesafe"})
+TYPESAFE_BASE_URL = "https://api.typesafe.ai"
+AZURE_DECISION_PATH = "/providers/microsoft"
+"""Appended to an Azure Foundry account's endpoint; ``SystemOneProvider`` adds
+``/v1/systemone``."""
 
 # Tests may replace the provider models build_model creates; see ol_llm.testing.
 _model_override: ContextVar[Model | Mapping[str, Model] | None] = ContextVar(
@@ -243,9 +251,11 @@ def classify_failure(  # noqa: PLR0911
 
     The table is closed: every ``ModelAPIError``, every ``httpx`` or ``httpx2``
     transport error, and every botocore transport error maps to a class, so
-    nothing a provider raises is unclassified. An exception group, which
-    Bedrock's Titan embedding model raises for its concurrent per-text requests,
-    maps to its first error that is not retryable, else its first error.
+    nothing a provider raises is unclassified. The one exception is a decision
+    model handing a step off (``DecisionHandOff``): that is an answer, not a
+    failure, so it returns ``None`` and reaches the caller as itself. An exception
+    group, which Bedrock's Titan embedding model raises for its concurrent per-text
+    requests, maps to its first error that is not retryable, else its first error.
 
     :param exc: what the request raised.
     :param use_case: the use case name, for the error.
@@ -257,6 +267,10 @@ def classify_failure(  # noqa: PLR0911
     if isinstance(exc, BaseExceptionGroup):
         return _classify_group(exc, use_case=use_case, model=model)
     message = str(exc)
+    # A decision model handing a step off (UnsureRoute, UnfillableRoute) is an
+    # answer, not an outage, so it is not retried; it reaches the caller as itself.
+    if isinstance(exc, DecisionHandOff):
+        return None
     if isinstance(exc, ModelHTTPError):
         if exc.status_code == RATE_LIMITED_STATUS:
             return LLMRateLimited(
@@ -280,7 +294,7 @@ def classify_failure(  # noqa: PLR0911
     )
     if isinstance(exc, unavailable):
         return LLMUnavailable(message, use_case=use_case, model=model)
-    if isinstance(exc, _TRANSPORT_ERRORS):
+    if isinstance(exc, TRANSPORT_ERRORS):
         return LLMRejected(message, use_case=use_case, model=model, status_code=None)
     return None
 
@@ -378,28 +392,21 @@ async def retrying(
         with the provider's exception as ``__cause__``. Anything that is not a
         model request failure is re-raised unchanged.
     """
-    budget = RetryBudget(policy, profile)
-    while True:
-        try:
-            return await attempt()
-        except Exception as exc:  # noqa: BLE001
-            delay = _retry_delay(exc, budget, use_case=use_case, model=model)
-        await _sleep(delay)
+    return await retry_attempts(
+        attempt,
+        budget=RetryBudget(policy, profile),
+        delay=partial(_retry_delay, use_case=use_case, model=model),
+        sleep=_sleep,
+    )
 
 
 def _retry_delay(
     exc: Exception, budget: RetryBudget, *, use_case: str, model: str
 ) -> float:
-    """Return the wait before the next attempt, or raise what the caller sees.
-
-    Callers catch ``Exception`` and hand it here; anything not classified is
-    re-raised unchanged.
-    """
-    if (error := classify_failure(exc, use_case=use_case, model=model)) is None:
-        raise exc
-    if (delay := budget.next_delay(error)) is None:
-        raise error from exc
-    return delay
+    """Return the wait before the next attempt, or raise what the caller sees."""
+    return delay_or_raise(
+        exc, budget, partial(classify_failure, use_case=use_case, model=model)
+    )
 
 
 _METADATA_KEY = "ol_llm"
@@ -1080,7 +1087,101 @@ def _together_provider(settings: Settings) -> Provider[Any]:
     return provider
 
 
-def provider_factory(
+class _TokenProviderAuth(httpx2.Auth):
+    """Sends a bearer token from a synchronous provider, fetched off the event loop.
+
+    An Entra token refresh is a blocking HTTP call, which on the loop would stall
+    every other task it runs. The client's timeout starts only once the request
+    is sent, so the fetch has its own, and running out of it is a connect timeout:
+    an outage, retried and failed over like any other.
+
+    :param token_provider: returns a current token, e.g. from
+        ``azure.identity.get_bearer_token_provider``.
+    :param timeout_seconds: how long one fetch may take, the policy timeout.
+    """
+
+    def __init__(
+        self, token_provider: Callable[[], str], timeout_seconds: float
+    ) -> None:
+        """Keep the provider; each request calls it."""
+        self._token_provider = token_provider
+        self._timeout_seconds = timeout_seconds
+
+    async def async_auth_flow(
+        self, request: httpx2.Request
+    ) -> AsyncGenerator[httpx2.Request, httpx2.Response]:
+        """Add the current token to the request."""
+        try:
+            async with asyncio.timeout(self._timeout_seconds):
+                token = await asyncio.to_thread(self._token_provider)
+        except TimeoutError as exc:
+            msg = f"No Entra token within {self._timeout_seconds}s"
+            raise httpx2.ConnectTimeout(msg, request=request) from exc
+        request.headers["Authorization"] = f"Bearer {token}"
+        yield request
+
+
+def _system_one_provider(
+    base_url: str,
+    policy: CallPolicy,
+    *,
+    api_key: str | None = None,
+    auth: httpx2.Auth | None = None,
+) -> Provider[Any]:
+    from pydantic_ai.providers.system_one import SystemOneProvider  # noqa: PLC0415
+
+    # A client of the provider's own, as for Google: exiting the provider closes
+    # it and entering again makes a new one. It carries the policy timeout and,
+    # for Azure, the token on each request.
+    new_client = partial(httpx2.AsyncClient, timeout=policy.timeout_seconds, auth=auth)
+    http_client = new_client()
+    provider = SystemOneProvider(
+        base_url=base_url, api_key=api_key, http_client=http_client
+    )
+    provider._own_http_client = http_client  # noqa: SLF001
+    provider._http_client_factory = new_client  # noqa: SLF001
+    return provider
+
+
+def _decision_provider(
+    provider: str, use_case: UseCase, policy: CallPolicy, settings: Settings
+) -> Provider[Any]:
+    """Build the provider for a ``DECISION_PROVIDERS`` model.
+
+    :raises ValueError: when the server's URL or credential is not configured.
+    :raises KeyError: for ``typesafe:`` with no key in the settings or
+        ``TYPESAFE_API_KEY``.
+    """
+    if provider == "openai-decisions":
+        return _openai_provider(settings.gateway_routes.get("openai"), use_case, policy)
+    if provider == "google-decisions":
+        return _google_provider("google", policy)
+    if provider == "typesafe":
+        key = settings.typesafe_api_key or os.environ["TYPESAFE_API_KEY"]
+        return _system_one_provider(TYPESAFE_BASE_URL, policy, api_key=key)
+    if provider == "system-one":
+        if not settings.systemone_base_url:
+            msg = "system-one: models need Settings.systemone_base_url"
+            raise ValueError(msg)
+        return _system_one_provider(
+            settings.systemone_base_url, policy, api_key=settings.systemone_api_key
+        )
+    if not settings.azure_decision_endpoint:
+        msg = "azure-decision: models need Settings.azure_decision_endpoint"
+        raise ValueError(msg)
+    if settings.azure_ad_token_provider is None:
+        msg = "azure-decision: models need Settings.azure_ad_token_provider"
+        raise ValueError(msg)
+    return _system_one_provider(
+        settings.azure_decision_endpoint.rstrip("/") + AZURE_DECISION_PATH,
+        policy,
+        auth=_TokenProviderAuth(
+            settings.azure_ad_token_provider, policy.timeout_seconds
+        ),
+    )
+
+
+def provider_factory(  # noqa: C901
     use_case: UseCase, policy: CallPolicy, settings: Settings
 ) -> Callable[[str], Provider[Any]]:
     """Return the factory that builds each provider with its SDK's retries off.
@@ -1123,6 +1224,8 @@ def provider_factory(
             return _mistral_provider()
         if provider == "together":
             return _together_provider(settings)
+        if provider in DECISION_PROVIDERS:
+            return _decision_provider(provider, use_case, policy, settings)
         msg = (
             f"ol-llm does not build {provider!r} models; "
             f"supported providers are {sorted(SUPPORTED_PROVIDERS)}"
@@ -1141,6 +1244,23 @@ def _provider_model(
         return override if isinstance(override, Model) else override[model_id]
     if factory is None:  # pragma: no cover - set whenever override is None
         raise AssertionError
+    return _infer(model_id, factory)
+
+
+def _infer(model_id: str, factory: Callable[[str], Provider[Any]]) -> Model:
+    """Build a provider model, as ``infer_model`` does for every other prefix.
+
+    ``azure-decision:`` and ``typesafe:`` models are System One models on servers
+    ol-llm knows, which ``infer_model`` has no prefix for. PydanticAI's own
+    ``TypeSafeModel`` needs TypeSafe's SDK, while TypeSafe's API is System One.
+    """
+    provider, _, name = model_id.partition(":")
+    if provider in _SYSTEM_ONE_SERVERS:
+        from pydantic_ai.models.system_one import SystemOneModel  # noqa: PLC0415
+
+        return SystemOneModel(
+            name, provider=cast("SystemOneProvider", factory(provider))
+        )
     return infer_model(model_id, provider_factory=factory)
 
 
@@ -1159,7 +1279,7 @@ def build_model(use_case: UseCase, *, settings: Settings | None = None) -> Model
         route that falls back on its own, a provider the library does not build,
         or an environment policy value that does not parse.
     """
-    entries = catalog_entries(use_case, kind="chat")
+    entries = catalog_entries(use_case, kind=None)
     policy = resolve_policy(use_case)
     override = _model_override.get()
     factory = (
@@ -1175,9 +1295,7 @@ def build_model(use_case: UseCase, *, settings: Settings | None = None) -> Model
             catalog_entry=entry,
             policy=policy,
             # An override's models are the test's own and are not rebuilt.
-            build=None
-            if factory is None
-            else partial(infer_model, model_id, provider_factory=factory),
+            build=None if factory is None else partial(_infer, model_id, factory),
         )
         for model_id, entry in zip(use_case.model_ids, entries, strict=True)
     ]

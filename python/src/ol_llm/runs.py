@@ -22,6 +22,7 @@ from collections.abc import (
     AsyncIterator,
     Callable,
     Generator,
+    Mapping,
     Sequence,
 )
 from contextlib import asynccontextmanager, contextmanager
@@ -29,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar, overload
 
 from pydantic_ai import Agent
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models import Model
 from pydantic_ai.output import OutputSpec
 from pydantic_ai.result import OutputValidatorFunc, StreamedRunResult
@@ -96,6 +97,9 @@ class LLMResult(Generic[OutputT]):
     :param prompt_name: the managed prompt used, the first when there are several.
     :param prompt_version: that prompt's version.
     :param new_messages: the messages this run added, for the next turn's history.
+    :param provider_details: the final response's ``provider_details``. A decision
+        model's holds each output field's ``confidence`` and, for a pick-one or a
+        rubric field, its ``probabilities`` over the options or levels.
     """
 
     output: OutputT
@@ -106,6 +110,7 @@ class LLMResult(Generic[OutputT]):
     prompt_name: str | None
     prompt_version: str | None
     new_messages: Sequence[ModelMessage]
+    provider_details: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -158,6 +163,14 @@ class _Run(TracedCall, Generic[OutputT]):
             prompt_name=named.name if named else None,
             prompt_version=named.version if named else None,
             new_messages=new_messages,
+            provider_details=next(
+                (
+                    message.provider_details
+                    for message in reversed(new_messages)
+                    if isinstance(message, ModelResponse)
+                ),
+                None,
+            ),
         )
 
     def stream_replacement(

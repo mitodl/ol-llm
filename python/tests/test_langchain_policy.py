@@ -15,7 +15,7 @@ from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.runnables import RunnableBinding
 from ol_llm import PolicyChatModel, UseCase, chat_litellm_kwargs, with_call_policy
-from ol_llm.langchain import classify_chat_failure
+from ol_llm.retries import classify_http_failure
 from pydantic import Field
 
 TUTOR = UseCase(
@@ -291,8 +291,8 @@ def test_bind_tools_refuses_a_binding_it_cannot_move() -> None:
         (500, "LLMRejected"),
     ],
 )
-def test_classify_chat_failure_by_status(status: int, expected: str) -> None:
-    error = classify_chat_failure(
+def test_classify_http_failure_by_status(status: int, expected: str) -> None:
+    error = classify_http_failure(
         ProviderError(status), use_case="tutor", model="openai:gpt-4o-mini"
     )
 
@@ -335,7 +335,7 @@ def test_the_responses_status_wins_over_the_exceptions() -> None:
     error = ProviderError(500)
     error.__context__ = _http_error(400).__context__
 
-    classified = classify_chat_failure(
+    classified = classify_http_failure(
         error, use_case="tutor", model="openai:gpt-4o-mini"
     )
 

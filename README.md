@@ -41,6 +41,56 @@ The test suite checks that genai-prices can price every chat model, which a `cos
 needs, and every embedding model, and that Opik prices every model at the catalog price. The
 Opik check downloads Opik's price table, so offline runs deselect it with `-m "not network"`.
 
+## Decision models
+
+A decision ("system-one") model answers typed questions about a text in one forward pass,
+with probabilities and no generated text, in tens of milliseconds. Use one where an app
+would otherwise match phrase lists or ask a chat model for JSON: routing, intent, yes/no
+checks. They are PydanticAI decision models, so a use case names one like any other model
+and `complete` (or `run`) runs it with the `pydantic-ai` extra. Each field of the output
+type is one question: a `bool` is a yes/no, a `Literal` or `Enum` of strings a pick-one,
+and its description is the question. The confidence and probabilities come back in
+`LLMResult.provider_details`:
+
+```python
+class ReplyIntent(BaseModel):
+    """What the learner wants done with the support request we showed them."""
+
+    intent: Literal["send", "cancel", "edit"] = Field(
+        description="What is the learner telling us to do with the request?"
+    )
+
+
+REPLY_INTENT = ol_llm.UseCase(
+    app="learn-ai",
+    name="support-reply-intent",
+    profile="request",
+    model="azure-decision:Microsoft-Decision-1.1",
+)
+
+result = await ol_llm.complete(REPLY_INTENT, "yeah go for it", output_type=ReplyIntent)
+probability = result.provider_details["probabilities"]["intent"][result.output.intent]
+```
+
+The model id's provider picks the server:
+
+| Provider | Server | Configuration |
+| --- | --- | --- |
+| `azure-decision:<deployment>` | Microsoft-Decision on an Azure Foundry (AIServices) account | `OL_LLM_AZURE_DECISION_ENDPOINT`, and `Settings.azure_ad_token_provider` for the Entra token |
+| `system-one:<model>` | Any System One server: DigitalOcean, OVHcloud, Telnyx, Cloudflare's Clef through one of them, or a self-hosted Laya (`laya-serve`), Strands Decider, Ollama or `llama-server` | `OL_LLM_SYSTEMONE_BASE_URL`, and `OL_LLM_SYSTEMONE_API_KEY` if the server checks one |
+| `typesafe:<model>` | TypeSafe's hosted Jev | `TYPESAFE_API_KEY` |
+| `openai-decisions:<model>` | OpenAI's Decisions API, e.g. `gpt-6-luna` | The `openai` extra, `OPENAI_API_KEY` or the `openai` gateway route |
+| `google-decisions:<model>` | Gemini's Decisions API, e.g. `gemini-decision-1` | The `google` extra and `GOOGLE_API_KEY` |
+
+Calls run under the use case's policy like a chat model's: its timeout, retries and error
+classes, its trace, and its catalog checks. A decision use case can name a chat model in
+`fallback_models`, which takes over on an outage. Its answer carries no decision
+probabilities, so check for `"fallback_model"` in `result.degraded_reasons` before reading
+`provider_details`. A decision model that hands a step off
+(PydanticAI's `UnsureRoute` or `UnfillableRoute`) is not retried and reaches the caller as
+itself. Thresholds are per model, since each calibrates its probabilities differently, and
+an app should keep a deterministic path for when the call fails or is not sure.
+
 ## Development
 
 ```sh

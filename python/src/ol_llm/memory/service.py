@@ -35,7 +35,7 @@ from ol_llm.memory.interface import (
 from ol_llm.memory.tokens import TokenExchange
 from ol_llm.policy import _NAME
 from ol_llm.settings import get_settings
-from ol_llm.traces import _record_error
+from ol_llm.traces import record_error
 from ol_llm.tracing import include_content, tracer_provider
 
 Scope = Literal["learner", "general", "admin"]
@@ -98,7 +98,7 @@ class _Call:
             try:
                 yield span
             except Exception as exc:
-                _record_error(span, exc, content=with_content)
+                record_error(span, exc, content=with_content)
                 raise
 
 
