@@ -80,6 +80,10 @@ MAX_CHOICE_OPTIONS = 255
 MIN_SCORE_LEVELS = 2
 MAX_SCORE_LEVELS = 10
 
+ROUNDING_PER_PROBABILITY = 0.005
+"""How far each probability may be off from rounding to two decimals, which
+TypeSafe's own examples do. A distribution may sum to 1 plus this per option."""
+
 # Patched in tests so retries do not wait.
 _sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep
 
@@ -486,6 +490,9 @@ def _answer(
         return None
     if any(not 0 <= p <= 1 for p in probabilities):
         return None
+    # A distribution over the options or levels, so it can't add up past 1.
+    if sum(probabilities) > 1 + ROUNDING_PER_PROBABILITY * len(probabilities):
+        return None
     return answer
 
 
@@ -597,6 +604,9 @@ async def decide(
         its cause.
     :raises ValueError: if there are no questions or no state, the catalog check
         rejects the use case, or the provider or its endpoint is not configured.
+    :raises KeyError: for a ``typesafe:`` model with no ``Settings.typesafe_api_key``
+        and no ``TYPESAFE_API_KEY``. Configuration errors raise before any
+        request and are not ``LLMError``: they are not model failures.
     """
     if not questions:
         msg = "decide needs at least one question"

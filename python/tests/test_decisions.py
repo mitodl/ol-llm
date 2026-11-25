@@ -399,6 +399,17 @@ def test_a_dropped_connection_is_retried(decision_sleeps: list[float]) -> None:
             id="a probability over 1",
         ),
         pytest.param(
+            {
+                **ANSWERS,
+                "intent": {
+                    "type": "choice",
+                    "choice": "send",
+                    "probabilities": {"send": 0.9, "cancel": 0.6, "edit": 0.1},
+                },
+            },
+            id="probabilities adding up past 1",
+        ),
+        pytest.param(
             {**ANSWERS, "urgency": {"type": "score", "score": 3.0}},
             id="a score past the last level",
         ),
@@ -522,6 +533,20 @@ def test_a_body_that_cannot_be_decoded_is_invalid_output() -> None:
     msg = "corrupt gzip"
     with raising(httpx2.DecodingError(msg)), pytest.raises(LLMInvalidOutput):
         decide_sync(REPLY, "x", QUESTIONS)
+
+
+def test_a_rounded_distribution_a_little_over_1_is_accepted(
+    requests: list[httpx2.Request],
+) -> None:
+    rounded = {"send": 0.34, "cancel": 0.34, "edit": 0.33}
+    answers = {
+        **ANSWERS,
+        "intent": {"type": "choice", "choice": "send", "probabilities": rounded},
+    }
+    with serving(requests, ok(answers)):
+        decision = decide_sync(REPLY, "x", QUESTIONS)
+
+    assert decision.choice("intent").probabilities == rounded
 
 
 def test_a_score_keeps_each_levels_position_when_a_level_is_left_out(
