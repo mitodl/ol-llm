@@ -15,7 +15,6 @@ Needs the ``langchain`` extra.
 """
 
 import asyncio
-import email.utils
 import time
 from collections.abc import (
     AsyncIterator,
@@ -30,8 +29,6 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
-import httpx
-import httpx2
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
     BaseCallbackHandler,
@@ -51,20 +48,10 @@ from pydantic import ConfigDict, InstanceOf
 
 from ol_llm.attribution import NO_ATTRIBUTION, Attribution
 from ol_llm.catalog import check_chat_model
-from ol_llm.errors import LLMError, LLMRateLimited, LLMRejected, LLMUnavailable
 from ol_llm.policy import CallPolicy, UseCase, resolve_policy
-from ol_llm.retries import (
-    RATE_LIMITED_STATUS,
-    RETRYABLE_STATUSES,
-    UNAVAILABLE_TRANSPORT_ERRORS,
-    RetryBudget,
-)
+from ol_llm.retries import RetryBudget, classify_http_failure
 from ol_llm.traces import TracedCall, TraceOutput, current_call
 from ol_llm.tracing import destinations, enabled
-
-MILLISECONDS_PER_SECOND = 1000
-UNMAPPED_ERROR_STATUS = 500
-"""The status litellm gives an error it cannot map to a provider response."""
 
 # Patched in tests so retries do not wait.
 _sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep
@@ -130,7 +117,7 @@ def with_call_policy(
     retry, or the layers multiply (``chat_litellm_kwargs`` turns a
     ``ChatLiteLLM``'s off). The timeout stays with the client.
 
-    A failure is classified from its exception chain (``classify_chat_failure``),
+    A failure is classified from its exception chain (``classify_http_failure``),
     so no provider SDK is imported. It reaches the caller as the model raised it,
     not as an ``LLMError``. Retried attempts are not reported to callbacks; a
     trace shows one span. ``fallback_models`` is not applied.
@@ -163,106 +150,6 @@ def with_call_policy(
         rate_limiter=model.rate_limiter,
         verbose=model.verbose,
     )
-
-
-def classify_chat_failure(
-    exc: BaseException, *, use_case: str, model: str
-) -> LLMError | None:
-    """Map a LangChain chat model's failure to the library error for its class.
-
-    The status comes from the HTTP response in the exception's chain
-    (``original_exception``, ``__cause__``, ``__context__``) when there is one,
-    else from an httpx timeout or disconnect there, else from the exception's
-    ``status_code``. A bare 500 is a rejection: litellm gives 500 to whatever it
-    cannot map, e.g. an error object inside a 200 stream or a failing credential
-    hook, and nothing in it says the provider is down.
-
-    :param exc: what the model raised.
-    :param use_case: the use case name, for the error.
-    :param model: the model id, for the error.
-    :returns: the library error, or ``None`` when ``exc`` is not a model request
-        failure.
-    :rtype: LLMError | None
-    """
-    message = str(exc)
-    chain = list(_exception_chain(exc))
-    status = next(
-        (
-            link.response.status_code
-            for link in chain
-            if isinstance(link, httpx.HTTPStatusError | httpx2.HTTPStatusError)
-        ),
-        None,
-    )
-    if status is None:
-        if any(isinstance(link, UNAVAILABLE_TRANSPORT_ERRORS) for link in chain):
-            return LLMUnavailable(message, use_case=use_case, model=model)
-        status = getattr(exc, "status_code", None)
-        if not isinstance(status, int) or isinstance(status, bool):
-            return None
-        if status == UNMAPPED_ERROR_STATUS:
-            return LLMRejected(
-                message, use_case=use_case, model=model, status_code=None
-            )
-    if status == RATE_LIMITED_STATUS:
-        return LLMRateLimited(
-            message, use_case=use_case, model=model, retry_after=_retry_after(chain)
-        )
-    if status in RETRYABLE_STATUSES:
-        return LLMUnavailable(message, use_case=use_case, model=model)
-    return LLMRejected(message, use_case=use_case, model=model, status_code=status)
-
-
-def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
-    """Yield ``exc`` and every exception it wraps, each once."""
-    seen: set[int] = set()
-    pending: list[BaseException | None] = [exc]
-    while pending:
-        link = pending.pop(0)
-        if link is None or id(link) in seen:
-            continue
-        seen.add(id(link))
-        yield link
-        original = getattr(link, "original_exception", None)
-        pending.extend(
-            (
-                original if isinstance(original, BaseException) else None,
-                link.__cause__,
-                link.__context__,
-            )
-        )
-
-
-def _retry_after(chain: Sequence[BaseException]) -> float | None:
-    """Read the seconds a rate-limited response asked to wait, if it said."""
-    for link in chain:
-        if headers := getattr(link, "litellm_response_headers", None):
-            return _parse_retry_after(headers)
-    for link in chain:
-        response = getattr(link, "response", None)
-        if isinstance(response, httpx.Response | httpx2.Response) and response.headers:
-            return _parse_retry_after(response.headers)
-    return None
-
-
-def _parse_retry_after(headers: Mapping[str, str]) -> float | None:
-    lowered = {str(key).lower(): str(value) for key, value in headers.items()}
-    if (milliseconds := lowered.get("retry-after-ms")) is not None:
-        try:
-            return float(milliseconds) / MILLISECONDS_PER_SECOND
-        except ValueError:
-            pass
-    if (value := lowered.get("retry-after")) is None:
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        pass
-    try:
-        when = email.utils.parsedate_to_datetime(value)
-    except (TypeError, ValueError):
-        return None
-    return max(when.timestamp() - time.time(), 0.0)
 
 
 class PolicyChatModel(BaseChatModel):
@@ -353,7 +240,7 @@ class PolicyChatModel(BaseChatModel):
         raise NotImplementedError(msg)
 
     def _delay(self, exc: Exception, budget: RetryBudget) -> float | None:
-        error = classify_chat_failure(
+        error = classify_http_failure(
             exc, use_case=self.use_case.name, model=self.use_case.model
         )
         return None if error is None else budget.next_delay(error)

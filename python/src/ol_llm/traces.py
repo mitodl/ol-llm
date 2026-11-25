@@ -208,7 +208,7 @@ class TracedCall:
                         # context is left as it was.
                         call.error = exc
                         if isinstance(exc, Exception):
-                            _record_error(span, exc, content=content)
+                            record_error(span, exc, content=content)
                         raise
                     call.output = outcome.value
                     if content and outcome.value is not None:
@@ -386,11 +386,11 @@ def _embedding_span(call: TracedCall, texts: list[str]) -> Generator[Span | None
         try:
             yield span
         except Exception as exc:
-            _record_error(span, exc, content=content)
+            record_error(span, exc, content=content)
             raise
 
 
-def _record_error(span: Span, error: Exception, *, content: bool) -> None:
+def record_error(span: Span, error: Exception, *, content: bool) -> None:
     """Mark the span failed, as PydanticAI's ``record_uncaught_errors`` does.
 
     Without content only the exception's type is kept: a provider's error response
