@@ -251,9 +251,11 @@ def classify_failure(  # noqa: PLR0911
 
     The table is closed: every ``ModelAPIError``, every ``httpx`` or ``httpx2``
     transport error, and every botocore transport error maps to a class, so
-    nothing a provider raises is unclassified. An exception group, which
-    Bedrock's Titan embedding model raises for its concurrent per-text requests,
-    maps to its first error that is not retryable, else its first error.
+    nothing a provider raises is unclassified. The one exception is a decision
+    model handing a step off (``DecisionHandOff``): that is an answer, not a
+    failure, so it returns ``None`` and reaches the caller as itself. An exception
+    group, which Bedrock's Titan embedding model raises for its concurrent per-text
+    requests, maps to its first error that is not retryable, else its first error.
 
     :param exc: what the request raised.
     :param use_case: the use case name, for the error.
@@ -1089,21 +1091,32 @@ class _TokenProviderAuth(httpx2.Auth):
     """Sends a bearer token from a synchronous provider, fetched off the event loop.
 
     An Entra token refresh is a blocking HTTP call, which on the loop would stall
-    every other task it runs.
+    every other task it runs. The client's timeout starts only once the request
+    is sent, so the fetch has its own, and running out of it is a connect timeout:
+    an outage, retried and failed over like any other.
 
     :param token_provider: returns a current token, e.g. from
         ``azure.identity.get_bearer_token_provider``.
+    :param timeout_seconds: how long one fetch may take, the policy timeout.
     """
 
-    def __init__(self, token_provider: Callable[[], str]) -> None:
+    def __init__(
+        self, token_provider: Callable[[], str], timeout_seconds: float
+    ) -> None:
         """Keep the provider; each request calls it."""
         self._token_provider = token_provider
+        self._timeout_seconds = timeout_seconds
 
     async def async_auth_flow(
         self, request: httpx2.Request
     ) -> AsyncGenerator[httpx2.Request, httpx2.Response]:
         """Add the current token to the request."""
-        token = await asyncio.to_thread(self._token_provider)
+        try:
+            async with asyncio.timeout(self._timeout_seconds):
+                token = await asyncio.to_thread(self._token_provider)
+        except TimeoutError as exc:
+            msg = f"No Entra token within {self._timeout_seconds}s"
+            raise httpx2.ConnectTimeout(msg, request=request) from exc
         request.headers["Authorization"] = f"Bearer {token}"
         yield request
 
@@ -1162,7 +1175,9 @@ def _decision_provider(
     return _system_one_provider(
         settings.azure_decision_endpoint.rstrip("/") + AZURE_DECISION_PATH,
         policy,
-        auth=_TokenProviderAuth(settings.azure_ad_token_provider),
+        auth=_TokenProviderAuth(
+            settings.azure_ad_token_provider, policy.timeout_seconds
+        ),
     )
 
 

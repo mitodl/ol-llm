@@ -3,6 +3,7 @@ built by ``build_model`` under the use case's policy."""
 
 import json
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,7 +11,7 @@ from typing import Any, Literal
 
 import pytest
 from conftest import record_sleeps
-from ol_llm import LLMRejected, UseCase, complete_sync, models
+from ol_llm import LLMRejected, LLMUnavailable, UseCase, complete_sync, models
 from ol_llm.catalog import load_catalog, model_kind
 from ol_llm.models import build_model, classify_failure
 from ol_llm.settings import Settings, configure
@@ -145,6 +146,45 @@ def test_an_azure_decision_model_gets_a_new_entra_token_for_each_attempt(
         "Bearer second",
     ]
     assert server.requests[0]["body"]["model"] == "Microsoft-Decision-1.1"
+    assert len(decision_sleeps) == 1
+
+
+def test_a_stalled_entra_token_fetch_fails_at_the_policy_timeout(
+    server: Server, decision_sleeps: list[float]
+) -> None:
+    released = threading.Event()
+
+    def stalls() -> str:
+        released.wait(5)
+        return "late"
+
+    configure(
+        Settings(
+            environment="ci",
+            azure_decision_endpoint=server.url,
+            azure_ad_token_provider=stalls,
+        )
+    )
+    started = time.monotonic()
+
+    try:
+        with pytest.raises(LLMUnavailable):
+            complete_sync(
+                use_case(
+                    "azure-decision:Microsoft-Decision-1.1",
+                    timeout_seconds=0.2,
+                    max_retries=1,
+                    policy_reason="a short timeout to keep the test fast",
+                ),
+                "x",
+                output_type=Reading,
+            )
+    finally:
+        released.set()
+
+    # Two attempts at 0.2s each, not the provider's own 5s.
+    assert time.monotonic() - started < 2
+    assert server.requests == []
     assert len(decision_sleeps) == 1
 
 
