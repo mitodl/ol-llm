@@ -23,7 +23,7 @@ from contextlib import contextmanager
 import opik
 from pydantic_ai.models import Model
 
-from ol_llm.catalog import load_catalog
+from ol_llm.catalog import load_catalog, model_kind
 from ol_llm.embeddings import override_embedding_models
 from ol_llm.models import PolicyModel, override_models
 from ol_llm.policy import UseCase, resolve_policy
@@ -50,7 +50,9 @@ def policy_model(use_case: UseCase, model: Model) -> PolicyModel:
         model,
         use_case=use_case,
         model_id=use_case.model,
-        catalog_entry=load_catalog().buildable(use_case.model, kind="chat"),
+        catalog_entry=load_catalog().buildable(
+            use_case.model, kind=model_kind(use_case.model)
+        ),
         policy=resolve_policy(use_case),
     )
 

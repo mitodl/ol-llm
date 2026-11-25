@@ -84,7 +84,9 @@ The model id's provider picks the server:
 
 Calls run under the use case's policy like a chat model's: its timeout, retries and error
 classes, its trace, and its catalog checks. A decision use case can name a chat model in
-`fallback_models`, which takes over on an outage. A decision model that hands a step off
+`fallback_models`, which takes over on an outage. Its answer carries no decision
+probabilities, so check for `"fallback_model"` in `result.degraded_reasons` before reading
+`provider_details`. A decision model that hands a step off
 (PydanticAI's `UnsureRoute` or `UnfillableRoute`) is not retried and reaches the caller as
 itself. Thresholds are per model, since each calibrates its probabilities differently, and
 an app should keep a deterministic path for when the call fails or is not sure.

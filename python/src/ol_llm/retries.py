@@ -1,8 +1,8 @@
 """The retry budget every model call runs under (spec §3.2 rule 1, §6.3).
 
-Kept free of PydanticAI so the LangChain wrapper (``ol_llm.langchain``) and the
-decision entry points (``ol_llm.decisions``) apply the same budget and error
-classes as the other entry points without the ``pydantic-ai`` extra.
+Kept free of PydanticAI so the LangChain wrapper (``ol_llm.langchain``) applies
+the same budget and error classes as the other entry points without the
+``pydantic-ai`` extra.
 """
 
 import email.utils
