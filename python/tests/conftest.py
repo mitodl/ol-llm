@@ -27,7 +27,7 @@ from ol_llm import (
     trace_destinations,
     tracing,
 )
-from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
+from ol_llm.catalog import CachedCheck, Catalog, CatalogEntry, load_catalog
 from ol_llm.experiments import configure_experiment_backend
 from ol_llm.models import build_agent, override_models
 from ol_llm.prompt_registry import configure_prompt_registry
@@ -442,6 +442,16 @@ def clear_policy_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in list(os.environ):
         if name.startswith(("OL_LLM_", "OPIK_KEYCLOAK_")):
             monkeypatch.delenv(name)
+
+
+def fresh_checks(check: CachedCheck[Any]) -> Generator[None]:
+    """Check each test's use cases against the catalog it patches in.
+
+    For an autouse fixture: ``yield from fresh_checks(check_chat_model)``.
+    """
+    check.cache_clear()
+    yield
+    check.cache_clear()
 
 
 def record_sleeps(monkeypatch: pytest.MonkeyPatch, module: ModuleType) -> list[float]:

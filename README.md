@@ -84,8 +84,10 @@ The model id's provider picks the server:
 | `typesafe:<model>` | TypeSafe's hosted Jev | `TYPESAFE_API_KEY` |
 | `systemone:<model>` | A self-hosted Laya (`laya-serve`) or Strands Decider (`strands-decider serve`) | `OL_LLM_SYSTEMONE_BASE_URL`, and `OL_LLM_SYSTEMONE_API_KEY` if the server checks one |
 
-`ChoiceAnswer.confidence` is computed by ol-llm from the probabilities, the same way for
-every model, because each vendor's own `confidence` uses a different formula. Thresholds are
+`ChoiceAnswer.confidence` is computed by ol-llm from the chosen option's probability, the
+same way for every model, because each vendor's own `confidence` uses a different formula.
+`decide` makes one request with no output to bound, so a use case's `request_limit` and
+`cost_limit` don't apply to it. Thresholds are
 still per model: each one calibrates its probabilities differently, which is also why a
 decision use case takes no `fallback_models`. Keep a deterministic path for when the call
 fails or is not confident. Tests can answer requests with

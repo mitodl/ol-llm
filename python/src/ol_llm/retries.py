@@ -8,14 +8,17 @@ classes as the other entry points without the ``pydantic-ai`` extra.
 import email.utils
 import random
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Any, TypeVar
 
 import httpx
 import httpx2
 
 from ol_llm.errors import LLMError, LLMRateLimited, LLMRejected, LLMUnavailable
 from ol_llm.policy import CallPolicy, Profile
+
+_T = TypeVar("_T")
 
 RETRYABLE_STATUSES = frozenset({408, 500, 502, 503, 504, 529})
 """HTTP statuses that mean the provider is unavailable (spec §6.3)."""
@@ -81,6 +84,55 @@ class RetryBudget:
         self.retries += 1
         self.waited += delay
         return delay
+
+
+Classify = Callable[[Exception], LLMError | None]
+"""Maps a failed attempt to its library error, or ``None`` to raise it as is."""
+
+
+def delay_or_raise(exc: Exception, budget: RetryBudget, classify: Classify) -> float:
+    """Return the wait before the next attempt, or raise what the caller sees.
+
+    Callers catch ``Exception`` and hand it here.
+
+    :param exc: what the attempt raised.
+    :param budget: the call's retry budget.
+    :param classify: the call path's classifier.
+    :returns: the wait in seconds.
+    :rtype: float
+    :raises LLMError: once the failure is not retryable or the retries are spent,
+        with ``exc`` as its cause. ``exc`` itself when it is not a model failure.
+    """
+    if (error := classify(exc)) is None:
+        raise exc
+    if (delay := budget.next_delay(error)) is None:
+        raise error from exc
+    return delay
+
+
+async def retry_attempts(
+    attempt: Callable[[], Awaitable[_T]],
+    *,
+    budget: RetryBudget,
+    delay: Callable[[Exception, RetryBudget], float],
+    sleep: Callable[[float], Awaitable[Any]],
+) -> _T:
+    """Make attempts until one succeeds or ``delay`` gives up.
+
+    :param attempt: makes one attempt.
+    :param budget: the call's retry budget.
+    :param delay: the call path's ``delay_or_raise``, with its classifier bound.
+    :param sleep: waits between attempts; tests pass one that records instead.
+    :returns: what the first successful attempt returned.
+    :rtype: _T
+    :raises LLMError: as ``delay_or_raise`` does.
+    """
+    while True:
+        try:
+            return await attempt()
+        except Exception as exc:  # noqa: BLE001
+            wait = delay(exc, budget)
+        await sleep(wait)
 
 
 def classify_http_failure(

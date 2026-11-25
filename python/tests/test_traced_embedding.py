@@ -7,6 +7,7 @@ from decimal import Decimal
 import ol_llm.catalog as catalog_module
 import opik
 import pytest
+from conftest import fresh_checks
 from ol_llm import Attribution, UseCase, embed_sync, traced_embedding, traces, tracing
 from ol_llm.catalog import Catalog, CatalogEntry, load_catalog
 from ol_llm.testing import override_embedding_models, tracing_disabled
@@ -27,10 +28,7 @@ VECTORS = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]
 
 @pytest.fixture(autouse=True)
 def fresh_catalog_checks() -> Generator[None]:
-    """Check each test's use cases against the catalog it patches in."""
-    traces._model_tags.cache_clear()  # noqa: SLF001
-    yield
-    traces._model_tags.cache_clear()  # noqa: SLF001
+    yield from fresh_checks(traces._model_tags)  # noqa: SLF001
 
 
 def embed_two(use_case: UseCase = SEARCH, *, input_tokens: int = 7) -> None:

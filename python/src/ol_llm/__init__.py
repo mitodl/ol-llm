@@ -48,9 +48,11 @@ from ol_llm.catalog import (
     load_catalog,
 )
 from ol_llm.decisions import (
+    Answer,
     Choice,
     ChoiceAnswer,
     Decision,
+    Question,
     Score,
     ScoreAnswer,
     YesNo,
@@ -153,6 +155,7 @@ _EXTRA_MODULES = {
 }
 
 __all__ = [
+    "Answer",
     "Attribution",
     "BatchFailed",
     "BatchKeys",
@@ -186,6 +189,7 @@ __all__ = [
     "Profile",
     "PromptVariablesError",
     "Provenance",
+    "Question",
     "RowFailure",
     "Score",
     "ScoreAnswer",

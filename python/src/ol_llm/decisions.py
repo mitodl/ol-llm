@@ -30,9 +30,12 @@ each server's own ``confidence``: they compute it with different formulas, so
 for every model.
 
 ``decide`` and ``decide_sync`` run under the use case's call policy (spec §6.2):
-the timeout on each attempt, retries with backoff on a 429, a 5xx or a dropped
-connection, and the library's error classes (spec §6.7). Each call is one traced
-call with the §4 attribution fields and the model's token usage. Needs no extra.
+the timeout on each attempt, token fetch included, retries with backoff on a
+429, a 5xx, a timeout or a dropped connection, and the library's error classes
+(spec §6.7). Each call is one traced call with the §4 attribution fields and the
+model's token usage. A call is one request with no output to bound, so the use
+case's ``request_limit`` and ``cost_limit`` don't apply; the catalog price goes
+into ``ol-llm-catalog prices`` like every entry's. Needs no extra.
 """
 
 import asyncio
@@ -49,6 +52,7 @@ from collections.abc import (
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Literal, TypeVar
 
 import httpx2
@@ -61,7 +65,13 @@ from ol_llm.catalog import check_decision_model
 from ol_llm.errors import LLMError, LLMInvalidOutput, LLMRejected
 from ol_llm.loops import LoopLocal, run_coroutine
 from ol_llm.policy import CallPolicy, UseCase, resolve_policy
-from ol_llm.retries import TRANSPORT_ERRORS, RetryBudget, classify_http_failure
+from ol_llm.retries import (
+    TRANSPORT_ERRORS,
+    RetryBudget,
+    classify_http_failure,
+    delay_or_raise,
+    retry_attempts,
+)
 from ol_llm.settings import Settings, get_settings
 from ol_llm.traces import TracedCall, model_span
 from ol_llm.tracing import enabled
@@ -427,11 +437,18 @@ def override_decision_transport(
         _transport_override.reset(token)
 
 
-def _confidence(probabilities: Mapping[str, float], options: int) -> float | None:
+def _confidence(
+    choice: str, probabilities: Mapping[str, float], options: int
+) -> float | None:
+    """Return how far the chosen option's own probability is above an even split.
+
+    The chosen option's, not the highest: a server that returns one option with
+    another's weight would otherwise pass its confidence to the wrong choice.
+    """
     if not probabilities:
         return None
     even = 1 / options
-    return max(0.0, (max(probabilities.values()) - even) / (1 - even))
+    return max(0.0, (probabilities.get(choice, 0.0) - even) / (1 - even))
 
 
 def _answers(
@@ -469,7 +486,7 @@ def _answer(
         answer = ChoiceAnswer(
             wire.choice,
             wire.probabilities,
-            _confidence(wire.probabilities, len(offered)),
+            _confidence(wire.choice, wire.probabilities, len(offered)),
         )
     elif isinstance(question, Score) and isinstance(wire, _WireScore):
         levels = range(len(question.levels))
@@ -512,18 +529,31 @@ def _decision_input(state: object, questions: object) -> None:
 
 
 async def _attempt(
-    endpoint: _Endpoint,
-    body: Mapping[str, Any],
-    headers: Mapping[str, str],
-    policy: CallPolicy,
+    endpoint: _Endpoint, body: Mapping[str, Any], policy: CallPolicy
 ) -> bytes:
-    async with _client() as client:
-        response = await client.post(
-            endpoint.url,
-            json={**body, "model": endpoint.model},
-            headers=dict(headers),
-            timeout=policy.timeout_seconds,
-        )
+    """Make one request, bounded as a whole by the policy timeout.
+
+    httpx2's timeout bounds each read, not the response, and an Entra token
+    refresh is a blocking HTTP call, so the token is fetched on a worker thread
+    and both run under one deadline. Running past it is a timeout, retried like
+    any other; a token provider's own failure propagates as itself.
+    """
+    deadline = asyncio.timeout(policy.timeout_seconds)
+    try:
+        async with deadline:
+            headers = await asyncio.to_thread(endpoint.headers)
+            async with _client() as client:
+                response = await client.post(
+                    endpoint.url,
+                    json={**body, "model": endpoint.model},
+                    headers=headers,
+                    timeout=policy.timeout_seconds,
+                )
+    except TimeoutError as exc:
+        if not deadline.expired():
+            raise
+        msg = f"no answer within {policy.timeout_seconds} s"
+        raise httpx2.TimeoutException(msg) from exc
     response.raise_for_status()
     return response.content
 
@@ -545,6 +575,11 @@ def _classify(exc: Exception, use_case: UseCase) -> LLMError | None:
     return None
 
 
+def _delay(exc: Exception, budget: RetryBudget, *, use_case: UseCase) -> float:
+    """Return the wait before the next attempt, or raise what the caller sees."""
+    return delay_or_raise(exc, budget, partial(_classify, use_case=use_case))
+
+
 async def _request(
     use_case: UseCase, body: Mapping[str, Any], settings: Settings
 ) -> _WireResponse:
@@ -553,28 +588,21 @@ async def _request(
     :raises LLMError: once a failure is not retryable or the retries are spent,
         or ``LLMInvalidOutput`` on a body that is not a System One response.
     """
-    budget = RetryBudget(policy := resolve_policy(use_case), use_case.profile)
+    policy = resolve_policy(use_case)
     endpoint = _endpoint(use_case, settings)
-    while True:
-        # Per attempt: a token provider hands out a new token near expiry. Its own
-        # failure (e.g. azure-identity's) is not a model failure and propagates.
-        headers = endpoint.headers()
-        try:
-            content = await _attempt(endpoint, body, headers, policy)
-        except Exception as exc:
-            if (error := _classify(exc, use_case)) is None:
-                raise
-            if (delay := budget.next_delay(error)) is None:
-                raise error from exc
-            await _sleep(delay)
-            continue
-        try:
-            return _WireResponse.model_validate_json(content)
-        except ValidationError as exc:
-            msg = f"{use_case.model} sent a response that is not a decision: {exc}"
-            raise LLMInvalidOutput(
-                msg, use_case=use_case.name, model=use_case.model
-            ) from exc
+    content = await retry_attempts(
+        partial(_attempt, endpoint, body, policy),
+        budget=RetryBudget(policy, use_case.profile),
+        delay=partial(_delay, use_case=use_case),
+        sleep=_sleep,
+    )
+    try:
+        return _WireResponse.model_validate_json(content)
+    except ValidationError as exc:
+        msg = f"{use_case.model} sent a response that is not a decision: {exc}"
+        raise LLMInvalidOutput(
+            msg, use_case=use_case.name, model=use_case.model
+        ) from exc
 
 
 async def decide(

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from collections.abc import Callable, Generator
 from datetime import date
 from decimal import Decimal
@@ -9,7 +10,7 @@ import httpx2
 import ol_llm.catalog as catalog_module
 import opik
 import pytest
-from conftest import record_sleeps
+from conftest import fresh_checks, record_sleeps
 from ol_llm import (
     Attribution,
     Choice,
@@ -94,10 +95,7 @@ def azure_settings() -> Settings:
 
 @pytest.fixture(autouse=True)
 def fresh_catalog_checks() -> Generator[None]:
-    """Check each test's use cases against the catalog it patches in."""
-    check_decision_model.cache_clear()
-    yield
-    check_decision_model.cache_clear()
+    yield from fresh_checks(check_decision_model)
 
 
 @pytest.fixture
@@ -604,4 +602,63 @@ def test_a_token_provider_failure_is_not_a_model_failure(
     with serving(requests, ok()), pytest.raises(RuntimeError, match="managed"):
         decide_sync(REPLY, "x", QUESTIONS)
 
+    assert requests == []
+
+
+def test_confidence_is_the_chosen_options_not_the_highest(
+    requests: list[httpx2.Request],
+) -> None:
+    lopsided = {"send": 0.01, "cancel": 0.98, "edit": 0.01}
+    answers = {
+        **ANSWERS,
+        "intent": {"type": "choice", "choice": "send", "probabilities": lopsided},
+    }
+    with serving(requests, ok(answers)):
+        decision = decide_sync(REPLY, "x", QUESTIONS)
+
+    assert decision.choice("intent").confidence == 0.0
+
+
+QUICK = UseCase(
+    app="learn-ai",
+    name="support-reply",
+    profile="request",
+    model=MODEL,
+    timeout_seconds=0.05,
+    max_retries=0,
+    policy_reason="a test of the attempt deadline",
+)
+
+
+def test_a_server_that_stalls_is_cut_off_at_the_policy_timeout() -> None:
+    async def stalls(_request: httpx2.Request) -> httpx2.Response:
+        await asyncio.sleep(5)
+        return ok()
+
+    with (
+        override_decision_transport(httpx2.MockTransport(stalls)),
+        pytest.raises(LLMUnavailable),
+    ):
+        decide_sync(QUICK, "x", QUESTIONS)
+
+
+def test_a_token_fetch_that_stalls_is_cut_off_without_blocking_the_loop(
+    requests: list[httpx2.Request],
+) -> None:
+    def slow_token() -> str:
+        time.sleep(0.5)
+        return "late"
+
+    configure(
+        Settings(
+            environment="ci",
+            azure_decision_endpoint=ENDPOINT,
+            azure_ad_token_provider=slow_token,
+        )
+    )
+    started = time.monotonic()
+    with serving(requests, ok()), pytest.raises(LLMUnavailable):
+        decide_sync(QUICK, "x", QUESTIONS)
+
+    assert time.monotonic() - started < 0.4
     assert requests == []

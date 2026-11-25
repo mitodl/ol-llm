@@ -103,6 +103,8 @@ from ol_llm.retries import (
     TRANSPORT_ERRORS,
     UNAVAILABLE_TRANSPORT_ERRORS,
     RetryBudget,
+    delay_or_raise,
+    retry_attempts,
 )
 from ol_llm.settings import GatewayRoute, Settings, get_settings
 from ol_llm.tracing import include_content, tracer_provider
@@ -371,28 +373,21 @@ async def retrying(
         with the provider's exception as ``__cause__``. Anything that is not a
         model request failure is re-raised unchanged.
     """
-    budget = RetryBudget(policy, profile)
-    while True:
-        try:
-            return await attempt()
-        except Exception as exc:  # noqa: BLE001
-            delay = _retry_delay(exc, budget, use_case=use_case, model=model)
-        await _sleep(delay)
+    return await retry_attempts(
+        attempt,
+        budget=RetryBudget(policy, profile),
+        delay=partial(_retry_delay, use_case=use_case, model=model),
+        sleep=_sleep,
+    )
 
 
 def _retry_delay(
     exc: Exception, budget: RetryBudget, *, use_case: str, model: str
 ) -> float:
-    """Return the wait before the next attempt, or raise what the caller sees.
-
-    Callers catch ``Exception`` and hand it here; anything not classified is
-    re-raised unchanged.
-    """
-    if (error := classify_failure(exc, use_case=use_case, model=model)) is None:
-        raise exc
-    if (delay := budget.next_delay(error)) is None:
-        raise error from exc
-    return delay
+    """Return the wait before the next attempt, or raise what the caller sees."""
+    return delay_or_raise(
+        exc, budget, partial(classify_failure, use_case=use_case, model=model)
+    )
 
 
 _METADATA_KEY = "ol_llm"

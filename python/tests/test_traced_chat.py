@@ -10,7 +10,7 @@ import ol_llm.catalog as catalog_module
 import ol_llm.trace_destinations.opik_langchain as langchain_module
 import opik
 import pytest
-from conftest import opik_context_is_empty
+from conftest import fresh_checks, opik_context_is_empty
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
     CallbackManagerForLLMRun,
@@ -159,10 +159,7 @@ class Stalls(Replies):
 
 @pytest.fixture(autouse=True)
 def fresh_catalog_checks() -> Generator[None]:
-    """Check each test's use cases against the catalog it patches in."""
-    check_chat_model.cache_clear()
-    yield
-    check_chat_model.cache_clear()
+    yield from fresh_checks(check_chat_model)
 
 
 def agent_graph(model: BaseChatModel) -> RunnableLambda[str, str]:
