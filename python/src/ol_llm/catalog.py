@@ -46,6 +46,12 @@ ModelKind = Literal["chat", "embedding", "decision"]
 ModelStatus = Literal["allowed", "deprecated", "retired"]
 Route = Literal["direct", "gateway"]
 
+DECISION_PROVIDERS = frozenset(
+    {"azure-decision", "typesafe", "system-one", "openai-decisions", "google-decisions"}
+)
+"""Providers of decision models: an agent on one answers its output type's fields
+as typed questions, with probabilities, rather than generating text."""
+
 TOKENS_PER_MTOK = 1_000_000
 
 # How many use cases whose models the catalog all lists a process keeps checks, models
@@ -249,14 +255,29 @@ def load_catalog() -> Catalog:
     return Catalog.from_toml(text)
 
 
-def catalog_entries(use_case: UseCase, *, kind: ModelKind) -> list[CatalogEntry | None]:
+def model_kind(model_id: str) -> Literal["chat", "decision"]:
+    """Return whether an agent's model id names a chat or a decision model.
+
+    :param model_id: a ``provider:model`` id.
+    :returns: ``decision`` for a ``DECISION_PROVIDERS`` provider, else ``chat``.
+    :rtype: Literal["chat", "decision"]
+    """
+    provider = model_id.partition(":")[0]
+    return "decision" if provider in DECISION_PROVIDERS else "chat"
+
+
+def catalog_entries(
+    use_case: UseCase, *, kind: ModelKind | None
+) -> list[CatalogEntry | None]:
     """Look up every model the use case names; retired models and other kinds raise.
 
     The catalog is not an allowlist: an id it does not list builds, with a warning
     and no entry, and a deprecated one builds with a warning.
 
     :param use_case: the call site.
-    :param kind: the kind of model the caller builds.
+    :param kind: the kind of model the caller builds, or ``None`` for an agent's
+        models, each a chat or decision model by its provider (``model_kind``), so
+        a decision model can fall back to a chat model.
     :returns: the entries, in the order of ``use_case.model_ids``, with ``None``
         for an id the catalog does not list.
     :rtype: list[CatalogEntry | None]
@@ -266,7 +287,8 @@ def catalog_entries(use_case: UseCase, *, kind: ModelKind) -> list[CatalogEntry 
     """
     catalog = load_catalog()
     entries = [
-        catalog.buildable(model_id, kind=kind) for model_id in use_case.model_ids
+        catalog.buildable(model_id, kind=kind or model_kind(model_id))
+        for model_id in use_case.model_ids
     ]
     primary = entries[0]
     if use_case.fallback_models and primary is not None and primary.route_falls_back:
@@ -505,31 +527,6 @@ def embedding_entry(use_case: UseCase) -> CatalogEntry | None:
         )
         raise ValueError(msg)
     return entry
-
-
-@CachedCheck
-def check_decision_model(use_case: UseCase) -> tuple[str, ...]:
-    """Check a decision use case against the catalog, as ``decide`` does.
-
-    A decision use case takes no ``fallback_models``: each model calibrates its
-    probabilities differently, so a threshold tuned on one does not carry over.
-    A rejected use case raises every time; an unlisted or deprecated model warns
-    once, until its use case falls out of ``UseCaseCache``.
-
-    :param use_case: the call site.
-    :returns: the ``model_status`` trace tags, from ``status_tags``.
-    :rtype: tuple[str, ...]
-    :raises ValueError: if the use case declares fallbacks, or its model is not in
-        ``provider:model`` form, is retired, or is listed as another kind.
-    """
-    if use_case.fallback_models:
-        msg = (
-            f"Use case {use_case.name!r} declares fallback_models; a decision use "
-            "case takes none, since each model calibrates its probabilities "
-            "differently"
-        )
-        raise ValueError(msg)
-    return status_tags(catalog_entries(use_case, kind="decision"))
 
 
 @dataclass(frozen=True)

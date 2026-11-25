@@ -11,10 +11,11 @@ Vertex use the default credential chain, which covers IRSA and workload identity
 A host that configures in code can pass Together's key and an Azure token provider
 on ``Settings`` instead.
 
-Decision models (``ol_llm.decisions``) have no provider SDK, so where they are
-served is set here: ``OL_LLM_AZURE_DECISION_ENDPOINT`` for an Azure Foundry account
-and ``OL_LLM_SYSTEMONE_BASE_URL`` (with ``OL_LLM_SYSTEMONE_API_KEY`` when the server
-wants one) for a self-hosted server. TypeSafe's key is ``TYPESAFE_API_KEY``.
+Decision models on the System One API have no provider SDK, so where they are
+served is set here: ``OL_LLM_AZURE_DECISION_ENDPOINT`` for ``azure-decision:``
+models on an Azure Foundry account, and ``OL_LLM_SYSTEMONE_BASE_URL`` (with
+``OL_LLM_SYSTEMONE_API_KEY`` when the server wants one) for ``system-one:`` models
+on any other System One server. TypeSafe's key is ``TYPESAFE_API_KEY``.
 """
 
 import inspect
@@ -64,14 +65,16 @@ class Settings:
     :param together_api_key: the Together AI API key; ``None`` reads
         ``TOGETHER_API_KEY``.
     :param azure_decision_endpoint: the endpoint of the Azure Foundry account that
-        serves ``azure:`` decision models, e.g.
+        serves ``azure-decision:`` models, e.g.
         ``https://<account>.cognitiveservices.azure.com``. Requests authenticate
         with ``azure_ad_token_provider``.
     :param typesafe_api_key: the TypeSafe API key, for ``typesafe:`` decision
         models; ``None`` reads ``TYPESAFE_API_KEY``.
-    :param systemone_base_url: the base URL of a self-hosted server speaking the
-        System One decision API (``laya-serve``, ``strands-decider serve``), for
-        ``systemone:`` decision models.
+    :param systemone_base_url: the base URL of a server speaking the System One
+        decision API, for ``system-one:`` models, with or without its ``/v1``: a
+        host such as DigitalOcean, OVHcloud or Telnyx, or ``laya-serve``, Ollama
+        or ``llama-server``. ``/v1/systemone`` is added to it, so a host on another
+        path (OpenRouter's ``/api/alpha/decisions``) does not fit.
     :param systemone_api_key: the bearer token that server wants, if any.
     """
 

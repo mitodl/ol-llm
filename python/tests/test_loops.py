@@ -34,12 +34,10 @@ from ol_llm import (
     KeycloakClient,
     TracingConfig,
     UseCase,
-    YesNo,
     close_thread_loop,
     complete,
     complete_sync,
     configure_tracing,
-    decide,
     embed,
     embeddings,
     loops,
@@ -63,6 +61,7 @@ from ol_llm.settings import GatewayRoute, Settings, configure
 from ol_llm.testing import override_models
 from ol_llm.trace_destinations.opik_destination import OTLP_TRACES_PATH
 from ol_llm.tracing import KeycloakTokens
+from pydantic import BaseModel, Field
 from pydantic_ai.models import Model
 
 FORK_TIMEOUT_SECONDS = 30
@@ -76,8 +75,14 @@ SEARCH = UseCase(
     model="openai:text-embedding-3-small",
 )
 DECIDE = UseCase(
-    app="learn-ai", name="support-reply", profile="request", model="systemone:laya"
+    app="learn-ai", name="support-reply", profile="request", model="system-one:laya"
 )
+
+
+class Done(BaseModel):
+    """Whether the learner is done."""
+
+    done: bool = Field(description="Is the learner done?")
 
 
 def run_in_fork(target: Callable[[], object]) -> object:
@@ -163,8 +168,8 @@ async def _embedding() -> object:
 
 
 async def _decision() -> object:
-    question = {"done": YesNo(instructions="Is the learner done?")}
-    return (await decide(DECIDE, "thanks!", question)).yes_no("done").probability
+    result = await complete(DECIDE, "thanks!", output_type=Done)
+    return result.output.done
 
 
 def _token_resource(url: str) -> Resource:
@@ -205,7 +210,7 @@ def _memory_exchange_resource(url: str) -> Resource:
 RESOURCES: dict[str, Callable[[str], Resource]] = {
     "model": lambda _url: Resource(_chat, "ok"),
     "embedding": lambda _url: Resource(_embedding, 3),
-    "decision": lambda _url: Resource(_decision, 0.9),
+    "decision": lambda _url: Resource(_decision, True),  # noqa: FBT003
     "token": _token_resource,
     "memory": _memory_resource,
     "memory-exchange": _memory_exchange_resource,

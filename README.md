@@ -18,7 +18,7 @@ The contracts move into `docs/` here as they are implemented.
 [`python/src/ol_llm/catalog.toml`](python/src/ol_llm/catalog.toml) records the models
 applications call, with each one's status, whether the id floats, the name Opik prices it
 under, and its list price. It is not an allowlist, so a new model needs no release here:
-`build_model`, `embed` and `decide` build an id the catalog does not list, log a warning, and tag the
+`build_model` and `embed` build an id the catalog does not list, log a warning, and tag the
 trace `model_status:uncataloged`. They refuse a retired id, and tag a deprecated one
 `model_status:deprecated`. A model with no entry has no price in the spend rules, so a model
 that stays in use should get one. Adding or changing an entry is a pull request here; the
@@ -43,55 +43,51 @@ Opik check downloads Opik's price table, so offline runs deselect it with `-m "n
 
 ## Decision models
 
-A decision ("system-one") model answers typed questions about a state in one forward pass,
+A decision ("system-one") model answers typed questions about a text in one forward pass,
 with probabilities and no generated text, in tens of milliseconds. Use one where an app
 would otherwise match phrase lists or ask a chat model for JSON: routing, intent, yes/no
-checks. `ol_llm.decide` (and `decide_sync`) sends the System One API request that
-Microsoft-Decision, TypeSafe's Jev, Laya and Strands Decider all accept:
+checks. They are PydanticAI decision models, so a use case names one like any other model
+and `complete` (or `run`) runs it with the `pydantic-ai` extra. Each field of the output
+type is one question: a `bool` is a yes/no, a `Literal` or `Enum` of strings a pick-one,
+and its description is the question. The confidence and probabilities come back in
+`LLMResult.provider_details`:
 
 ```python
+class ReplyIntent(BaseModel):
+    """What the learner wants done with the support request we showed them."""
+
+    intent: Literal["send", "cancel", "edit"] = Field(
+        description="What is the learner telling us to do with the request?"
+    )
+
+
 REPLY_INTENT = ol_llm.UseCase(
     app="learn-ai",
     name="support-reply-intent",
     profile="request",
-    model="azure:Microsoft-Decision-1.1",
+    model="azure-decision:Microsoft-Decision-1.1",
 )
 
-decision = await ol_llm.decide(
-    REPLY_INTENT,
-    {"we_asked": "Send this request to support?", "reply": "yeah go for it"},
-    {
-        "intent": ol_llm.Choice(
-            instructions="What is the learner telling us to do with the request?",
-            options={
-                "send": None,
-                "cancel": None,
-                "edit": "They added or changed details",
-            },
-        ),
-    },
-)
-intent = decision.choice("intent")
-if intent.confidence is not None and intent.confidence >= 0.8:
-    ...
+result = await ol_llm.complete(REPLY_INTENT, "yeah go for it", output_type=ReplyIntent)
+probability = result.provider_details["probabilities"]["intent"][result.output.intent]
 ```
 
 The model id's provider picks the server:
 
 | Provider | Server | Configuration |
 | --- | --- | --- |
-| `azure:<deployment>` | Microsoft-Decision on an Azure Foundry (AIServices) account | `OL_LLM_AZURE_DECISION_ENDPOINT`, and `Settings.azure_ad_token_provider` for the Entra token |
+| `azure-decision:<deployment>` | Microsoft-Decision on an Azure Foundry (AIServices) account | `OL_LLM_AZURE_DECISION_ENDPOINT`, and `Settings.azure_ad_token_provider` for the Entra token |
+| `system-one:<model>` | Any System One server: DigitalOcean, OVHcloud, Telnyx, Cloudflare's Clef through one of them, or a self-hosted Laya (`laya-serve`), Strands Decider, Ollama or `llama-server` | `OL_LLM_SYSTEMONE_BASE_URL`, and `OL_LLM_SYSTEMONE_API_KEY` if the server checks one |
 | `typesafe:<model>` | TypeSafe's hosted Jev | `TYPESAFE_API_KEY` |
-| `systemone:<model>` | A self-hosted Laya (`laya-serve`) or Strands Decider (`strands-decider serve`) | `OL_LLM_SYSTEMONE_BASE_URL`, and `OL_LLM_SYSTEMONE_API_KEY` if the server checks one |
+| `openai-decisions:<model>` | OpenAI's Decisions API, e.g. `gpt-6-luna` | The `openai` extra, `OPENAI_API_KEY` or the `openai` gateway route |
+| `google-decisions:<model>` | Gemini's Decisions API, e.g. `gemini-decision-1` | The `google` extra and `GOOGLE_API_KEY` |
 
-`ChoiceAnswer.confidence` is computed by ol-llm from the chosen option's probability, the
-same way for every model, because each vendor's own `confidence` uses a different formula.
-`decide` makes one request with no output to bound, so a use case's `request_limit` and
-`cost_limit` don't apply to it. Thresholds are
-still per model: each one calibrates its probabilities differently, which is also why a
-decision use case takes no `fallback_models`. Keep a deterministic path for when the call
-fails or is not confident. Tests can answer requests with
-`ol_llm.decisions.override_decision_transport(httpx2.MockTransport(handler))`.
+Calls run under the use case's policy like a chat model's: its timeout, retries and error
+classes, its trace, and its catalog checks. A decision use case can name a chat model in
+`fallback_models`, which takes over on an outage. A decision model that hands a step off
+(PydanticAI's `UnsureRoute` or `UnfillableRoute`) is not retried and reaches the caller as
+itself. Thresholds are per model, since each calibrates its probabilities differently, and
+an app should keep a deterministic path for when the call fails or is not sure.
 
 ## Development
 
